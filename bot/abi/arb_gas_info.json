@@ -1,0 +1,41 @@
+[
+  {
+    "inputs": [],
+    "name": "getPricesInWei",
+    "outputs": [
+      {"internalType": "uint256", "name": "perL2Tx", "type": "uint256"},
+      {"internalType": "uint256", "name": "perL1CalldataUnit", "type": "uint256"},
+      {"internalType": "uint256", "name": "perStorageAllocation", "type": "uint256"},
+      {"internalType": "uint256", "name": "perArbGasBase", "type": "uint256"},
+      {"internalType": "uint256", "name": "perArbGasCongestion", "type": "uint256"},
+      {"internalType": "uint256", "name": "perArbGasTotal", "type": "uint256"}
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "aggregator", "type": "address"}],
+    "name": "getPricesInWeiWithAggregator",
+    "outputs": [
+      {"internalType": "uint256", "name": "perL2Tx", "type": "uint256"},
+      {"internalType": "uint256", "name": "perL1CalldataUnit", "type": "uint256"},
+      {"internalType": "uint256", "name": "perStorageAllocation", "type": "uint256"},
+      {"internalType": "uint256", "name": "perArbGasBase", "type": "uint256"},
+      {"internalType": "uint256", "name": "perArbGasCongestion", "type": "uint256"},
+      {"internalType": "uint256", "name": "perArbGasTotal", "type": "uint256"}
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "aggregator", "type": "address"}],
+    "name": "getPricesInArbGasWithAggregator",
+    "outputs": [
+      {"internalType": "uint256", "name": "perL2Tx", "type": "uint256"},
+      {"internalType": "uint256", "name": "perL1CalldataUnit", "type": "uint256"},
+      {"internalType": "uint256", "name": "perStorageAllocation", "type": "uint256"}
+    ],
+    "stateMutability": "view",
+    "type": "function"
+  }
+]

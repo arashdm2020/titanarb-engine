@@ -1,0 +1,138 @@
+{
+  "network": "Polygon PoS Mainnet",
+  "chainId": 137,
+  "_verificationNote": "Addresses below were verified against Aave's official aave-address-book (bgd-labs) and developers.uniswap.org deployment docs / PolygonScan on the date of writing. Uniswap V3 pool addresses for the specific USDC/WMATIC/USDT trio are NOT hardcoded here -- they are resolved on-chain at runtime via UniswapV3Factory.getPool(tokenA, tokenB, fee), because current liquidity depth for a specific hardcoded pool address could not be independently verified from documentation alone and pool liquidity can shift over time. This is also the more robust engineering approach.",
+  "aaveV3": {
+    "poolAddressesProvider": "0xa97684ead0e402dC232d5A977953DF7ECBaB3CDb",
+    "pool": "0x794a61358D6845594F94dc1DB02A252b5b4814aD",
+    "protocolDataProvider": "0x243Aa95cAC2a25651eda86e80bEe66114413c43b",
+    "defaultFlashLoanPremiumBpsAssumption": 5,
+    "note": "The premium bps assumption above is only used for OFF-CHAIN pre-trade estimation (optimizer/config default). The authoritative value is always read on-chain via Pool.FLASHLOAN_PREMIUM_TOTAL() or the `premium` argument passed into executeOperation by Aave itself."
+  },
+  "uniswapV3": {
+    "factory": "0x1F98431c8aD98523631AE4a59f267346ea31F984",
+    "swapRouter": "0xE592427A0AEce92De3Edee1F18E0157C05861564",
+    "swapRouterNote": "This is the original SwapRouter (v1), which includes an explicit `deadline` field required by this system. SwapRouter02 (0x68b3465833fb72A70ecDF485E0e4C7bD8665Fc45) intentionally NOT used because it omits per-call deadline in its param structs.",
+    "quoterV2": "0x61fFE014bA17989E743c5F6cB21bF9697530B21e"
+  },
+  "tokens": {
+    "USDC": {
+      "address": "0x3c499c542cEF5E3811e1192ce70d8cC03d5c3359",
+      "decimals": 6,
+      "symbol": "USDC",
+      "note": "Native (Circle-issued) USDC on Polygon PoS. NOT the older bridged USDC.e."
+    },
+    "USDC_E": {
+      "address": "0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174",
+      "decimals": 6,
+      "symbol": "USDC.e",
+      "note": "Legacy PoS-bridged USDC (USDC.e). Historically deeper Uniswap V3 liquidity than native USDC on Polygon for many pairs. Used in routes USDCe-WMATIC-USDT-USDCe and USDCe-WBTC-WMATIC-USDCe."
+    },
+    "WMATIC": {
+      "address": "0x0d500B1d8E8eF31E21C99d1Db9A6444d3ADf1270",
+      "decimals": 18,
+      "symbol": "WMATIC",
+      "note": "Same contract now commonly displayed as WPOL following the MATIC->POL rebrand; contract address and behavior unchanged."
+    },
+    "USDT": {
+      "address": "0xc2132D05D31c914a87C6611C10748AEb04B58e8F",
+      "decimals": 6,
+      "symbol": "USDT"
+    },
+    "WETH": {
+      "address": "0x7ceB23fD6bC0adD76CeB575B5dE2dD2d1b9f6F18",
+      "decimals": 18,
+      "symbol": "WETH",
+      "note": "Wrapped Ether (bridged) on Polygon PoS. This is the canonical WETH used by Uniswap V3 on Polygon."
+    },
+    "WBTC": {
+      "address": "0x1BFD67037B42Cf73acf2047067bd4F2C47D9BfD6",
+      "decimals": 8,
+      "symbol": "WBTC",
+      "note": "Wrapped Bitcoin (bridged) on Polygon PoS. 8 decimals (not 18)."
+    },
+    "LINK": {
+      "address": "0x53E0bca35eC356BD5ddFEebb381e82c082E33718",
+      "decimals": 18,
+      "symbol": "LINK",
+      "note": "Chainlink Token on Polygon PoS. No Uniswap V3 pools with USDC/WMATIC/USDT -- kept for reference only."
+    },
+    "DAI": {
+      "address": "0x8f3Cf7aD23Cd3CaDbD9735AFf958023239c6A063",
+      "decimals": 18,
+      "symbol": "DAI",
+      "note": "Dai stablecoin on Polygon PoS. Deep Uniswap V3 liquidity with USDC, USDC.e, WMATIC, and USDT."
+    },
+    "AAVE": {
+      "address": "0xD6DF932A45C0f72fE139BD479c486E66F7df5d66",
+      "decimals": 18,
+      "symbol": "AAVE",
+      "note": "Aave Token on Polygon PoS. No Uniswap V3 pools with USDC/WMATIC/USDT -- kept for reference only."
+    },
+    "CRV": {
+      "address": "0x172370d5Cd63279eFa6d502DAB29171933a610AF",
+      "decimals": 18,
+      "symbol": "CRV",
+      "note": "Curve DAO Token on Polygon PoS. Has Uniswap V3 pools with USDC (fee 3000), WMATIC (fee 3000/500), and USDT (fee 500)."
+    }
+  },
+  "routes": [
+    {
+      "name": "USDC-WMATIC-USDT-USDC",
+      "description": "USDC (native) -> WMATIC -> USDT -> USDC (native), three Uniswap V3 legs",
+      "legs": [
+        { "tokenIn": "USDC", "tokenOut": "WMATIC", "feeTierCandidatesBps": [500, 3000, 100] },
+        { "tokenIn": "WMATIC", "tokenOut": "USDT", "feeTierCandidatesBps": [3000, 500, 100] },
+        { "tokenIn": "USDT", "tokenOut": "USDC", "feeTierCandidatesBps": [100, 500] }
+      ]
+    },
+    {
+      "name": "USDCe-WMATIC-USDT-USDCe",
+      "description": "USDC.e (bridged) -> WMATIC -> USDT -> USDC.e, three Uniswap V3 legs",
+      "legs": [
+        { "tokenIn": "USDC_E", "tokenOut": "WMATIC", "feeTierCandidatesBps": [500, 3000, 100] },
+        { "tokenIn": "WMATIC", "tokenOut": "USDT", "feeTierCandidatesBps": [3000, 500, 100] },
+        { "tokenIn": "USDT", "tokenOut": "USDC_E", "feeTierCandidatesBps": [100, 500] }
+      ]
+    },
+    {
+      "name": "USDCe-WBTC-WMATIC-USDCe",
+      "description": "USDC.e (bridged) -> WBTC -> WMATIC -> USDC.e, three Uniswap V3 legs",
+      "legs": [
+        { "tokenIn": "USDC_E", "tokenOut": "WBTC", "feeTierCandidatesBps": [500, 3000, 100] },
+        { "tokenIn": "WBTC", "tokenOut": "WMATIC", "feeTierCandidatesBps": [3000, 500, 100] },
+        { "tokenIn": "WMATIC", "tokenOut": "USDC_E", "feeTierCandidatesBps": [500, 3000, 100] }
+      ]
+    },
+    {
+      "name": "USDC-DAI-WMATIC-USDC",
+      "description": "USDC (native) -> DAI -> WMATIC -> USDC (native), three Uniswap V3 legs",
+      "legs": [
+        { "tokenIn": "USDC", "tokenOut": "DAI", "feeTierCandidatesBps": [100, 500, 3000] },
+        { "tokenIn": "DAI", "tokenOut": "WMATIC", "feeTierCandidatesBps": [3000, 500, 100] },
+        { "tokenIn": "WMATIC", "tokenOut": "USDC", "feeTierCandidatesBps": [500, 3000, 100] }
+      ]
+    },
+    {
+      "name": "USDCe-DAI-WMATIC-USDCe",
+      "description": "USDC.e (bridged) -> DAI -> WMATIC -> USDC.e, three Uniswap V3 legs",
+      "legs": [
+        { "tokenIn": "USDC_E", "tokenOut": "DAI", "feeTierCandidatesBps": [100, 500, 3000] },
+        { "tokenIn": "DAI", "tokenOut": "WMATIC", "feeTierCandidatesBps": [3000, 500, 100] },
+        { "tokenIn": "WMATIC", "tokenOut": "USDC_E", "feeTierCandidatesBps": [500, 3000, 100] }
+      ]
+    },
+    {
+      "name": "USDC-CRV-WMATIC-USDC",
+      "description": "USDC (native) -> CRV -> WMATIC -> USDC (native), three Uniswap V3 legs",
+      "legs": [
+        { "tokenIn": "USDC", "tokenOut": "CRV", "feeTierCandidatesBps": [3000, 500, 100] },
+        { "tokenIn": "CRV", "tokenOut": "WMATIC", "feeTierCandidatesBps": [3000, 500, 100] },
+        { "tokenIn": "WMATIC", "tokenOut": "USDC", "feeTierCandidatesBps": [500, 3000, 100] }
+      ]
+    }
+  ],
+  "pools": {
+    "note": "Pool address/token0/token1/fee/liquidity are NOT hardcoded; resolved and read live on-chain by bot/pools.py via IUniswapV3Factory.getPool() and IUniswapV3Pool (token0/token1/fee/liquidity/slot0). This avoids shipping a stale or unverifiable pool address."
+  }
+}

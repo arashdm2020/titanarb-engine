@@ -1,0 +1,36 @@
+[profile.default]
+src = "contracts"
+out = "out"
+libs = ["lib"]
+test = "test"
+script = "script"
+solc_version = "0.8.19"
+optimizer = true
+optimizer_runs = 200
+# via_ir is required: executeOperation() has enough local variables (asset/amount/premium/
+# initiator/params decoding + 3-leg loop + repayment/profit accounting) to trigger solc's legacy
+# codegen "stack too deep" error under 0.8.19's non-IR pipeline. IR-based codegen resolves this
+# without changing contract semantics or the pinned 0.8.19 compiler version.
+via_ir = true
+fs_permissions = [{ access = "read", path = "./config" }]
+# Polygon mainnet has adopted post-Cancun opcodes (e.g. MCOPY, transient storage) in some
+# deployed bytecode (observed via Aave V3 Pool implementation reverting with EvmError::NotActivated
+# under Foundry's older default EVM version during fork testing). Fork tests against live Polygon
+# state require this to be set so revm activates the same opcodes the real chain supports.
+evm_version = "cancun"
+
+# Mainnet fork testing profile.
+# Usage:
+#   forge test --match-path test/Integration.t.sol --fork-url $POLYGON_RPC_URL -vvv
+[profile.fork]
+src = "contracts"
+out = "out"
+libs = ["lib"]
+
+[rpc_endpoints]
+polygon = "${POLYGON_RPC_URL}"
+arbitrum = "${ARBITRUM_RPC_URL}"
+
+[fmt]
+line_length = 120
+tab_width = 4

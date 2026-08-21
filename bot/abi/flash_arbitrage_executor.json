@@ -1,0 +1,166 @@
+[
+  {
+    "inputs": [
+      {"internalType": "address", "name": "asset", "type": "address"},
+      {"internalType": "uint256", "name": "amount", "type": "uint256"},
+      {
+        "components": [
+          {"internalType": "address", "name": "adapter", "type": "address"},
+          {"internalType": "address", "name": "tokenIn", "type": "address"},
+          {"internalType": "address", "name": "tokenOut", "type": "address"},
+          {"internalType": "uint256", "name": "amountOutMinimum", "type": "uint256"},
+          {"internalType": "bytes", "name": "data", "type": "bytes"}
+        ],
+        "internalType": "struct FlashArbitrageExecutor.SwapStep[]",
+        "name": "steps",
+        "type": "tuple[]"
+      },
+      {"internalType": "uint256", "name": "deadline", "type": "uint256"},
+      {"internalType": "uint256", "name": "minProfit", "type": "uint256"}
+    ],
+    "name": "executeArbitrage",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [
+      {"internalType": "address", "name": "asset", "type": "address"},
+      {"internalType": "uint256", "name": "amount", "type": "uint256"},
+      {"internalType": "uint256", "name": "premium", "type": "uint256"},
+      {"internalType": "address", "name": "initiator", "type": "address"},
+      {"internalType": "bytes", "name": "params", "type": "bytes"}
+    ],
+    "name": "executeOperation",
+    "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "token", "type": "address"}, {"internalType": "uint256", "name": "amount", "type": "uint256"}],
+    "name": "withdrawToken",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "uint256", "name": "amount", "type": "uint256"}],
+    "name": "withdrawNative",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "executor", "type": "address"}],
+    "name": "setAuthorizedExecutor",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "recipient", "type": "address"}],
+    "name": "setProfitRecipient",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "profitRecipient",
+    "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "authorizedExecutor",
+    "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "owner",
+    "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "token", "type": "address"}, {"internalType": "bool", "name": "allowed", "type": "bool"}],
+    "name": "setAllowedToken",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "adapter", "type": "address"}, {"internalType": "bool", "name": "approved", "type": "bool"}],
+    "name": "setApprovedAdapter",
+    "outputs": [],
+    "stateMutability": "nonpayable",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "", "type": "address"}],
+    "name": "allowedTokens",
+    "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [{"internalType": "address", "name": "", "type": "address"}],
+    "name": "approvedAdapters",
+    "outputs": [{"internalType": "bool", "name": "", "type": "bool"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "MIN_HOPS",
+    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "inputs": [],
+    "name": "MAX_HOPS",
+    "outputs": [{"internalType": "uint256", "name": "", "type": "uint256"}],
+    "stateMutability": "view",
+    "type": "function"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "address", "name": "asset", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "amount", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "premium", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "finalAmount", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "profit", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "hops", "type": "uint256"}
+    ],
+    "name": "ArbitrageExecuted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "uint256", "name": "stepIndex", "type": "uint256"},
+      {"indexed": true, "internalType": "address", "name": "adapter", "type": "address"},
+      {"indexed": true, "internalType": "address", "name": "tokenIn", "type": "address"},
+      {"indexed": false, "internalType": "address", "name": "tokenOut", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "amountIn", "type": "uint256"},
+      {"indexed": false, "internalType": "uint256", "name": "amountOut", "type": "uint256"}
+    ],
+    "name": "SwapExecuted",
+    "type": "event"
+  },
+  {
+    "anonymous": false,
+    "inputs": [
+      {"indexed": true, "internalType": "address", "name": "token", "type": "address"},
+      {"indexed": true, "internalType": "address", "name": "recipient", "type": "address"},
+      {"indexed": false, "internalType": "uint256", "name": "amount", "type": "uint256"}
+    ],
+    "name": "ProfitTransferred",
+    "type": "event"
+  }
+]

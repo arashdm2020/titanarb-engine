@@ -1,0 +1,27 @@
+[
+  {"type":"function","name":"executeArbitrage","stateMutability":"nonpayable","inputs":[
+    {"name":"asset","type":"address"},
+    {"name":"amount","type":"uint256"},
+    {"name":"steps","type":"tuple[]","components":[
+      {"name":"adapter","type":"address"},{"name":"tokenIn","type":"address"},{"name":"tokenOut","type":"address"},{"name":"amountOutMinimum","type":"uint256"},{"name":"data","type":"bytes"}
+    ]},
+    {"name":"deadline","type":"uint256"},{"name":"minProfit","type":"uint256"}
+  ],"outputs":[]},
+  {"type":"function","name":"authorizedExecutor","stateMutability":"view","inputs":[],"outputs":[{"name":"","type":"address"}]},
+  {"type":"function","name":"profitRecipient","stateMutability":"view","inputs":[],"outputs":[{"name":"","type":"address"}]},
+  {"type":"function","name":"AAVE_POOL","stateMutability":"view","inputs":[],"outputs":[{"name":"","type":"address"}]},
+  {"type":"function","name":"approvedAdapters","stateMutability":"view","inputs":[{"name":"","type":"address"}],"outputs":[{"name":"","type":"bool"}]},
+  {"type":"function","name":"allowedTokens","stateMutability":"view","inputs":[{"name":"","type":"address"}],"outputs":[{"name":"","type":"bool"}]},
+  {"type":"error","name":"InsufficientProfit","inputs":[{"name":"required","type":"uint256"},{"name":"available","type":"uint256"}]},
+  {"type":"error","name":"InsufficientOutput","inputs":[{"name":"expectedMin","type":"uint256"},{"name":"actual","type":"uint256"}]},
+  {"type":"error","name":"InvalidRoute","inputs":[]},
+  {"type":"event","name":"SwapExecuted","anonymous":false,"inputs":[
+    {"name":"stepIndex","type":"uint256","indexed":true},{"name":"adapter","type":"address","indexed":true},{"name":"tokenIn","type":"address","indexed":true},{"name":"tokenOut","type":"address","indexed":false},{"name":"amountIn","type":"uint256","indexed":false},{"name":"amountOut","type":"uint256","indexed":false}
+  ]},
+  {"type":"event","name":"ProfitTransferred","anonymous":false,"inputs":[
+    {"name":"token","type":"address","indexed":true},{"name":"recipient","type":"address","indexed":true},{"name":"amount","type":"uint256","indexed":false}
+  ]},
+  {"type":"event","name":"ArbitrageExecuted","anonymous":false,"inputs":[
+    {"name":"asset","type":"address","indexed":true},{"name":"amount","type":"uint256","indexed":false},{"name":"premium","type":"uint256","indexed":false},{"name":"finalAmount","type":"uint256","indexed":false},{"name":"profit","type":"uint256","indexed":false},{"name":"hops","type":"uint256","indexed":false}
+  ]}
+]

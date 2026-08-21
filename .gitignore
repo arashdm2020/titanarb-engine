@@ -1,0 +1,33 @@
+.env
+.env.example
+.env.example.arbitrum
+runtime/
+go/runtime/
+go/*.exe
+__pycache__/
+*.pyc
+
+# Foundry
+out/
+cache/
+broadcast/
+lib/
+
+# Python
+.venv/
+venv/
+*.egg-info/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local validation transcripts
+build_cancun_test.txt
+build_log.txt
+build_out*.txt
+final_*.txt
+fork_out*.txt
+fork_trace*.txt
+rpc_check.txt
+test_out*.txt
