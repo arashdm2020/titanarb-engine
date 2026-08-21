@@ -9,7 +9,7 @@ __pycache__/
 
 # Foundry
 out/
-cache/
+/cache/
 broadcast/
 lib/
 
