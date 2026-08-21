@@ -6,6 +6,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/telegram"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -26,4 +27,27 @@ func TestSinkPersistsWithoutBlocking(t *testing.T) {
 	if strings.Contains(string(data), "credential") {
 		t.Fatalf("secret leaked: %s", data)
 	}
+}
+
+func TestConcurrentPublishAndCloseIsSafe(t *testing.T) {
+	s, err := New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 100; j++ {
+				s.Publish(Event{Category: observability.Performance, Name: "cycle"})
+			}
+		}()
+	}
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	wg.Wait()
+	// A late asynchronous producer must be ignored rather than panic.
+	s.Publish(Event{Category: observability.Performance, Name: "late"})
 }

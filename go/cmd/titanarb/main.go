@@ -9,12 +9,15 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"syscall"
 	"time"
 
 	"github.com/titanarb/titanarb-go/internal/alpha"
 	"github.com/titanarb/titanarb-go/internal/cache"
 	"github.com/titanarb/titanarb-go/internal/config"
+	"github.com/titanarb/titanarb-go/internal/control"
+	"github.com/titanarb/titanarb-go/internal/dashboard"
 	"github.com/titanarb/titanarb-go/internal/execution"
 	"github.com/titanarb/titanarb-go/internal/fees"
 	"github.com/titanarb/titanarb-go/internal/health"
@@ -29,7 +32,9 @@ import (
 	"github.com/titanarb/titanarb-go/internal/profit"
 	"github.com/titanarb/titanarb-go/internal/quotes"
 	"github.com/titanarb/titanarb-go/internal/rpc"
+	"github.com/titanarb/titanarb-go/internal/runtimeconfig"
 	"github.com/titanarb/titanarb-go/internal/safety"
+	"github.com/titanarb/titanarb-go/internal/scheduler"
 	"github.com/titanarb/titanarb-go/internal/telegram"
 	ws "github.com/titanarb/titanarb-go/internal/websocket"
 )
@@ -46,7 +51,9 @@ func main() {
 	if operationsDir == "" {
 		operationsDir = filepath.Join("runtime", "go")
 	}
-	operationSink, operationErr := operations.New(operationsDir, telegram.New(telegram.FromEnv()))
+	telegramConfig := telegram.FromEnv()
+	notifier := telegram.New(telegramConfig)
+	operationSink, operationErr := operations.New(operationsDir, notifier)
 	if operationErr != nil {
 		log.Event(logger.Warn, "health_check_failed", "operations", "observability disabled: "+operationErr.Error(), nil)
 	} else {
@@ -55,6 +62,15 @@ func main() {
 	}
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
+	runtimeConfigPath := os.Getenv("TITANARB_RUNTIME_CONFIG_PATH")
+	if runtimeConfigPath == "" {
+		runtimeConfigPath = filepath.Join(operationsDir, "runtime_config.json")
+	}
+	runtimeRisk, riskErr := runtimeconfig.Open(runtimeConfigPath, runtimeconfig.Defaults(runtimeconfig.Balanced))
+	if riskErr != nil {
+		log.Event(logger.Warn, "health_check_failed", "risk", "runtime risk controls unavailable: "+riskErr.Error(), nil)
+		runtimeRisk, _ = runtimeconfig.Open("", runtimeconfig.Defaults(runtimeconfig.Balanced))
+	}
 	rpcClient := rpc.New(cfg.HTTPRPCURL, 15*time.Second, 2, m)
 	chain, err := rpcClient.ChainID(ctx)
 	if err != nil || chain != config.ArbitrumOneChainID {
@@ -84,12 +100,31 @@ func main() {
 	if marketErr != nil && os.Getenv("TITANARB_MARKET_ENGINE") == "true" {
 		log.Event(logger.Warn, "health_check_failed", "market", "market engine disabled: "+marketErr.Error(), nil)
 	}
-	marketRunning := make(chan struct{}, 1)
+	if telegramConfig.Enabled() && runtimeRisk != nil {
+		go control.Run(ctx, notifier, control.Handler{
+			Auth: control.Authorizer{ChatID: telegramConfig.ChatID, AdminID: os.Getenv("TELEGRAM_ADMIN_ID")},
+			Risk: runtimeRisk,
+			Status: func() string {
+				return fmt.Sprintf("🟢 TITANARB — STATUS\n🌐 Arbitrum One\n🧠 Risk: %s\n🔌 WSS: %t\n📡 RPC: Healthy", runtimeRisk.Snapshot().Profile, w.Connected())
+			},
+			Market: func() string {
+				marketSnapshot := market.Snapshot{}
+				if marketEngine != nil {
+					marketSnapshot = marketEngine.Snapshot()
+				}
+				wssStatus := "Disconnected"
+				if w.Connected() {
+					wssStatus = "Healthy"
+				}
+				return dashboard.FormatMarket(dashboard.MarketSnapshot{Status: "ONLINE", RiskProfile: string(runtimeRisk.Snapshot().Profile), WSS: wssStatus, ActivePools: marketSnapshot.ActivePools, Cycles: marketSnapshot.Cycles, Metrics: m.Snapshot()})
+			},
+			Top: func() string { return "🏆 No globally ranked candidate is available yet." },
+		})
+	}
 	phase4Engine, phase4Err := buildPhase4Engine(rpcClient, m)
 	if phase4Err != nil && os.Getenv("TITANARB_PHASE4_READ_ONLY") == "true" {
 		log.Event(logger.Warn, "health_check_failed", "phase4", "Phase 4 alpha engine disabled: "+phase4Err.Error(), nil)
 	}
-	phase4Running := make(chan struct{}, 1)
 	var executionPipeline *execution.Pipeline
 	if os.Getenv("TITANARB_EXECUTION_RUNTIME") == "true" && marketErr == nil {
 		var executionErr error
@@ -103,8 +138,124 @@ func main() {
 			log.Event(logger.Info, "execution_preflight_verified", "execution", "executor, adapters, routers, allow-lists, and signer verified", nil)
 		}
 	}
+	var marketScheduler *scheduler.Latest
+	if marketEngine != nil {
+		var recordedCoalesced uint64
+		marketScheduler = scheduler.New(func(runCtx context.Context, trigger scheduler.Trigger) {
+			cycleStarted := time.Now()
+			before := m.Snapshot()
+			cycleCtx, stop := context.WithTimeout(runCtx, 45*time.Second)
+			defer stop()
+			settings := runtimeconfig.Defaults(runtimeconfig.Balanced)
+			if runtimeRisk != nil {
+				settings = runtimeRisk.Snapshot()
+			}
+			report, cycleErr := marketEngine.CycleAt(cycleCtx, trigger.Block, settings.RouteSearchDepth, routeBudget(settings), settings.VolatilityWeight)
+			if cycleErr != nil {
+				log.Event(logger.Warn, "health_check_failed", "market", "market cycle failed", map[string]any{"block": trigger.Block, "error_type": fmt.Sprintf("%T", cycleErr)})
+				publish(operationSink, observability.Errors, "market_cycle_failed", telegram.Warning, "market cycle failed", map[string]any{"block": trigger.Block, "error_type": fmt.Sprintf("%T", cycleErr)})
+				return
+			}
+
+			var rejected, quoteFailed, found, stale uint64
+			for {
+				select {
+				case outcome := <-marketEngine.Events:
+					fields := map[string]any{"reason": outcome.Reason, "source_block": trigger.Block}
+					if outcome.Opportunity != nil {
+						fields["route"] = outcome.Opportunity.Route.String()
+						fields["expected_profit"] = outcome.Opportunity.ExpectedProfit.String()
+						fields["source_block"] = outcome.Opportunity.SourceBlock
+					}
+					switch outcome.Type {
+					case opportunity.Rejected:
+						rejected++
+					case opportunity.QuoteFailed:
+						quoteFailed++
+						publish(operationSink, observability.Opportunities, string(outcome.Type), telegram.Warning, "quote failed", fields)
+					case opportunity.Found:
+						found++
+						log.Event(logger.Info, string(outcome.Type), "market", "profitable candidate detected", fields)
+						alert(operationSink, observability.Opportunities, string(outcome.Type), telegram.Info, "profitable candidate detected", fields)
+						if executionPipeline != nil {
+							result := executionPipeline.Process(cycleCtx, outcome.Opportunity)
+							if strings.HasPrefix(result.Reason, "stale candidate:") {
+								stale++
+							}
+							log.Event(logger.Info, "execution_"+result.Decision, "execution", result.Reason, map[string]any{"tx_hash": result.TxHash})
+							tradeFields := map[string]any{"decision": result.Decision, "reason": result.Reason, "tx_hash": result.TxHash}
+							if result.FinalProfit != nil {
+								tradeFields["expected_profit"] = result.FinalProfit.String()
+							}
+							if result.Receipt != nil {
+								tradeFields["receipt_status"] = result.Receipt.Status
+								tradeFields["gas_used"] = result.Receipt.GasUsed
+							}
+							category, severity := observability.Trades, telegram.Info
+							if result.Decision == "reject" {
+								category, severity = observability.Errors, telegram.Warning
+							}
+							alert(operationSink, category, "execution_"+result.Decision, severity, result.Reason, tradeFields)
+						}
+					}
+				default:
+					goto eventsDrained
+				}
+			}
+		eventsDrained:
+			if phase4Engine != nil && report.FullReconcile {
+				stats, refreshErr := phase4Engine.Refresh(cycleCtx, boundedHopDepth(settings.RouteSearchDepth), routeBudget(settings))
+				if refreshErr != nil {
+					log.Event(logger.Warn, "health_check_failed", "phase4", "periodic graph reconciliation failed", nil)
+				} else {
+					publish(operationSink, observability.Performance, "phase4_graph_reconciled", telegram.Info, "periodic asset-agnostic graph reconciliation complete", map[string]any{"pairs": stats.Pairs, "pools": stats.Pools, "routes": stats.Routes, "failures": stats.Failures})
+				}
+			}
+
+			latest := marketScheduler.LatestBlock()
+			lag := uint64(0)
+			if latest > report.StateBlock {
+				lag = latest - report.StateBlock
+			}
+			coalesced := marketScheduler.BlocksCoalesced()
+			if coalesced > recordedCoalesced {
+				m.AddBlocksCoalesced(coalesced - recordedCoalesced)
+				recordedCoalesced = coalesced
+			}
+			after := m.Snapshot()
+			rpcCalls := after.RPCCalls - before.RPCCalls
+			duration := report.Duration
+			blockToStart := cycleStarted.Sub(trigger.ObservedAt)
+			if blockToStart < 0 {
+				blockToStart = 0
+			}
+			m.ObserveMarketCycle(metrics.CycleSample{
+				BlockToStartMS: uint64(blockToStart.Milliseconds()),
+				DurationMS:     uint64(duration.Milliseconds()), QuoteDurationMS: uint64(report.QuoteDuration.Milliseconds()),
+				OptimizerMS: uint64(report.OptimizerDuration.Milliseconds()), LagBlocks: lag, DirtyPools: report.DirtyPools,
+				RoutesRecomputed: report.RoutesRecomputed, RoutesReused: report.RoutesReused, RPCCalls: rpcCalls,
+			})
+			fields := map[string]any{
+				"block": report.StateBlock, "full_reconcile": report.FullReconcile, "cycles": len(report.Routes),
+				"routes_recomputed": report.RoutesRecomputed, "routes_reused": report.RoutesReused,
+				"quotes": after.Quotes - before.Quotes, "quote_failures": quoteFailed,
+				"rejected_min_profit": rejected, "profitable_candidates": found, "stale_candidates": stale,
+				"dirty_pools": report.DirtyPools, "block_to_cycle_start_ms": blockToStart.Milliseconds(), "duration_ms": duration.Milliseconds(),
+				"quote_duration_ms": report.QuoteDuration.Milliseconds(), "optimizer_duration_ms": report.OptimizerDuration.Milliseconds(), "cycle_lag_blocks": lag,
+				"blocks_coalesced": coalesced, "rpc_calls": rpcCalls,
+			}
+			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)
+			publish(operationSink, observability.Performance, "market_cycle", telegram.Info, "market cycle complete", fields)
+		})
+		if executionPipeline != nil {
+			executionPipeline.SetLatestBlockSource(marketScheduler.LatestBlock)
+		}
+		go marketScheduler.Run(ctx)
+	}
 	healthTicker := time.NewTicker(30 * time.Second)
 	defer healthTicker.Stop()
+	pollTicker := time.NewTicker(pollInterval())
+	defer pollTicker.Stop()
 	summaryTicker := time.NewTicker(summaryInterval())
 	defer summaryTicker.Stop()
 	metricsPath := os.Getenv("TITANARB_METRICS_JSON")
@@ -114,6 +265,7 @@ func main() {
 			metricsPath = ""
 		}
 	}
+	fallbackActive := false
 	for {
 		select {
 		case <-ctx.Done():
@@ -122,88 +274,33 @@ func main() {
 			if !ok {
 				return
 			}
-			log.Event(logger.Info, "new_block_received", "websocket", "new Arbitrum block", map[string]any{"block": event.Number, "hash": event.Hash})
+			log.Event(logger.Debug, "new_block_received", "websocket", "new Arbitrum block", map[string]any{"block": event.Number, "hash": event.Hash})
 			publish(operationSink, observability.Performance, "new_block_received", telegram.Info, "new Arbitrum block", map[string]any{"block": event.Number, "hash": event.Hash})
-			if marketEngine != nil {
-				select {
-				case marketRunning <- struct{}{}:
-					go func() {
-						defer func() { <-marketRunning }()
-						cycleCtx, stop := context.WithTimeout(ctx, 45*time.Second)
-						defer stop()
-						routes, err := marketEngine.Cycle(cycleCtx)
-						if err != nil {
-							log.Event(logger.Warn, "health_check_failed", "market", "market cycle failed", nil)
-							return
-						}
-						log.Event(logger.Info, "pool_updated", "market", "read-only market cycle complete", map[string]any{"routes": len(routes)})
-						for {
-							select {
-							case outcome := <-marketEngine.Events:
-								log.Event(logger.Info, string(outcome.Type), "market", outcome.Reason, nil)
-								fields := map[string]any{"reason": outcome.Reason}
-								if outcome.Opportunity != nil {
-									fields["route"] = outcome.Opportunity.Route.String()
-									fields["expected_profit"] = outcome.Opportunity.ExpectedProfit.String()
-								}
-								severity := telegram.Info
-								if outcome.Type == opportunity.QuoteFailed {
-									severity = telegram.Warning
-								}
-								if outcome.Type == opportunity.Found || outcome.Type == opportunity.QuoteFailed {
-									alert(operationSink, observability.Opportunities, string(outcome.Type), severity, "market opportunity event", fields)
-								} else {
-									publish(operationSink, observability.Opportunities, string(outcome.Type), severity, "market opportunity event", fields)
-								}
-								if outcome.Type == opportunity.Found && executionPipeline != nil {
-									result := executionPipeline.Process(cycleCtx, outcome.Opportunity)
-									log.Event(logger.Info, "execution_"+result.Decision, "execution", result.Reason, map[string]any{"tx_hash": result.TxHash})
-									tradeFields := map[string]any{"decision": result.Decision, "reason": result.Reason, "tx_hash": result.TxHash}
-									if result.FinalProfit != nil {
-										tradeFields["expected_profit"] = result.FinalProfit.String()
-									}
-									if result.Receipt != nil {
-										tradeFields["receipt_status"] = result.Receipt.Status
-										tradeFields["gas_used"] = result.Receipt.GasUsed
-									}
-									category := observability.Trades
-									severity := telegram.Info
-									if result.Decision == "reject" {
-										category = observability.Errors
-										severity = telegram.Warning
-									}
-									alert(operationSink, category, "execution_"+result.Decision, severity, result.Reason, tradeFields)
-								}
-							default:
-								return
-							}
-						}
-					}()
-				default:
-					log.Event(logger.Debug, "pool_updated", "market", "previous market cycle still running", nil)
+			if marketScheduler != nil {
+				fallbackActive = false
+				blockNumber, parseErr := parseHexBlock(event.Number)
+				if parseErr != nil {
+					log.Event(logger.Warn, "health_check_failed", "market", "invalid newHeads block number", nil)
+					continue
 				}
+				marketScheduler.Submit(scheduler.Trigger{Block: blockNumber, Hash: event.Hash, ObservedAt: time.Now().UTC()})
 			}
-			if phase4Engine != nil {
-				select {
-				case phase4Running <- struct{}{}:
-					go func() {
-						defer func() { <-phase4Running }()
-						cycleCtx, stop := context.WithTimeout(ctx, 45*time.Second)
-						defer stop()
-						stats, err := phase4Engine.Refresh(cycleCtx, phase4MaxHops(), 256)
-						if err != nil {
-							log.Event(logger.Warn, "health_check_failed", "phase4", "read-only graph refresh failed", nil)
-							publish(operationSink, observability.Errors, "phase4_refresh_failed", telegram.Warning, "read-only graph refresh failed", nil)
-							return
-						}
-						fields := map[string]any{"pairs": stats.Pairs, "pools": stats.Pools, "routes": stats.Routes, "failures": stats.Failures}
-						log.Event(logger.Info, "pool_updated", "phase4", "asset-agnostic graph refresh complete", fields)
-						publish(operationSink, observability.Performance, "phase4_graph_refreshed", telegram.Info, "read-only asset-agnostic graph refresh complete", fields)
-					}()
-				default:
-					log.Event(logger.Debug, "pool_updated", "phase4", "previous graph refresh still running", nil)
-				}
+		case <-pollTicker.C:
+			if marketScheduler == nil || w.Connected() {
+				continue
 			}
+			if !fallbackActive {
+				fallbackActive = true
+				log.Event(logger.Warn, "http_fallback_active", "market", "WSS unavailable; HTTP polling fallback active", nil)
+				alert(operationSink, observability.Server, "http_fallback_active", telegram.Warning, "WSS unavailable; HTTP polling fallback active", nil)
+			}
+			latestBlock, pollErr := rpcClient.BlockNumber(ctx)
+			if pollErr != nil {
+				log.Event(logger.Warn, "rpc_degraded", "rpc", "HTTP fallback block poll failed", map[string]any{"error_type": fmt.Sprintf("%T", pollErr)})
+				publish(operationSink, observability.Errors, "rpc_degraded", telegram.Warning, "HTTP fallback block poll failed", map[string]any{"error_type": fmt.Sprintf("%T", pollErr)})
+				continue
+			}
+			marketScheduler.Submit(scheduler.Trigger{Block: latestBlock, ObservedAt: time.Now().UTC()})
 		case <-healthTicker.C:
 			report := monitor.Check(ctx)
 			if report.Status != health.Healthy {
@@ -229,7 +326,20 @@ func main() {
 			publish(operationSink, observability.Performance, "metrics_snapshot", telegram.Info, "runtime metrics snapshot", map[string]any{"blocks": m.Snapshot().BlocksReceived, "routes": m.Snapshot().RoutesEvaluated, "quotes": m.Snapshot().Quotes, "quote_failures": m.Snapshot().QuoteFailures, "opportunities": m.Snapshot().Opportunities})
 		case <-summaryTicker.C:
 			snapshot := m.Snapshot()
-			alert(operationSink, observability.Performance, "operational_summary", telegram.Info, "periodic operational summary", map[string]any{"blocks": snapshot.BlocksReceived, "routes": snapshot.RoutesEvaluated, "quotes": snapshot.Quotes, "opportunities": snapshot.Opportunities, "rpc_errors": snapshot.RPCErrors, "wss_disconnects": snapshot.WSSDisconnects, "transactions": snapshot.TransactionsBroadcast})
+			marketSnapshot := market.Snapshot{}
+			if marketEngine != nil {
+				marketSnapshot = marketEngine.Snapshot()
+			}
+			wssStatus := "Disconnected"
+			if w.Connected() {
+				wssStatus = "Healthy"
+			}
+			profile := "BALANCED"
+			if runtimeRisk != nil {
+				profile = string(runtimeRisk.Snapshot().Profile)
+			}
+			message := dashboard.FormatMarket(dashboard.MarketSnapshot{Status: "ONLINE", RiskProfile: profile, WSS: wssStatus, ActivePools: marketSnapshot.ActivePools, Cycles: marketSnapshot.Cycles, Metrics: snapshot})
+			alert(operationSink, observability.Performance, "operational_summary", telegram.Info, message, map[string]any{"blocks": snapshot.BlocksReceived, "routes": snapshot.RoutesEvaluated, "quotes": snapshot.Quotes, "opportunities": snapshot.Opportunities, "rpc_errors": snapshot.RPCErrors, "wss_disconnects": snapshot.WSSDisconnects, "transactions": snapshot.TransactionsBroadcast})
 		}
 	}
 }
@@ -259,13 +369,44 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 			safetyBPS = parsed
 		}
 	}
-	base, ok := marketConfig.Tokens[marketConfig.BaseAsset]
-	if !ok {
-		return nil, config.MarketConfig{}, fmt.Errorf("base token missing from market config")
-	}
 	feeService := fees.New(client, marketConfig.ArbGasInfo, marketConfig.ETHUSDFeed, safetyBPS)
-	evaluator := opportunity.New(client, marketConfig, uni, camelot, opportunity.ArbitrumCostModel{Service: feeService, BaseDecimals: base.Decimals}, minimum, 4, metrics)
-	return market.New(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, amount, 4, metrics), marketConfig, nil
+	quoteWorkers := boundedWorkerCount("TITANARB_QUOTE_WORKERS", 8)
+	evaluator := opportunity.New(client, marketConfig, uni, camelot, opportunity.ArbitrumCostModel{Service: feeService}, minimum, quoteWorkers, metrics)
+	amounts := marketAmounts(marketConfig, amount)
+	return market.NewWithAmounts(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, amounts, 4, metrics), marketConfig, nil
+}
+
+func boundedWorkerCount(name string, fallback int) int {
+	workers := fallback
+	if parsed, err := strconv.Atoi(strings.TrimSpace(os.Getenv(name))); err == nil {
+		workers = parsed
+	}
+	if workers < 1 {
+		return 1
+	}
+	if workers > 32 {
+		return 32
+	}
+	return workers
+}
+
+func marketAmounts(marketConfig config.MarketConfig, legacyAmount *big.Int) map[string]*big.Int {
+	amounts := make(map[string]*big.Int)
+	for _, symbol := range marketConfig.ExecutionAssets() {
+		name := "TITANARB_MARKET_AMOUNT_" + strings.ToUpper(strings.ReplaceAll(symbol, ".", "_")) + "_RAW"
+		if raw := os.Getenv(name); raw != "" {
+			if amount, ok := new(big.Int).SetString(raw, 10); ok && amount.Sign() > 0 {
+				amounts[symbol] = amount
+			}
+		}
+	}
+	// Compatibility for the pre-existing one-amount configuration. This is
+	// intentionally restricted to its legacy asset; it is never copied to
+	// WETH, ARB, USDT, or another asset.
+	if len(amounts) == 0 && marketConfig.BaseAsset != "" && legacyAmount != nil && legacyAmount.Sign() > 0 {
+		amounts[marketConfig.BaseAsset] = new(big.Int).Set(legacyAmount)
+	}
+	return amounts
 }
 
 // buildPhase4Engine is read-only by construction: it has no signer,
@@ -282,19 +423,28 @@ func buildPhase4Engine(client *rpc.Client, m *metrics.Metrics) (*alpha.Engine, e
 	return alpha.New(marketConfig.Tokens, discoverer, quotes.NewUniswapV3(client, marketConfig.UniswapQuoterV2, m), quotes.NewCamelot(client, marketConfig.CamelotQuoter, m), 4), nil
 }
 
-func phase4MaxHops() int {
-	const safeExecutionMaxHops = 4
-	value, err := strconv.Atoi(os.Getenv("TITANARB_GRAPH_MAX_HOPS"))
-	if err != nil || value < 2 {
-		return safeExecutionMaxHops
+func boundedHopDepth(value int) int {
+	if value < 2 {
+		return 2
 	}
-	// The deployed safety path is proven for at most four hops. Keep graph
-	// discovery within that active compatibility boundary until it is extended
-	// by a separately validated contract change.
-	if value > safeExecutionMaxHops {
-		return safeExecutionMaxHops
+	if value > 4 {
+		return 4
 	}
 	return value
+}
+
+func routeBudget(settings runtimeconfig.Settings) int {
+	// Optimizer depth governs bounded read-only candidate breadth. The cap
+	// protects the RPC budget and is applied evenly across all start assets by
+	// routes.BuildAll.
+	depth := settings.OptimizerDepth
+	if depth < 2 {
+		depth = 2
+	}
+	if depth > 32 {
+		depth = 32
+	}
+	return depth * 32
 }
 
 func publish(sink *operations.Sink, category, event string, severity telegram.Severity, message string, fields map[string]any) {
@@ -316,6 +466,15 @@ func summaryInterval() time.Duration {
 		}
 	}
 	return time.Hour
+}
+
+func pollInterval() time.Duration {
+	if raw := strings.TrimSpace(os.Getenv("POLL_INTERVAL_SECONDS")); raw != "" {
+		if seconds, err := strconv.ParseUint(raw, 10, 64); err == nil && seconds > 0 {
+			return time.Duration(seconds) * time.Second
+		}
+	}
+	return 15 * time.Second
 }
 
 func loadMarketConfig() (config.MarketConfig, error) {
@@ -356,4 +515,17 @@ func rawEnv(name string) (*big.Int, error) {
 		return nil, fmt.Errorf("%s must be a non-negative raw token amount", name)
 	}
 	return v, nil
+}
+
+func parseHexBlock(raw string) (uint64, error) {
+	value := strings.TrimSpace(raw)
+	if value == "" {
+		return 0, fmt.Errorf("empty block number")
+	}
+	base := 10
+	if strings.HasPrefix(value, "0x") || strings.HasPrefix(value, "0X") {
+		base = 16
+		value = value[2:]
+	}
+	return strconv.ParseUint(value, base, 64)
 }

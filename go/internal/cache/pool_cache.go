@@ -57,6 +57,19 @@ func (c *PoolCache) Snapshot() []pools.Pool {
 	return result
 }
 
+// Replace atomically installs a fully reconciled pool universe. Readers see
+// either the old complete snapshot or the new complete snapshot, never a
+// partially rebuilt graph.
+func (c *PoolCache) Replace(updated []pools.Pool) {
+	next := make(map[string]pools.Pool, len(updated))
+	for _, pool := range updated {
+		next[pool.Address] = pool
+	}
+	c.mu.Lock()
+	c.pools = next
+	c.mu.Unlock()
+}
+
 // Refresh obtains a replacement outside the lock, so readers never block on RPC.
 func (c *PoolCache) Refresh(ctx context.Context, load func(context.Context) ([]pools.Pool, error)) error {
 	updated, err := load(ctx)

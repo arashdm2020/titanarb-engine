@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -59,10 +60,46 @@ type MarketConfig struct {
 	ETHUSDFeed          string
 	SequencerUptimeFeed string
 	ArbGasInfo          string
+	ExecutionAssetNames []string
 	BaseAsset           string
 	IntermediateTokens  []string
 	UniswapFeeTiers     []uint32
 	Tokens              map[string]Token
+}
+
+// ExecutionAssets returns the deployed executor's allow-listed universe.
+// executionAssets is neutral membership metadata; its order is normalized and
+// never used for ranking or as a preferred route start. BaseAsset is retained
+// only as a compatibility fallback for older configuration files.
+func (m MarketConfig) ExecutionAssets() []string {
+	seen := make(map[string]struct{})
+	configured := m.ExecutionAssetNames
+	if len(configured) == 0 {
+		configured = append([]string{m.BaseAsset}, m.IntermediateTokens...)
+	}
+	for _, symbol := range configured {
+		if _, ok := m.Tokens[symbol]; ok && symbol != "" {
+			seen[symbol] = struct{}{}
+		}
+	}
+	assets := make([]string, 0, len(seen))
+	for symbol := range seen {
+		assets = append(assets, symbol)
+	}
+	sort.Strings(assets)
+	return assets
+}
+
+// DiscoveryAssets is the broader, read-only token registry. Tokens outside
+// ExecutionAssets may be inspected but cannot be sent to the deployed
+// executor until its on-chain allow-list is explicitly updated.
+func (m MarketConfig) DiscoveryAssets() []string {
+	assets := make([]string, 0, len(m.Tokens))
+	for symbol := range m.Tokens {
+		assets = append(assets, symbol)
+	}
+	sort.Strings(assets)
+	return assets
 }
 
 // LoadMarketConfig reads the repository's canonical Arbitrum JSON file. It
@@ -94,6 +131,7 @@ func LoadMarketConfig(path string) (MarketConfig, error) {
 			Precompile string `json:"precompile"`
 		} `json:"arbGasInfo"`
 		RouteDiscovery struct {
+			ExecutionAssets    []string `json:"executionAssets"`
 			BaseAsset          string   `json:"baseAsset"`
 			IntermediateTokens []string `json:"intermediateTokens"`
 			UniswapFeeTiers    []uint32 `json:"uniswapFeeTiers"`
@@ -107,10 +145,10 @@ func LoadMarketConfig(path string) (MarketConfig, error) {
 		AavePool: raw.AaveV3.Pool, UniswapFactory: raw.UniswapV3.Factory, UniswapSwapRouter: raw.UniswapV3.SwapRouter,
 		UniswapQuoterV2: raw.UniswapV3.QuoterV2, CamelotFactory: raw.CamelotV3.Factory, CamelotSwapRouter: raw.CamelotV3.SwapRouter,
 		CamelotQuoter: raw.CamelotV3.Quoter, ETHUSDFeed: raw.Chainlink.ETHUSDFeed, SequencerUptimeFeed: raw.Chainlink.SequencerUptimeFeed, ArbGasInfo: raw.ArbGasInfo.Precompile,
-		BaseAsset: raw.RouteDiscovery.BaseAsset, IntermediateTokens: raw.RouteDiscovery.IntermediateTokens,
+		ExecutionAssetNames: raw.RouteDiscovery.ExecutionAssets, BaseAsset: raw.RouteDiscovery.BaseAsset, IntermediateTokens: raw.RouteDiscovery.IntermediateTokens,
 		UniswapFeeTiers: raw.RouteDiscovery.UniswapFeeTiers, Tokens: raw.Tokens,
 	}
-	if cfg.BaseAsset == "" || len(cfg.Tokens) == 0 {
+	if len(cfg.ExecutionAssets()) == 0 || len(cfg.Tokens) == 0 {
 		return MarketConfig{}, fmt.Errorf("market configuration is incomplete")
 	}
 	for name, token := range cfg.Tokens {
@@ -119,6 +157,11 @@ func LoadMarketConfig(path string) (MarketConfig, error) {
 		}
 		if token.USDFeed != "" && !addressPattern.MatchString(token.USDFeed) {
 			return MarketConfig{}, fmt.Errorf("token %s has an invalid USD feed", name)
+		}
+	}
+	for _, symbol := range cfg.ExecutionAssetNames {
+		if _, ok := cfg.Tokens[symbol]; !ok {
+			return MarketConfig{}, fmt.Errorf("execution asset %s is not configured", symbol)
 		}
 	}
 	return cfg, nil

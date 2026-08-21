@@ -52,7 +52,7 @@ func VerifyDeployment(ctx context.Context, chain Verifier, cfg config.Config, ma
 	// Validate precisely the configured execution universe. The token registry
 	// also contains optional discovery-only assets (for example USDC.e) that
 	// are not part of this deployment's allow-list.
-	symbols := append([]string{market.BaseAsset}, market.IntermediateTokens...)
+	symbols := market.ExecutionAssets()
 	for _, symbol := range symbols {
 		token, ok := market.Tokens[symbol]
 		if !ok {

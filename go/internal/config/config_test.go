@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -60,5 +61,39 @@ func TestMarketPriceFeedsAreExplicitOnly(t *testing.T) {
 	feeds := market.USDFeeds()
 	if len(feeds) != 1 || feeds["A"] == "" {
 		t.Fatalf("unexpected feed mapping: %#v", feeds)
+	}
+}
+
+func TestMarketAssetsSeparateExecutionBoundaryFromReadOnlyDiscovery(t *testing.T) {
+	market := MarketConfig{
+		BaseAsset:          "USDC",
+		IntermediateTokens: []string{"WETH", "ARB"},
+		Tokens: map[string]Token{
+			"USDC": {Symbol: "USDC", Address: "0x1111111111111111111111111111111111111111"},
+			"WETH": {Symbol: "WETH", Address: "0x2222222222222222222222222222222222222222"},
+			"ARB":  {Symbol: "ARB", Address: "0x3333333333333333333333333333333333333333"},
+			"READ": {Symbol: "READ", Address: "0x4444444444444444444444444444444444444444"},
+		},
+	}
+	if got := strings.Join(market.ExecutionAssets(), ","); got != "ARB,USDC,WETH" {
+		t.Fatalf("unexpected execution asset universe %q", got)
+	}
+	if got := strings.Join(market.DiscoveryAssets(), ","); got != "ARB,READ,USDC,WETH" {
+		t.Fatalf("unexpected discovery asset universe %q", got)
+	}
+}
+
+func TestExecutionAssetsDoNotUseLegacyBaseWhenNeutralMembershipExists(t *testing.T) {
+	market := MarketConfig{
+		BaseAsset:           "USDC",
+		ExecutionAssetNames: []string{"WETH", "ARB"},
+		Tokens: map[string]Token{
+			"USDC": {Symbol: "USDC", Address: "0x1111111111111111111111111111111111111111"},
+			"WETH": {Symbol: "WETH", Address: "0x2222222222222222222222222222222222222222"},
+			"ARB":  {Symbol: "ARB", Address: "0x3333333333333333333333333333333333333333"},
+		},
+	}
+	if got := strings.Join(market.ExecutionAssets(), ","); got != "ARB,WETH" {
+		t.Fatalf("legacy base leaked into neutral execution membership: %q", got)
 	}
 }

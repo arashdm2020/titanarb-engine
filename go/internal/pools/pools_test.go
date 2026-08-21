@@ -63,3 +63,19 @@ func TestInvalidPoolResponse(t *testing.T) {
 		t.Fatal("expected invalid RPC response")
 	}
 }
+
+func TestRefreshPoolReadsOnlyMutableState(t *testing.T) {
+	address := "0x0000000000000000000000000000000000000020"
+	lookup := map[string]string{
+		address + "|" + dex.StaticCall("liquidity()"): response(word(big.NewInt(123))),
+		address + "|" + dex.StaticCall("slot0()"):     response(word(big.NewInt(456))),
+	}
+	d := NewDiscoverer(fakeCaller{responses: lookup}, "factory", "camelot", nil)
+	updated, err := d.RefreshPoolAt(context.Background(), Pool{Address: address, DEX: UniswapV3}, 99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.Liquidity.Cmp(big.NewInt(123)) != 0 || updated.SqrtPriceX96.Cmp(big.NewInt(456)) != 0 || updated.LastUpdatedBlock != 99 {
+		t.Fatalf("unexpected refreshed state: %+v", updated)
+	}
+}

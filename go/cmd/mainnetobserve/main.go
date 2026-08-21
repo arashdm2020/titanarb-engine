@@ -83,7 +83,7 @@ func main() {
 	}
 
 	discoverer := pools.NewDiscoverer(chain, market.UniswapFactory, market.CamelotFactory, market.UniswapFeeTiers)
-	evaluator := opportunity.New(chain, market, quotes.NewUniswapV3(chain, market.UniswapQuoterV2, m), quotes.NewCamelot(chain, market.CamelotQuoter, m), opportunity.ArbitrumCostModel{Service: feeService, BaseDecimals: market.Tokens[market.BaseAsset].Decimals}, minimum, 4, m)
+	evaluator := opportunity.New(chain, market, quotes.NewUniswapV3(chain, market.UniswapQuoterV2, m), quotes.NewCamelot(chain, market.CamelotQuoter, m), opportunity.ArbitrumCostModel{Service: feeService}, minimum, 4, m)
 
 	var (
 		blocks                = map[uint64]struct{}{}

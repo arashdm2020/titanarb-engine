@@ -152,8 +152,15 @@ func (c *Client) GetBlockByNumber(ctx context.Context, number string) (Block, er
 	return b, err
 }
 func (c *Client) EthCall(ctx context.Context, call map[string]string) (string, error) {
+	return c.EthCallAt(ctx, call, "latest")
+}
+
+func (c *Client) EthCallAt(ctx context.Context, call map[string]string, block string) (string, error) {
+	if block == "" {
+		block = "latest"
+	}
 	var raw string
-	err := c.Call(ctx, "eth_call", []any{call, "latest"}, &raw)
+	err := c.Call(ctx, "eth_call", []any{call, block}, &raw)
 	return raw, err
 }
 

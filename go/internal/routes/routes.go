@@ -13,17 +13,58 @@ type Route struct {
 	Hops    []pools.Pool
 }
 
-// Build cycles from the configured base asset through unique configured
-// intermediates. It is intentionally bounded to 2--4 hops and maxRoutes.
+// Build cycles from a legacy configured base asset. New runtime code should
+// use BuildAll, which gives every asset equal start/end treatment.
 func Build(base string, intermediates []string, byPair map[Pair][]pools.Pool, maxRoutes int) []Route {
+	return buildFrom(base, uniqueSorted(intermediates), byPair, maxRoutes)
+}
+
+// BuildAll enumerates 2--4-hop asset-continuous cycles for every supplied
+// asset. A rotated route is intentionally retained: its first asset is the
+// flash-loan asset and therefore creates a materially different execution.
+// Token ordering is normalized only for deterministic output, never ranking.
+func BuildAll(assets []string, byPair map[Pair][]pools.Pool, maxRoutes int) []Route {
 	if maxRoutes < 1 {
+		return nil
+	}
+	assets = uniqueSorted(assets)
+	if len(assets) < 2 {
+		return nil
+	}
+	// A global first-come cap would give alphabetically earlier symbols more
+	// routes. Reserve an equal bounded share for every possible loan asset;
+	// economic ranking happens after quotes, never during enumeration.
+	perAsset := (maxRoutes + len(assets) - 1) / len(assets)
+	var output []Route
+	for _, start := range assets {
+		intermediates := make([]string, 0, len(assets)-1)
+		for _, asset := range assets {
+			if asset != start {
+				intermediates = append(intermediates, asset)
+			}
+		}
+		remaining := maxRoutes - len(output)
+		limit := perAsset
+		if limit > remaining {
+			limit = remaining
+		}
+		output = append(output, buildFrom(start, intermediates, byPair, limit)...)
+		if len(output) >= maxRoutes {
+			return output
+		}
+	}
+	return output
+}
+
+func buildFrom(start string, intermediates []string, byPair map[Pair][]pools.Pool, maximum int) []Route {
+	if maximum < 1 {
 		return nil
 	}
 	var output []Route
 	for hops := 2; hops <= 4; hops++ {
 		for _, path := range permutations(intermediates, hops-1) {
-			symbols := append([]string{base}, path...)
-			symbols = append(symbols, base)
+			symbols := append([]string{start}, path...)
+			symbols = append(symbols, start)
 			choices := make([][]pools.Pool, 0, hops)
 			valid := true
 			for i := 0; i < len(symbols)-1; i++ {
@@ -37,12 +78,27 @@ func Build(base string, intermediates []string, byPair map[Pair][]pools.Pool, ma
 			if !valid {
 				continue
 			}
-			appendCombinations(symbols, choices, 0, nil, &output, maxRoutes)
-			if len(output) >= maxRoutes {
+			appendCombinations(symbols, choices, 0, nil, &output, maximum)
+			if len(output) >= maximum {
 				return output
 			}
 		}
 	}
+	return output
+}
+
+func uniqueSorted(values []string) []string {
+	seen := make(map[string]struct{})
+	for _, value := range values {
+		if value != "" {
+			seen[value] = struct{}{}
+		}
+	}
+	output := make([]string, 0, len(seen))
+	for value := range seen {
+		output = append(output, value)
+	}
+	sort.Strings(output)
 	return output
 }
 

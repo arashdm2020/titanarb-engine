@@ -33,15 +33,16 @@ type Chain interface {
 }
 
 type Pipeline struct {
-	config    config.Config
-	market    config.MarketConfig
-	chain     Chain
-	fees      *fees.Service
-	wallet    *wallet.Wallet
-	tracker   *profit.Tracker
-	gate      *safety.Gate
-	metrics   *metrics.Metrics
-	minProfit *big.Int
+	config              config.Config
+	market              config.MarketConfig
+	chain               Chain
+	fees                *fees.Service
+	wallet              *wallet.Wallet
+	tracker             *profit.Tracker
+	gate                *safety.Gate
+	metrics             *metrics.Metrics
+	minProfit           *big.Int
+	latestObservedBlock func() uint64
 }
 
 type Outcome struct {
@@ -55,6 +56,13 @@ type Outcome struct {
 }
 
 func (p *Pipeline) WalletAddress() common.Address { return p.wallet.Address() }
+
+// SetLatestBlockSource connects the execution gate to the market scheduler's
+// latest observed head. It does not alter economics: it only prevents a quote
+// produced from an older pool snapshot from reaching simulation or broadcast.
+func (p *Pipeline) SetLatestBlockSource(source func() uint64) {
+	p.latestObservedBlock = source
+}
 
 func NewPipeline(cfg config.Config, market config.MarketConfig, chain Chain, feeService *fees.Service, gate *safety.Gate, minProfit *big.Int, tracker *profit.Tracker, metricStore *metrics.Metrics) (*Pipeline, error) {
 	if minProfit == nil || minProfit.Sign() <= 0 {
@@ -74,12 +82,16 @@ func NewPipeline(cfg config.Config, market config.MarketConfig, chain Chain, fee
 // SwapStep[] ABI layout and derives a non-zero per-hop minOut from the current
 // configured slippage policy.
 func (p *Pipeline) BuildRequest(ctx context.Context, opp *opportunity.Opportunity) (Request, error) {
-	if opp == nil || len(opp.Hops) < 2 || len(opp.Hops) > 4 {
+	if opp == nil || len(opp.Hops) < 2 || len(opp.Hops) > 4 || len(opp.Route.Symbols) != len(opp.Hops)+1 {
 		return Request{}, fmt.Errorf("invalid opportunity")
 	}
-	base, ok := p.market.Tokens[p.market.BaseAsset]
+	assetSymbol := opp.Route.Symbols[0]
+	asset, ok := p.market.Tokens[assetSymbol]
 	if !ok {
-		return Request{}, fmt.Errorf("base asset not configured")
+		return Request{}, fmt.Errorf("loan asset %s not configured", assetSymbol)
+	}
+	if opp.Route.Symbols[len(opp.Route.Symbols)-1] != assetSymbol {
+		return Request{}, fmt.Errorf("route must return to its loan asset")
 	}
 	steps := make([]SwapStep, 0, len(opp.Hops))
 	for i, hop := range opp.Hops {
@@ -109,7 +121,7 @@ func (p *Pipeline) BuildRequest(ctx context.Context, opp *opportunity.Opportunit
 	if err != nil {
 		return Request{}, err
 	}
-	return Request{Asset: common.HexToAddress(base.Address), Amount: new(big.Int).Set(opp.AmountIn), Steps: steps, Deadline: new(big.Int).SetUint64(block + p.config.DeadlineSeconds), MinProfit: new(big.Int).Set(p.minProfit)}, nil
+	return Request{Asset: common.HexToAddress(asset.Address), Amount: new(big.Int).Set(opp.AmountIn), Steps: steps, Deadline: new(big.Int).SetUint64(block + p.config.DeadlineSeconds), MinProfit: new(big.Int).Set(p.minProfit)}, nil
 }
 
 // Process applies every production safety gate. Broadcast requires both the
@@ -117,6 +129,9 @@ func (p *Pipeline) BuildRequest(ctx context.Context, opp *opportunity.Opportunit
 // makes migration cut-over an explicit operational decision rather than an
 // accidental consequence of reusing a legacy environment file.
 func (p *Pipeline) Process(ctx context.Context, opp *opportunity.Opportunity) Outcome {
+	if opp != nil && p.latestObservedBlock != nil && !candidateIsFresh(opp.SourceBlock, p.latestObservedBlock()) {
+		return Outcome{Decision: "reject", Reason: "stale candidate: newer chain state observed"}
+	}
 	if err := p.gate.Check(ctx, time.Now().UTC()); err != nil {
 		return Outcome{Decision: "reject", Reason: "safety gate: " + err.Error()}
 	}
@@ -143,9 +158,12 @@ func (p *Pipeline) Process(ctx context.Context, opp *opportunity.Opportunity) Ou
 	if err != nil {
 		return Outcome{Decision: "reject", Reason: err.Error(), Request: req, Simulation: &sim}
 	}
-	base := p.market.Tokens[p.market.BaseAsset]
-	l2 := feeToBaseRaw(sim.Fee.L2Cost, sim.Fee.TotalUSD, sim.Fee.TotalETH, base.Decimals)
-	l1 := feeToBaseRaw(sim.Fee.L1Cost, sim.Fee.TotalUSD, sim.Fee.TotalETH, base.Decimals)
+	asset, ok := p.market.Tokens[opp.Route.Symbols[0]]
+	if !ok {
+		return Outcome{Decision: "reject", Reason: "loan asset not configured", Request: req, Simulation: &sim}
+	}
+	l2 := feeToBaseRaw(sim.Fee.L2Cost, sim.Fee.TotalUSD, sim.Fee.TotalETH, asset.Decimals)
+	l1 := feeToBaseRaw(sim.Fee.L1Cost, sim.Fee.TotalUSD, sim.Fee.TotalETH, asset.Decimals)
 	final := new(big.Int).Set(opp.Hops[len(opp.Hops)-1].AmountOut)
 	economics := pricing.Evaluate(pricing.Inputs{AmountIn: req.Amount, AmountOut: final, AavePremium: premium, L2Fee: l2, L1DataFee: l1, MinProfit: req.MinProfit})
 	if !economics.Profitable {
@@ -199,6 +217,13 @@ func (p *Pipeline) Process(ctx context.Context, opp *opportunity.Opportunity) Ou
 	}
 	p.recordReceipt("trade_success", opp, hash, economics.ExpectedProfit, premium, receiptResult.Receipt)
 	return Outcome{Decision: "confirmed", Request: req, Simulation: &sim, FinalProfit: economics.ExpectedProfit, TxHash: hash, Receipt: receiptResult.Receipt}
+}
+
+func candidateIsFresh(sourceBlock, latestObservedBlock uint64) bool {
+	// SourceBlock zero is retained for deterministic fixtures and callers that
+	// do not yet provide block-aware pool state. Production market cycles always
+	// attach the pinned pool-state block.
+	return sourceBlock == 0 || latestObservedBlock <= sourceBlock
 }
 
 func (p *Pipeline) aavePremium(ctx context.Context, amount *big.Int) (*big.Int, error) {

@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/titanarb/titanarb-go/internal/observability"
@@ -24,6 +25,8 @@ type Sink struct {
 	queue    chan Event
 	done     chan struct{}
 	dropped  atomic.Uint64
+	closeMu  sync.RWMutex
+	closed   bool
 }
 
 func New(dir string, notifier *telegram.Client) (*Sink, error) {
@@ -37,6 +40,11 @@ func New(dir string, notifier *telegram.Client) (*Sink, error) {
 }
 func (s *Sink) Publish(event Event) {
 	if s == nil {
+		return
+	}
+	s.closeMu.RLock()
+	defer s.closeMu.RUnlock()
+	if s.closed {
 		return
 	}
 	if event.Category == "" {
@@ -67,7 +75,12 @@ func (s *Sink) Close(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	close(s.queue)
+	s.closeMu.Lock()
+	if !s.closed {
+		s.closed = true
+		close(s.queue)
+	}
+	s.closeMu.Unlock()
 	select {
 	case <-s.done:
 		if s.telegram != nil {

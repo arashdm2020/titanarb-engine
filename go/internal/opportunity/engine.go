@@ -37,6 +37,7 @@ type Opportunity struct {
 	Route          routes.Route
 	AmountIn       *big.Int
 	Hops           []Hop
+	SourceBlock    uint64
 	ExpectedProfit *big.Int
 	GasEstimate    *big.Int
 	L1DataFee      *big.Int
@@ -54,11 +55,11 @@ type Caller interface {
 	EthCall(context.Context, map[string]string) (string, error)
 }
 type CostModel interface {
-	Estimate(context.Context, routes.Route, []Hop) (l2, l1 *big.Int, err error)
+	Estimate(context.Context, config.Token, routes.Route, []Hop) (l2, l1 *big.Int, err error)
 }
 type StaticCostModel struct{ L2Fee, L1Fee *big.Int }
 
-func (s StaticCostModel) Estimate(_ context.Context, _ routes.Route, _ []Hop) (*big.Int, *big.Int, error) {
+func (s StaticCostModel) Estimate(_ context.Context, _ config.Token, _ routes.Route, _ []Hop) (*big.Int, *big.Int, error) {
 	if s.L2Fee == nil || s.L1Fee == nil {
 		return nil, nil, fmt.Errorf("L2 and L1/data fee estimates are required")
 	}
@@ -68,17 +69,16 @@ func (s StaticCostModel) Estimate(_ context.Context, _ routes.Route, _ []Hop) (*
 // ArbitrumCostModel mirrors Python's provisional 5M-gas, ABI-size route model
 // but obtains current Arbitrum fee components from the authoritative services.
 type ArbitrumCostModel struct {
-	Service      *fees.Service
-	BaseDecimals uint8
+	Service *fees.Service
 }
 
-func (m ArbitrumCostModel) Estimate(ctx context.Context, _ routes.Route, hops []Hop) (*big.Int, *big.Int, error) {
+func (m ArbitrumCostModel) Estimate(ctx context.Context, asset config.Token, _ routes.Route, hops []Hop) (*big.Int, *big.Int, error) {
 	payload := make([]byte, 4+160+256*len(hops))
 	estimate, err := m.Service.Estimate(ctx, 5_000_000, payload)
 	if err != nil {
 		return nil, nil, err
 	}
-	return feeToBaseRaw(estimate.L2Cost, estimate.TotalUSD, estimate.TotalETH, m.BaseDecimals), feeToBaseRaw(estimate.L1Cost, estimate.TotalUSD, estimate.TotalETH, m.BaseDecimals), nil
+	return feeToBaseRaw(estimate.L2Cost, estimate.TotalUSD, estimate.TotalETH, asset.Decimals), feeToBaseRaw(estimate.L1Cost, estimate.TotalUSD, estimate.TotalETH, asset.Decimals), nil
 }
 func feeToBaseRaw(component *big.Int, totalUSD, totalETH *big.Rat, decimals uint8) *big.Int {
 	if component.Sign() == 0 || totalETH.Sign() == 0 {
@@ -107,12 +107,19 @@ func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost 
 	if workers < 1 {
 		workers = 1
 	}
-	return &Engine{caller: c, market: market, uni: uni, camelot: camelot, cost: cost, minProfit: new(big.Int).Set(minProfit), workers: workers, metrics: m, Events: make(chan Event, 128)}
+	// The route universe is bounded by the runtime. Keep one complete bounded
+	// cycle of diagnostic events so a burst of routine rejections cannot hide a
+	// later profitable candidate before the runner drains the cycle.
+	return &Engine{caller: c, market: market, uni: uni, camelot: camelot, cost: cost, minProfit: new(big.Int).Set(minProfit), workers: workers, metrics: m, Events: make(chan Event, 4096)}
 }
 
 func (e *Engine) Evaluate(ctx context.Context, route routes.Route, amount *big.Int) (*Opportunity, error) {
 	if len(route.Hops) < 2 || len(route.Hops) > 4 || len(route.Symbols) != len(route.Hops)+1 {
 		return nil, fmt.Errorf("invalid bounded route")
+	}
+	asset, ok := e.market.Tokens[route.Symbols[0]]
+	if !ok || route.Symbols[len(route.Symbols)-1] != route.Symbols[0] {
+		return nil, fmt.Errorf("route must start and end in a configured loan asset")
 	}
 	current := new(big.Int).Set(amount)
 	hops := make([]Hop, 0, len(route.Hops))
@@ -148,12 +155,12 @@ func (e *Engine) Evaluate(ctx context.Context, route routes.Route, amount *big.I
 	if err != nil {
 		return nil, err
 	}
-	l2, l1, err := e.cost.Estimate(ctx, route, hops)
+	l2, l1, err := e.cost.Estimate(ctx, asset, route, hops)
 	if err != nil {
 		return nil, err
 	}
 	result := pricing.Evaluate(pricing.Inputs{AmountIn: amount, AmountOut: current, AavePremium: premium, L2Fee: l2, L1DataFee: l1, MinProfit: e.minProfit})
-	opportunity := &Opportunity{Route: route, AmountIn: new(big.Int).Set(amount), Hops: hops, ExpectedProfit: result.ExpectedProfit, GasEstimate: l2, L1DataFee: l1, Confidence: "pre_simulation", Timestamp: time.Now().UTC()}
+	opportunity := &Opportunity{Route: route, AmountIn: new(big.Int).Set(amount), Hops: hops, SourceBlock: routeSourceBlock(route), ExpectedProfit: result.ExpectedProfit, GasEstimate: l2, L1DataFee: l1, Confidence: "pre_simulation", Timestamp: time.Now().UTC()}
 	if e.metrics != nil {
 		e.metrics.IncRoutesEvaluated()
 	}
@@ -166,6 +173,19 @@ func (e *Engine) Evaluate(ctx context.Context, route routes.Route, amount *big.I
 		e.emit(Event{Type: Rejected, Opportunity: opportunity, Reason: "profitability threshold not met", Timestamp: opportunity.Timestamp})
 	}
 	return opportunity, nil
+}
+
+func routeSourceBlock(route routes.Route) uint64 {
+	var source uint64
+	for _, pool := range route.Hops {
+		if pool.LastUpdatedBlock == 0 {
+			continue
+		}
+		if source == 0 || pool.LastUpdatedBlock < source {
+			source = pool.LastUpdatedBlock
+		}
+	}
+	return source
 }
 
 func (e *Engine) EvaluateMany(ctx context.Context, candidates []routes.Route, amount *big.Int) {

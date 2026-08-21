@@ -28,3 +28,15 @@ func TestCacheRefreshAndBlockInvalidation(t *testing.T) {
 	}
 	wg.Wait()
 }
+
+func TestReplaceRemovesSupersededPools(t *testing.T) {
+	c := NewPoolCache()
+	c.Put(pools.Pool{Address: "old", LastUpdatedBlock: 1})
+	c.Replace([]pools.Pool{{Address: "new", LastUpdatedBlock: 2}})
+	if _, ok := c.Get("old", 0); ok {
+		t.Fatal("superseded pool survived full reconciliation")
+	}
+	if _, ok := c.Get("new", 2); !ok {
+		t.Fatal("new reconciled pool missing")
+	}
+}

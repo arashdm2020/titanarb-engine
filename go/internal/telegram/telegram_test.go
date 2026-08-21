@@ -42,3 +42,15 @@ func TestFailureNeverBlocksCaller(t *testing.T) {
 	defer cancel()
 	_ = c.Close(ctx)
 }
+
+func TestPresentationMessageDoesNotMirrorDiagnosticFields(t *testing.T) {
+	got := format(Message{
+		Severity: Info,
+		Event:    "operational_summary",
+		Text:     "📊 TITANARB — MARKET\n🟢 Status: ONLINE",
+		Fields:   map[string]string{"routes": "42", "rpc_url": "https://secret.example"},
+	})
+	if got != "📊 TITANARB — MARKET\n🟢 Status: ONLINE" {
+		t.Fatalf("presentation was polluted with raw fields: %q", got)
+	}
+}
