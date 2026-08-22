@@ -86,12 +86,32 @@ func TestSelectOptimizerCandidatesPrefersBestNearMisses(t *testing.T) {
 		t.Fatalf("selected %d optimizer candidates", len(selected))
 	}
 
-	got := []string{selected[0].String(), selected[1].String()}
+	got := []string{selected[0].route.String(), selected[1].route.String()}
 	want := []string{"USDC -> WETH -> USDC", "WETH -> ARB -> WETH"}
 	for i := range want {
 		if got[i] != want[i] {
 			t.Fatalf("candidate %d mismatch: got %q want %q", i, got[i], want[i])
 		}
+	}
+}
+
+func TestSelectOptimizerCandidatesUsesRouteScoreBeforeRawProfit(t *testing.T) {
+	evaluated := []evaluatedRoute{
+		{route: routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}}, score: big.NewInt(100), routeScore: 1_000},
+		{route: routes.Route{Symbols: []string{"ARB", "WETH", "ARB"}}, score: big.NewInt(50), routeScore: 5_000},
+	}
+	selected := selectOptimizerCandidates(evaluated, 1)
+	if len(selected) != 1 || selected[0].route.String() != "ARB -> WETH -> ARB" {
+		t.Fatalf("route score did not drive optimizer priority: %+v", selected)
+	}
+}
+
+func TestSamplesForScoreAllocatesMoreBudgetToHighScoreRoutes(t *testing.T) {
+	base := 8
+	high := samplesForScore(4_500, base)
+	low := samplesForScore(1_000, base)
+	if high <= base || low >= base || low < 2 {
+		t.Fatalf("unexpected sample allocation high=%d base=%d low=%d", high, base, low)
 	}
 }
 

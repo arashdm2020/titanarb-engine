@@ -3,6 +3,7 @@ package market
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"sort"
 	"strings"
@@ -13,6 +14,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/config"
 	"github.com/titanarb/titanarb-go/internal/graph"
 	"github.com/titanarb/titanarb-go/internal/metrics"
+	"github.com/titanarb/titanarb-go/internal/nearmiss"
 	"github.com/titanarb/titanarb-go/internal/opportunity"
 	"github.com/titanarb/titanarb-go/internal/optimizer"
 	"github.com/titanarb/titanarb-go/internal/pools"
@@ -43,6 +45,7 @@ type Engine struct {
 	lastMaxHops       int
 	lastMaxRoutes     int
 	lastStateBlock    uint64
+	routeFailures     map[string]uint64
 }
 
 type Snapshot struct {
@@ -70,6 +73,10 @@ type CycleReport struct {
 	RouteCountAfter   int
 	RoutesByHop       map[int]int
 	DEXRoutes         map[string]int
+	TopNearMisses     []map[string]any
+	RouteScores       map[string]int
+	OptimizerBudget   map[string]int
+	RejectionReasons  map[string]int
 }
 
 const fullReconcileEvery = 240
@@ -125,7 +132,7 @@ func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, ca
 			validAmounts[symbol] = new(big.Int).Set(amount)
 		}
 	}
-	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.ExecutionAssets()}
+	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.ExecutionAssets(), routeFailures: make(map[string]uint64)}
 }
 
 func (e *Engine) SetUniverseTelemetry(active, dynamic, decisions []string) {
@@ -148,6 +155,64 @@ func (e *Engine) Cycle(ctx context.Context) ([]routes.Route, error) {
 // market cycle. It does not alter slippage, repayment, or execution gates.
 func (e *Engine) CycleWithLimits(ctx context.Context, maxHops, maxRoutes int) ([]routes.Route, error) {
 	return e.CycleWithSearch(ctx, maxHops, maxRoutes, 1)
+}
+
+// ForcedOpportunity builds one configured route for a one-shot operational
+// experiment. It bypasses market discovery ranking only; quote reads, fee
+// calculation, min-profit economics, and the downstream execution pipeline
+// remain unchanged.
+func (e *Engine) ForcedOpportunity(ctx context.Context, stateBlock uint64, symbols []string, amount *big.Int) (*opportunity.Opportunity, error) {
+	if len(symbols) < 3 || len(symbols) > 5 {
+		return nil, fmt.Errorf("forced route must contain a 2-4 hop cycle")
+	}
+	if symbols[0] == "" || symbols[len(symbols)-1] != symbols[0] {
+		return nil, fmt.Errorf("forced route must start and end with the loan asset")
+	}
+	if amount == nil || amount.Sign() <= 0 {
+		return nil, fmt.Errorf("forced amount must be positive")
+	}
+	for _, symbol := range symbols {
+		if _, ok := e.market.Tokens[symbol]; !ok {
+			return nil, fmt.Errorf("forced route token %s is not configured", symbol)
+		}
+	}
+	choices := make([][]pools.Pool, 0, len(symbols)-1)
+	for i := 0; i < len(symbols)-1; i++ {
+		in, out := e.market.Tokens[symbols[i]], e.market.Tokens[symbols[i+1]]
+		var found []pools.Pool
+		var err error
+		if stateBlock > 0 {
+			found, err = e.discoverer.DiscoverPairAt(ctx, in.Address, out.Address, stateBlock)
+		} else {
+			found, err = e.discoverer.DiscoverPair(ctx, in.Address, out.Address)
+		}
+		if err != nil {
+			return nil, err
+		}
+		found = liquidPools(found)
+		if len(found) == 0 {
+			return nil, fmt.Errorf("no liquid pool for forced hop %s -> %s", symbols[i], symbols[i+1])
+		}
+		choices = append(choices, found)
+	}
+	var best *opportunity.Opportunity
+	for _, route := range forcedRouteCombinations(symbols, choices, 32) {
+		op, err := e.evaluator.EvaluateSilent(ctx, route, amount)
+		if err != nil || op == nil || op.ExpectedProfit == nil {
+			continue
+		}
+		op.SourceBlock = forcedRouteSourceBlock(op.Route)
+		if op.SourceBlock == 0 {
+			op.SourceBlock = stateBlock
+		}
+		if best == nil || op.ExpectedProfit.Cmp(best.ExpectedProfit) > 0 {
+			best = op
+		}
+	}
+	if best == nil {
+		return nil, fmt.Errorf("forced route produced no quotable pool combination")
+	}
+	return best, nil
 }
 
 // CycleWithSearch additionally consumes a risk-profile supplied volatility
@@ -243,6 +308,10 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.OptimizerRuns = evaluation.OptimizerRuns
 	report.OptimizerSamples = evaluation.OptimizerSamples
 	report.RoutesEvaluated = evaluation.RoutesEvaluated
+	report.TopNearMisses = nearmiss.Snapshot(evaluation.NearMisses, 10)
+	report.RouteScores = nearmiss.Distribution(evaluation.NearMisses)
+	report.OptimizerBudget = evaluation.OptimizerBudget
+	report.RejectionReasons = nearmiss.RejectionReasons(evaluation.NearMisses)
 	report.Duration = time.Since(started)
 	report.Routes = routesFound
 	report.RouteCountAfter = len(routesFound)
@@ -423,6 +492,8 @@ type evaluationReport struct {
 	OptimizerSamples  uint64
 	RoutesEvaluated   uint64
 	OptimizerDuration time.Duration
+	NearMisses        []nearmiss.Record
+	OptimizerBudget   map[string]int
 }
 
 func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, options SearchOptions) evaluationReport {
@@ -442,6 +513,12 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		evaluationCandidates := boundedRoutes(candidates, options.EvaluationRoutesPerAsset)
 		report.RoutesEvaluated += uint64(len(evaluationCandidates))
 		evaluated := e.evaluateCurrent(ctx, evaluationCandidates, amount)
+		e.updateRouteFailures(evaluated)
+		for _, item := range evaluated {
+			if item.nearMiss != nil && item.nearMiss.GapToProfit != nil && item.nearMiss.GapToProfit.Sign() > 0 {
+				report.NearMisses = append(report.NearMisses, *item.nearMiss)
+			}
+		}
 
 		optimizerCandidates := selectOptimizerCandidates(evaluated, options.OptimizerRoutesPerAsset)
 		optimizerStarted := time.Now()
@@ -449,19 +526,28 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		report.OptimizerDuration += time.Since(optimizerStarted)
 		report.OptimizerRuns += optimized.OptimizerRuns
 		report.OptimizerSamples += optimized.OptimizerSamples
+		if report.OptimizerBudget == nil {
+			report.OptimizerBudget = make(map[string]int)
+		}
+		for key, value := range optimized.OptimizerBudget {
+			report.OptimizerBudget[key] += value
+		}
 	}
 	return report
 }
 
 type evaluatedRoute struct {
-	route routes.Route
-	score *big.Int
+	route      routes.Route
+	score      *big.Int
+	nearMiss   *nearmiss.Record
+	routeScore int64
 }
 
 func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route, amount *big.Int) []evaluatedRoute {
 	if len(candidates) == 0 {
 		return nil
 	}
+	failures := e.routeFailureSnapshot()
 	jobs := make(chan routes.Route)
 	results := make(chan evaluatedRoute, len(candidates))
 	var wg sync.WaitGroup
@@ -470,11 +556,17 @@ func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route,
 		go func() {
 			defer wg.Done()
 			for route := range jobs {
+				started := time.Now()
 				op, err := e.evaluator.Evaluate(ctx, route, amount)
 				if err != nil || op == nil || op.ExpectedProfit == nil {
 					continue
 				}
-				results <- evaluatedRoute{route: route, score: new(big.Int).Set(op.ExpectedProfit)}
+				reason := ""
+				if op.MinProfit != nil && op.ExpectedProfit.Cmp(op.MinProfit) <= 0 {
+					reason = "profitability threshold not met"
+				}
+				record := nearmiss.FromOpportunity(op, reason, time.Since(started), failures[routeKey(route)])
+				results <- evaluatedRoute{route: route, score: new(big.Int).Set(op.ExpectedProfit), nearMiss: &record, routeScore: record.Score}
 			}
 		}()
 	}
@@ -502,11 +594,19 @@ func collectEvaluated(results <-chan evaluatedRoute) []evaluatedRoute {
 	return evaluated
 }
 
-func selectOptimizerCandidates(evaluated []evaluatedRoute, limit int) []routes.Route {
+type optimizerCandidate struct {
+	route routes.Route
+	score int64
+}
+
+func selectOptimizerCandidates(evaluated []evaluatedRoute, limit int) []optimizerCandidate {
 	if limit < 1 || len(evaluated) == 0 {
 		return nil
 	}
 	sort.SliceStable(evaluated, func(i, j int) bool {
+		if evaluated[i].routeScore != evaluated[j].routeScore {
+			return evaluated[i].routeScore > evaluated[j].routeScore
+		}
 		left, right := evaluated[i].score, evaluated[j].score
 		if left == nil || right == nil {
 			return right == nil
@@ -519,11 +619,40 @@ func selectOptimizerCandidates(evaluated []evaluatedRoute, limit int) []routes.R
 	if len(evaluated) > limit {
 		evaluated = evaluated[:limit]
 	}
-	selected := make([]routes.Route, 0, len(evaluated))
+	selected := make([]optimizerCandidate, 0, len(evaluated))
 	for _, item := range evaluated {
-		selected = append(selected, item.route)
+		selected = append(selected, optimizerCandidate{route: item.route, score: item.routeScore})
 	}
 	return selected
+}
+
+func (e *Engine) routeFailureSnapshot() map[string]uint64 {
+	e.statsMu.RLock()
+	defer e.statsMu.RUnlock()
+	out := make(map[string]uint64, len(e.routeFailures))
+	for key, value := range e.routeFailures {
+		out[key] = value
+	}
+	return out
+}
+
+func (e *Engine) updateRouteFailures(evaluated []evaluatedRoute) {
+	e.statsMu.Lock()
+	defer e.statsMu.Unlock()
+	if e.routeFailures == nil {
+		e.routeFailures = make(map[string]uint64)
+	}
+	for _, item := range evaluated {
+		if item.score == nil {
+			continue
+		}
+		key := routeKey(item.route)
+		if item.nearMiss != nil && item.nearMiss.GapToProfit != nil && item.nearMiss.GapToProfit.Sign() > 0 {
+			e.routeFailures[key]++
+			continue
+		}
+		delete(e.routeFailures, key)
+	}
 }
 
 func poolChanged(before, after pools.Pool) bool {
@@ -676,8 +805,8 @@ func boundedRoutes(candidates []routes.Route, limit int) []routes.Route {
 	return candidates[:limit]
 }
 
-func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []routes.Route, current *big.Int, samples int) evaluationReport {
-	report := evaluationReport{}
+func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []optimizerCandidate, current *big.Int, samples int) evaluationReport {
+	report := evaluationReport{OptimizerBudget: make(map[string]int)}
 	if current == nil || current.Sign() <= 0 {
 		return report
 	}
@@ -690,7 +819,10 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 		}
 	}
 
-	for _, route := range candidates {
+	for _, candidate := range candidates {
+		route := candidate.route
+		allocatedSamples := samplesForScore(candidate.score, samples)
+		report.OptimizerBudget[routeKey(route)] = allocatedSamples
 		graphRoute := graph.Route{
 			Assets: append([]string(nil), route.Symbols...),
 			Hops:   append([]pools.Pool(nil), route.Hops...),
@@ -710,7 +842,7 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 				return optimizer.Range{
 					Min:     min,
 					Max:     max,
-					Samples: samples,
+					Samples: allocatedSamples,
 				}
 			}(),
 		)
@@ -731,6 +863,65 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 		}
 	}
 	return report
+}
+
+func samplesForScore(score int64, base int) int {
+	if base < 2 {
+		base = 2
+	}
+	switch {
+	case score >= 4_000:
+		return base * 2
+	case score < 2_000:
+		if base/2 < 2 {
+			return 2
+		}
+		return base / 2
+	default:
+		return base
+	}
+}
+
+func routeKey(route routes.Route) string {
+	return route.String() + "|" + nearmiss.DEXPath(route)
+}
+
+func forcedRouteSourceBlock(route routes.Route) uint64 {
+	var source uint64
+	for _, pool := range route.Hops {
+		if pool.LastUpdatedBlock == 0 {
+			continue
+		}
+		if source == 0 || pool.LastUpdatedBlock < source {
+			source = pool.LastUpdatedBlock
+		}
+	}
+	return source
+}
+
+func forcedRouteCombinations(symbols []string, choices [][]pools.Pool, maximum int) []routes.Route {
+	if maximum < 1 {
+		return nil
+	}
+	var out []routes.Route
+	var walk func(int, []pools.Pool)
+	walk = func(index int, current []pools.Pool) {
+		if len(out) >= maximum {
+			return
+		}
+		if index == len(choices) {
+			out = append(out, routes.Route{Symbols: append([]string(nil), symbols...), Hops: append([]pools.Pool(nil), current...)})
+			return
+		}
+		for _, pool := range choices[index] {
+			walk(index+1, append(current, pool))
+			if len(out) >= maximum {
+				return
+			}
+		}
+	}
+	walk(0, nil)
+	return out
 }
 
 func capLoanMax(configured, available *big.Int) *big.Int {

@@ -1,12 +1,22 @@
 package main
 
 import (
+	"context"
+	"io"
 	"math/big"
+	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/titanarb/titanarb-go/internal/config"
+	"github.com/titanarb/titanarb-go/internal/execution"
+	"github.com/titanarb/titanarb-go/internal/logger"
+	"github.com/titanarb/titanarb-go/internal/operations"
+	"github.com/titanarb/titanarb-go/internal/opportunity"
+	"github.com/titanarb/titanarb-go/internal/pools"
+	"github.com/titanarb/titanarb-go/internal/routes"
 	"github.com/titanarb/titanarb-go/internal/runtimeconfig"
 )
 
@@ -108,5 +118,116 @@ func TestApprovedDynamicAssetExpandsMarketOnlyUniverse(t *testing.T) {
 	}
 	if routeUsesOnlyAssets([]string{"USDC", "USDC_E_BRIDGED_ALTERNATIVE", "USDC"}, assetSet(core.ExecutionAssets())) {
 		t.Fatal("dynamic route was incorrectly execution eligible")
+	}
+}
+
+func TestLoadForcedTradeConfig(t *testing.T) {
+	t.Setenv("FORCE_ONE_TRADE", "true")
+	t.Setenv("FORCE_TRADE_ASSET", "USDC")
+	t.Setenv("FORCE_TRADE_AMOUNT", "10000000")
+	t.Setenv("FORCE_TRADE_ROUTE", "USDC,WETH,USDC")
+	dir := t.TempDir()
+	got, err := loadForcedTradeConfig(dir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Enabled || got.Asset != "USDC" || got.Amount.Cmp(big.NewInt(10_000_000)) != 0 || strings.Join(got.Route, ",") != "USDC,WETH,USDC" {
+		t.Fatalf("forced config mismatch: %+v", got)
+	}
+	if !strings.HasPrefix(got.MarkerPath, dir) {
+		t.Fatalf("marker path did not use observability dir: %s", got.MarkerPath)
+	}
+}
+
+func TestLoadForcedTradeConfigRejectsNonCycle(t *testing.T) {
+	t.Setenv("FORCE_ONE_TRADE", "true")
+	t.Setenv("FORCE_TRADE_ASSET", "USDC")
+	t.Setenv("FORCE_TRADE_AMOUNT", "10000000")
+	t.Setenv("FORCE_TRADE_ROUTE", "USDC,WETH,ARB")
+	if _, err := loadForcedTradeConfig(t.TempDir(), ""); err == nil {
+		t.Fatal("invalid forced route accepted")
+	}
+}
+
+func TestConsumeForcedTradeIsOneShot(t *testing.T) {
+	path := t.TempDir() + "/force_one_trade_consumed.json"
+	first, err := consumeForcedTrade(path, map[string]any{"route": "USDC,WETH,USDC"})
+	if err != nil || !first {
+		t.Fatalf("first consume failed: consumed=%t err=%v", first, err)
+	}
+	second, err := consumeForcedTrade(path, map[string]any{"route": "USDC,WETH,USDC"})
+	if err != nil || second {
+		t.Fatalf("second consume was not blocked: consumed=%t err=%v", second, err)
+	}
+	if _, err := os.Stat(path); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type fakeForcedBuilder struct {
+	calls atomic.Uint64
+	opp   *opportunity.Opportunity
+}
+
+func (f *fakeForcedBuilder) ForcedOpportunity(context.Context, uint64, []string, *big.Int) (*opportunity.Opportunity, error) {
+	f.calls.Add(1)
+	return f.opp, nil
+}
+
+type fakeForcedPipeline struct {
+	calls    atomic.Uint64
+	observed atomic.Uint64
+}
+
+func (f *fakeForcedPipeline) ProcessWithObserver(_ context.Context, opp *opportunity.Opportunity, observer execution.Observer) execution.Outcome {
+	f.calls.Add(1)
+	if observer != nil {
+		observer("forced_trade_simulation", map[string]any{"result": "pass", "expected_output": opp.AmountOut.String(), "fees": "0", "repayment": opp.AmountIn.String()})
+		f.observed.Add(1)
+	}
+	return execution.Outcome{Decision: "reject", Reason: "unprofitable after final gas repricing", FinalProfit: big.NewInt(-1)}
+}
+
+type fakeBlockReader struct{}
+
+func (fakeBlockReader) BlockNumber(context.Context) (uint64, error) { return 123, nil }
+
+func TestRunForcedTradeTriggersOnceAndUsesPipeline(t *testing.T) {
+	opp := &opportunity.Opportunity{
+		Route: routes.Route{
+			Symbols: []string{"USDC", "WETH", "USDC"},
+			Hops:    []pools.Pool{{DEX: pools.UniswapV3}, {DEX: pools.CamelotV3}},
+		},
+		AmountIn:       big.NewInt(1000),
+		AmountOut:      big.NewInt(900),
+		GrossProfit:    big.NewInt(-100),
+		AavePremium:    big.NewInt(1),
+		GasEstimate:    big.NewInt(2),
+		L1DataFee:      big.NewInt(3),
+		ExpectedProfit: big.NewInt(-106),
+		MinProfit:      big.NewInt(10),
+		Timestamp:      time.Now().UTC(),
+	}
+	builder := &fakeForcedBuilder{opp: opp}
+	pipeline := &fakeForcedPipeline{}
+	sink, err := operations.New(t.TempDir(), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sink.Close(context.Background())
+	cfg := forcedTradeConfig{Enabled: true, Asset: "USDC", Amount: big.NewInt(1000), Route: []string{"USDC", "WETH", "USDC"}, MarkerPath: t.TempDir() + "/force_one_trade_consumed.json"}
+	log := logger.New(false, io.Discard)
+
+	runForcedTrade(context.Background(), cfg, builder, pipeline, fakeBlockReader{}, sink, log)
+	runForcedTrade(context.Background(), cfg, builder, pipeline, fakeBlockReader{}, sink, log)
+
+	if got := builder.calls.Load(); got != 1 {
+		t.Fatalf("forced opportunity builder calls=%d", got)
+	}
+	if got := pipeline.calls.Load(); got != 1 {
+		t.Fatalf("execution pipeline calls=%d", got)
+	}
+	if got := pipeline.observed.Load(); got != 1 {
+		t.Fatalf("pipeline observer calls=%d", got)
 	}
 }

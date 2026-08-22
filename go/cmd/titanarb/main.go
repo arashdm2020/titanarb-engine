@@ -3,6 +3,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"math/big"
 	"os"
@@ -27,6 +28,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/market"
 	"github.com/titanarb/titanarb-go/internal/metrics"
 	monitor2 "github.com/titanarb/titanarb-go/internal/monitor"
+	"github.com/titanarb/titanarb-go/internal/nearmiss"
 	"github.com/titanarb/titanarb-go/internal/observability"
 	"github.com/titanarb/titanarb-go/internal/operations"
 	"github.com/titanarb/titanarb-go/internal/opportunity"
@@ -172,6 +174,7 @@ func main() {
 					switch outcome.Type {
 					case opportunity.Rejected:
 						rejected++
+						publish(operationSink, observability.Opportunities, "route_evaluation_rejected", telegram.Info, "route rejected by economics", fields)
 					case opportunity.QuoteFailed:
 						quoteFailed++
 						publish(operationSink, observability.Opportunities, string(outcome.Type), telegram.Warning, "quote failed", fields)
@@ -254,13 +257,17 @@ func main() {
 				"quote_duration_ms": report.QuoteDuration.Milliseconds(), "optimizer_duration_ms": report.OptimizerDuration.Milliseconds(),
 				"optimizer_runs": report.OptimizerRuns, "optimizer_samples": report.OptimizerSamples, "cycle_lag_blocks": lag,
 				"blocks_coalesced": coalesced, "rpc_calls": rpcCalls,
-				"active_universe_assets": strings.Join(report.UniverseAssets, ","),
-				"added_dynamic_assets":   strings.Join(report.DynamicAssets, ","),
-				"universe_decisions":     strings.Join(report.UniverseDecisions, "; "),
-				"route_count_before":     report.RouteCountBefore,
-				"route_count_after":      report.RouteCountAfter,
-				"cycles_by_hop":          intMapString(report.RoutesByHop),
-				"dex_diversity":          stringIntMapString(report.DEXRoutes),
+				"active_universe_assets":      strings.Join(report.UniverseAssets, ","),
+				"added_dynamic_assets":        strings.Join(report.DynamicAssets, ","),
+				"universe_decisions":          strings.Join(report.UniverseDecisions, "; "),
+				"route_count_before":          report.RouteCountBefore,
+				"route_count_after":           report.RouteCountAfter,
+				"cycles_by_hop":               intMapString(report.RoutesByHop),
+				"dex_diversity":               stringIntMapString(report.DEXRoutes),
+				"top_near_misses":             report.TopNearMisses,
+				"route_score_distribution":    stringIntMapString(report.RouteScores),
+				"optimizer_budget_allocation": stringIntMapString(report.OptimizerBudget),
+				"rejection_reasons":           stringIntMapString(report.RejectionReasons),
 			}
 			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)
 			publish(operationSink, observability.Performance, "market_cycle", telegram.Info, "market cycle complete", fields)
@@ -269,6 +276,15 @@ func main() {
 			executionPipeline.SetLatestBlockSource(marketScheduler.LatestBlock)
 		}
 		go marketScheduler.Run(ctx)
+	}
+	if marketEngine != nil && executionPipeline != nil {
+		forcedConfig, forcedErr := loadForcedTradeConfig(operationsDir, runtimeConfigPath)
+		if forcedErr != nil {
+			log.Event(logger.Error, "forced_trade_failed", "execution", forcedErr.Error(), nil)
+			publish(operationSink, observability.Errors, "forced_trade_failed", telegram.Error, forcedErr.Error(), nil)
+		} else if forcedConfig.Enabled {
+			go runForcedTrade(ctx, forcedConfig, marketEngine, executionPipeline, rpcClient, operationSink, log)
+		}
 	}
 	healthTicker := time.NewTicker(30 * time.Second)
 	defer healthTicker.Stop()
@@ -585,17 +601,22 @@ func routeUsesOnlyAssets(route []string, allowed map[string]struct{}) bool {
 
 func opportunityTelemetry(opp *opportunity.Opportunity) map[string]any {
 	fields := map[string]any{
-		"route":           opp.Route.String(),
-		"source_block":    opp.SourceBlock,
-		"amount_in":       decimalString(opp.AmountIn),
-		"amount_out":      decimalString(opp.AmountOut),
-		"gross_profit":    decimalString(opp.GrossProfit),
-		"aave_premium":    decimalString(opp.AavePremium),
-		"l2_fee":          decimalString(opp.GasEstimate),
-		"l1_data_fee":     decimalString(opp.L1DataFee),
-		"expected_profit": decimalString(opp.ExpectedProfit),
-		"min_profit":      decimalString(opp.MinProfit),
-		"dex_path":        dexPath(opp),
+		"route":                       opp.Route.String(),
+		"source_block":                opp.SourceBlock,
+		"amount_in":                   decimalString(opp.AmountIn),
+		"amount_out":                  decimalString(opp.AmountOut),
+		"gross_profit":                decimalString(opp.GrossProfit),
+		"aave_premium":                decimalString(opp.AavePremium),
+		"l2_fee":                      decimalString(opp.GasEstimate),
+		"l1_data_fee":                 decimalString(opp.L1DataFee),
+		"expected_profit":             decimalString(opp.ExpectedProfit),
+		"net_profit":                  decimalString(opp.ExpectedProfit),
+		"min_profit":                  decimalString(opp.MinProfit),
+		"min_profit_threshold":        decimalString(opp.MinProfit),
+		"distance_from_profitability": decimalString(nearmiss.Gap(opp.ExpectedProfit, opp.MinProfit)),
+		"price_impact_bps":            nearmiss.PriceImpactBPS(opp.AmountIn, opp.AmountOut),
+		"hop_count":                   len(opp.Hops),
+		"dex_path":                    dexPath(opp),
 	}
 	return fields
 }
@@ -776,6 +797,174 @@ func buildExecutionPipeline(cfg config.Config, marketCfg config.MarketConfig, cl
 	feeService := fees.New(client, marketCfg.ArbGasInfo, marketCfg.ETHUSDFeed, safetyBPS)
 	gate := safety.New(client, marketCfg.ETHUSDFeed, marketCfg.SequencerUptimeFeed, time.Duration(cfg.PriceMaxStalenessSeconds)*time.Second, time.Duration(cfg.SequencerGraceSeconds)*time.Second)
 	return execution.NewPipeline(cfg, marketCfg, client, feeService, gate, minimum, profit.New(os.Getenv("TITANARB_TRADE_METRICS_JSON")), m)
+}
+
+type forcedTradeConfig struct {
+	Enabled    bool
+	Asset      string
+	Amount     *big.Int
+	Route      []string
+	MarkerPath string
+}
+
+type forcedOpportunityBuilder interface {
+	ForcedOpportunity(context.Context, uint64, []string, *big.Int) (*opportunity.Opportunity, error)
+}
+
+type forcedExecutionPipeline interface {
+	ProcessWithObserver(context.Context, *opportunity.Opportunity, execution.Observer) execution.Outcome
+}
+
+type forcedBlockReader interface {
+	BlockNumber(context.Context) (uint64, error)
+}
+
+func loadForcedTradeConfig(observabilityDir, runtimeConfigPath string) (forcedTradeConfig, error) {
+	if !truthy(os.Getenv("FORCE_ONE_TRADE")) {
+		return forcedTradeConfig{}, nil
+	}
+	asset := strings.TrimSpace(os.Getenv("FORCE_TRADE_ASSET"))
+	if asset == "" {
+		return forcedTradeConfig{}, fmt.Errorf("FORCE_TRADE_ASSET is required when FORCE_ONE_TRADE=true")
+	}
+	amount, err := rawEnv("FORCE_TRADE_AMOUNT")
+	if err != nil || amount.Sign() <= 0 {
+		return forcedTradeConfig{}, fmt.Errorf("FORCE_TRADE_AMOUNT must be a positive raw token amount")
+	}
+	route := parseForcedRoute(os.Getenv("FORCE_TRADE_ROUTE"))
+	if len(route) < 3 || len(route) > 5 {
+		return forcedTradeConfig{}, fmt.Errorf("FORCE_TRADE_ROUTE must contain a 2-4 hop cycle")
+	}
+	if route[0] != asset || route[len(route)-1] != asset {
+		return forcedTradeConfig{}, fmt.Errorf("FORCE_TRADE_ROUTE must start and end with FORCE_TRADE_ASSET")
+	}
+	return forcedTradeConfig{Enabled: true, Asset: asset, Amount: amount, Route: route, MarkerPath: forcedTradeMarkerPath(observabilityDir, runtimeConfigPath)}, nil
+}
+
+func runForcedTrade(ctx context.Context, cfg forcedTradeConfig, engine forcedOpportunityBuilder, pipeline forcedExecutionPipeline, client forcedBlockReader, sink *operations.Sink, log *logger.Logger) {
+	fields := map[string]any{"asset": cfg.Asset, "amount": cfg.Amount.String(), "route": strings.Join(cfg.Route, ",")}
+	log.Event(logger.Info, "forced_trade_requested", "execution", "one-shot forced trade requested", fields)
+	publish(sink, observability.Trades, "forced_trade_requested", telegram.Info, "one-shot forced trade requested", fields)
+
+	consumed, err := consumeForcedTrade(cfg.MarkerPath, fields)
+	if err != nil {
+		failForcedTrade(sink, log, "forced_trade_failed", "failed to persist forced trade marker: "+err.Error(), fields)
+		return
+	}
+	if !consumed {
+		log.Event(logger.Info, "forced_trade_skipped", "execution", "one-shot forced trade already consumed", fields)
+		publish(sink, observability.Trades, "forced_trade_skipped", telegram.Info, "one-shot forced trade already consumed", fields)
+		return
+	}
+
+	stateBlock, err := client.BlockNumber(ctx)
+	if err != nil {
+		failForcedTrade(sink, log, "forced_trade_failed", "latest block unavailable: "+err.Error(), fields)
+		return
+	}
+	opp, err := engine.ForcedOpportunity(ctx, stateBlock, cfg.Route, cfg.Amount)
+	if err != nil {
+		failForcedTrade(sink, log, "forced_trade_failed", err.Error(), fields)
+		return
+	}
+	mergeFields(fields, opportunityTelemetry(opp))
+	fields["source_block"] = opp.SourceBlock
+
+	outcome := pipeline.ProcessWithObserver(ctx, opp, func(event string, eventFields map[string]any) {
+		merged := cloneAnyMap(fields)
+		mergeFields(merged, eventFields)
+		log.Event(logger.Info, event, "execution", event, merged)
+		publish(sink, observability.Trades, event, telegram.Info, event, merged)
+	})
+
+	resultFields := cloneAnyMap(fields)
+	resultFields["decision"] = outcome.Decision
+	resultFields["reason"] = outcome.Reason
+	resultFields["tx_hash"] = outcome.TxHash
+	if outcome.FinalProfit != nil {
+		resultFields["final_net_profit"] = outcome.FinalProfit.String()
+	}
+	if outcome.Simulation != nil {
+		resultFields["gas_estimate"] = outcome.Simulation.GasEstimate
+	}
+	if outcome.Receipt != nil {
+		resultFields["receipt_status"] = outcome.Receipt.Status
+		resultFields["gas_used"] = outcome.Receipt.GasUsed
+	}
+	if outcome.TxHash != "" {
+		log.Event(logger.Info, "forced_trade_submitted", "execution", "forced trade submitted", resultFields)
+		publish(sink, observability.Trades, "forced_trade_submitted", telegram.Info, "forced trade submitted", resultFields)
+	}
+	if outcome.Decision == "confirmed" {
+		log.Event(logger.Info, "forced_trade_confirmed", "execution", "forced trade confirmed", resultFields)
+		publish(sink, observability.Trades, "forced_trade_confirmed", telegram.Info, "forced trade confirmed", resultFields)
+		return
+	}
+	failForcedTrade(sink, log, "forced_trade_failed", outcome.Reason, resultFields)
+}
+
+func failForcedTrade(sink *operations.Sink, log *logger.Logger, event, reason string, fields map[string]any) {
+	copyFields := cloneAnyMap(fields)
+	copyFields["reason"] = reason
+	log.Event(logger.Warn, event, "execution", reason, copyFields)
+	publish(sink, observability.Trades, event, telegram.Warning, reason, copyFields)
+}
+
+func consumeForcedTrade(path string, fields map[string]any) (bool, error) {
+	if strings.TrimSpace(path) == "" {
+		return false, fmt.Errorf("forced trade marker path is empty")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return false, err
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		if os.IsExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	defer file.Close()
+	return true, json.NewEncoder(file).Encode(map[string]any{"consumed_at": time.Now().UTC(), "fields": fields})
+}
+
+func forcedTradeMarkerPath(observabilityDir, runtimeConfigPath string) string {
+	base := strings.TrimSpace(observabilityDir)
+	if base == "" && strings.TrimSpace(runtimeConfigPath) != "" {
+		base = filepath.Dir(runtimeConfigPath)
+	}
+	if base == "" {
+		base = "."
+	}
+	return filepath.Join(base, "force_one_trade_consumed.json")
+}
+
+func parseForcedRoute(raw string) []string {
+	parts := strings.Split(raw, ",")
+	out := make([]string, 0, len(parts))
+	for _, part := range parts {
+		if value := strings.TrimSpace(part); value != "" {
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func truthy(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "y", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneAnyMap(input map[string]any) map[string]any {
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		out[key] = value
+	}
+	return out
 }
 
 func rawEnv(name string) (*big.Int, error) {

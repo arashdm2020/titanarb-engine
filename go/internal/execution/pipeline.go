@@ -55,6 +55,8 @@ type Outcome struct {
 	Receipt     *rpc.Receipt
 }
 
+type Observer func(event string, fields map[string]any)
+
 func (p *Pipeline) WalletAddress() common.Address { return p.wallet.Address() }
 
 // SetLatestBlockSource connects the execution gate to the market scheduler's
@@ -129,6 +131,10 @@ func (p *Pipeline) BuildRequest(ctx context.Context, opp *opportunity.Opportunit
 // makes migration cut-over an explicit operational decision rather than an
 // accidental consequence of reusing a legacy environment file.
 func (p *Pipeline) Process(ctx context.Context, opp *opportunity.Opportunity) Outcome {
+	return p.ProcessWithObserver(ctx, opp, nil)
+}
+
+func (p *Pipeline) ProcessWithObserver(ctx context.Context, opp *opportunity.Opportunity, observer Observer) Outcome {
 	if opp != nil && p.latestObservedBlock != nil && !candidateIsFresh(opp.SourceBlock, p.latestObservedBlock()) {
 		return Outcome{Decision: "reject", Reason: "stale candidate: newer chain state observed"}
 	}
@@ -166,6 +172,17 @@ func (p *Pipeline) Process(ctx context.Context, opp *opportunity.Opportunity) Ou
 	l1 := feeToBaseRaw(sim.Fee.L1Cost, sim.Fee.TotalUSD, sim.Fee.TotalETH, asset.Decimals)
 	final := new(big.Int).Set(opp.Hops[len(opp.Hops)-1].AmountOut)
 	economics := pricing.Evaluate(pricing.Inputs{AmountIn: req.Amount, AmountOut: final, AavePremium: premium, L2Fee: l2, L1DataFee: l1, MinProfit: req.MinProfit})
+	if observer != nil {
+		repayment := new(big.Int).Add(req.Amount, premium)
+		observer("forced_trade_simulation", map[string]any{
+			"result":          "pass",
+			"expected_output": final.String(),
+			"l2_fee":          l2.String(),
+			"l1_fee":          l1.String(),
+			"repayment":       repayment.String(),
+			"gas_estimate":    sim.GasEstimate,
+		})
+	}
 	if !economics.Profitable {
 		if p.metrics != nil {
 			p.metrics.IncPostGasRejections()
@@ -194,6 +211,9 @@ func (p *Pipeline) Process(ctx context.Context, opp *opportunity.Opportunity) Ou
 		priorityFee = big.NewInt(0)
 	}
 	limit := sim.GasEstimate * p.config.GasLimitMultiplierBPS / 10_000
+	if observer != nil {
+		observer("forced_trade_ready", map[string]any{"tx_hash": "", "gas_estimate": sim.GasEstimate, "gas_limit": limit})
+	}
 	hash, err := tx.Broadcast(ctx, p.chain, p.wallet, big.NewInt(p.config.ChainID), nonce, limit, gasPrice, priorityFee, p.config.FlashExecutorAddress, calldata)
 	if err != nil {
 		p.wallet.Release(nonce)
