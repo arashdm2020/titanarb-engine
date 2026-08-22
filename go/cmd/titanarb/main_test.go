@@ -93,9 +93,12 @@ func TestApprovedDynamicAssetExpandsMarketOnlyUniverse(t *testing.T) {
 		},
 	}
 
-	expanded, added := marketConfigWithApprovedDynamicAssets(core)
+	expanded, added, decisions := marketConfigWithApprovedDynamicAssets(core, nil, nil, nil, nil, nil)
 	if len(added) != 1 || added[0] != "USDC_E_BRIDGED_ALTERNATIVE" {
 		t.Fatalf("USDC.e dynamic candidate not approved through universe manager: %v", added)
+	}
+	if len(decisions) == 0 || !strings.Contains(strings.Join(decisions, ","), "scan_failed") {
+		t.Fatalf("fallback dynamic bootstrap did not explain scanner failure: %v", decisions)
 	}
 	if got := strings.Join(core.ExecutionAssets(), ","); got != "USDC,WETH" {
 		t.Fatalf("core execution assets changed: %s", got)

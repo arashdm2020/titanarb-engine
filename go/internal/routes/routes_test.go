@@ -92,3 +92,35 @@ func TestBuildAllSharesBoundedCapacityAcrossStartAssets(t *testing.T) {
 		}
 	}
 }
+
+func TestBuildForStartsUsesDynamicAssetsOnlyAsIntermediates(t *testing.T) {
+	assets := []string{"USDC", "WETH", "USDC_E"}
+	pairs := make(map[Pair][]pools.Pool)
+	for _, from := range assets {
+		for _, to := range assets {
+			if from == to {
+				continue
+			}
+			pairs[Pair{From: from, To: to}] = []pools.Pool{{Address: from + to, DEX: pools.UniswapV3, Liquidity: big.NewInt(1)}}
+		}
+	}
+
+	got := BuildForStarts([]string{"USDC", "WETH"}, assets, pairs, 100)
+	if len(got) == 0 {
+		t.Fatal("expected routes through dynamic market asset")
+	}
+	usesDynamic := false
+	for _, route := range got {
+		if route.Symbols[0] == "USDC_E" {
+			t.Fatalf("dynamic market-only asset became a loan/start asset: %#v", route.Symbols)
+		}
+		for _, symbol := range route.Symbols[1 : len(route.Symbols)-1] {
+			if symbol == "USDC_E" {
+				usesDynamic = true
+			}
+		}
+	}
+	if !usesDynamic {
+		t.Fatalf("dynamic asset was not used as an intermediate: %#v", got)
+	}
+}

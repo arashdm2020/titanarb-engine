@@ -33,6 +33,7 @@ type Scanner struct {
 }
 
 type Candidate struct {
+	Name                string         `json:"name"`
 	Symbol              string         `json:"symbol"`
 	Address             string         `json:"address"`
 	Decimals            uint8          `json:"decimals"`
@@ -71,6 +72,7 @@ func (s Scanner) Scan(ctx context.Context) (Report, error) {
 		}
 		token := s.Market.Tokens[symbol]
 		candidate := Candidate{
+			Name:        symbol,
 			Symbol:      token.Symbol,
 			Address:     token.Address,
 			Decimals:    token.Decimals,

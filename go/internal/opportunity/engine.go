@@ -36,11 +36,15 @@ type Hop struct {
 type Opportunity struct {
 	Route          routes.Route
 	AmountIn       *big.Int
+	AmountOut      *big.Int
 	Hops           []Hop
 	SourceBlock    uint64
+	GrossProfit    *big.Int
+	AavePremium    *big.Int
 	ExpectedProfit *big.Int
 	GasEstimate    *big.Int
 	L1DataFee      *big.Int
+	MinProfit      *big.Int
 	Confidence     string
 	Timestamp      time.Time
 }
@@ -247,10 +251,14 @@ func (e *Engine) EvaluateSilent(ctx context.Context, route routes.Route, amount 
 	return &Opportunity{
 		Route:          route,
 		AmountIn:       new(big.Int).Set(amount),
+		AmountOut:      new(big.Int).Set(current),
 		Hops:           hops,
+		GrossProfit:    new(big.Int).Set(result.GrossProfit),
+		AavePremium:    new(big.Int).Set(premium),
 		ExpectedProfit: result.ExpectedProfit,
 		GasEstimate:    l2,
 		L1DataFee:      l1,
+		MinProfit:      new(big.Int).Set(e.minProfit),
 		Confidence:     "optimizer_sample",
 		Timestamp:      time.Now().UTC(),
 	}, nil
@@ -303,7 +311,21 @@ func (e *Engine) Evaluate(ctx context.Context, route routes.Route, amount *big.I
 		return nil, err
 	}
 	result := pricing.Evaluate(pricing.Inputs{AmountIn: amount, AmountOut: current, AavePremium: premium, L2Fee: l2, L1DataFee: l1, MinProfit: e.minProfit})
-	opportunity := &Opportunity{Route: route, AmountIn: new(big.Int).Set(amount), Hops: hops, SourceBlock: routeSourceBlock(route), ExpectedProfit: result.ExpectedProfit, GasEstimate: l2, L1DataFee: l1, Confidence: "pre_simulation", Timestamp: time.Now().UTC()}
+	opportunity := &Opportunity{
+		Route:          route,
+		AmountIn:       new(big.Int).Set(amount),
+		AmountOut:      new(big.Int).Set(current),
+		Hops:           hops,
+		SourceBlock:    routeSourceBlock(route),
+		GrossProfit:    new(big.Int).Set(result.GrossProfit),
+		AavePremium:    new(big.Int).Set(premium),
+		ExpectedProfit: result.ExpectedProfit,
+		GasEstimate:    l2,
+		L1DataFee:      l1,
+		MinProfit:      new(big.Int).Set(e.minProfit),
+		Confidence:     "pre_simulation",
+		Timestamp:      time.Now().UTC(),
+	}
 	if e.metrics != nil {
 		e.metrics.IncRoutesEvaluated()
 	}

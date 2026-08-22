@@ -21,27 +21,28 @@ import (
 )
 
 type Engine struct {
-	market           config.MarketConfig
-	discoverer       *pools.Discoverer
-	cache            *cache.PoolCache
-	evaluator        *opportunity.Engine
-	Events           <-chan opportunity.Event
-	metrics          *metrics.Metrics
-	discoveryWorkers int
-	amounts          map[string]*big.Int
-	statsMu          sync.RWMutex
-	activePools      uint64
-	cycles           uint64
-	volatility       *volatility.Tracker
-	optimizer        optimizer.Optimizer
-	liquidity        func(context.Context, string) (*big.Int, error)
-	routeCache       []routes.Route
-	universeAssets   []string
-	dynamicAssets    []string
-	cyclesSinceFull  uint64
-	lastMaxHops      int
-	lastMaxRoutes    int
-	lastStateBlock   uint64
+	market            config.MarketConfig
+	discoverer        *pools.Discoverer
+	cache             *cache.PoolCache
+	evaluator         *opportunity.Engine
+	Events            <-chan opportunity.Event
+	metrics           *metrics.Metrics
+	discoveryWorkers  int
+	amounts           map[string]*big.Int
+	statsMu           sync.RWMutex
+	activePools       uint64
+	cycles            uint64
+	volatility        *volatility.Tracker
+	optimizer         optimizer.Optimizer
+	liquidity         func(context.Context, string) (*big.Int, error)
+	routeCache        []routes.Route
+	universeAssets    []string
+	dynamicAssets     []string
+	universeDecisions []string
+	cyclesSinceFull   uint64
+	lastMaxHops       int
+	lastMaxRoutes     int
+	lastStateBlock    uint64
 }
 
 type Snapshot struct {
@@ -64,8 +65,11 @@ type CycleReport struct {
 	Routes            []routes.Route
 	UniverseAssets    []string
 	DynamicAssets     []string
+	UniverseDecisions []string
 	RouteCountBefore  int
 	RouteCountAfter   int
+	RoutesByHop       map[int]int
+	DEXRoutes         map[string]int
 }
 
 const fullReconcileEvery = 240
@@ -124,11 +128,12 @@ func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, ca
 	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.ExecutionAssets()}
 }
 
-func (e *Engine) SetUniverseTelemetry(active, dynamic []string) {
+func (e *Engine) SetUniverseTelemetry(active, dynamic, decisions []string) {
 	e.statsMu.Lock()
 	defer e.statsMu.Unlock()
 	e.universeAssets = append([]string(nil), active...)
 	e.dynamicAssets = append([]string(nil), dynamic...)
+	e.universeDecisions = append([]string(nil), decisions...)
 }
 
 // Cycle refreshes the deployed executor's complete allow-listed universe,
@@ -170,6 +175,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	e.statsMu.RLock()
 	report.UniverseAssets = append([]string(nil), e.universeAssets...)
 	report.DynamicAssets = append([]string(nil), e.dynamicAssets...)
+	report.UniverseDecisions = append([]string(nil), e.universeDecisions...)
 	e.statsMu.RUnlock()
 	if maxHops < 2 {
 		maxHops = 2
@@ -213,7 +219,6 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		signals = e.volatility.Observe(active)
 	}
 	routesFound := refreshRoutes(e.routeCache, active)
-	optimizerStarted := time.Now()
 	sort.SliceStable(routesFound, func(i, j int) bool {
 		left := routeVolatility(routesFound[i], signals, volatilityWeight)
 		right := routeVolatility(routesFound[j], signals, volatilityWeight)
@@ -223,7 +228,6 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		return routesFound[i].String() < routesFound[j].String()
 	})
 	affected := routesAffectedBy(routesFound, dirty, report.FullReconcile)
-	report.OptimizerDuration = time.Since(optimizerStarted)
 	report.RoutesRecomputed = uint64(len(affected))
 	if len(routesFound) > len(affected) {
 		report.RoutesReused = uint64(len(routesFound) - len(affected))
@@ -235,12 +239,15 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	quoteStarted := time.Now()
 	evaluation := e.evaluate(ctx, affected, options)
 	report.QuoteDuration = time.Since(quoteStarted)
+	report.OptimizerDuration = evaluation.OptimizerDuration
 	report.OptimizerRuns = evaluation.OptimizerRuns
 	report.OptimizerSamples = evaluation.OptimizerSamples
 	report.RoutesEvaluated = evaluation.RoutesEvaluated
 	report.Duration = time.Since(started)
 	report.Routes = routesFound
 	report.RouteCountAfter = len(routesFound)
+	report.RoutesByHop = routesByHop(routesFound)
+	report.DEXRoutes = routeDEXDiversity(routesFound)
 	if stateBlock > 0 {
 		e.lastStateBlock = stateBlock
 	}
@@ -325,7 +332,7 @@ func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, 
 	}
 	e.cache.Replace(discovered)
 
-	routesFound := routes.BuildAll(symbols, byPair, maxRoutes)
+	routesFound := routes.BuildForStarts(e.loanAssets(), symbols, byPair, maxRoutes)
 
 	filtered := routesFound[:0]
 	for _, route := range routesFound {
@@ -412,9 +419,10 @@ func poolsByAddress(all []pools.Pool, selected map[string]struct{}) []pools.Pool
 }
 
 type evaluationReport struct {
-	OptimizerRuns    uint64
-	OptimizerSamples uint64
-	RoutesEvaluated  uint64
+	OptimizerRuns     uint64
+	OptimizerSamples  uint64
+	RoutesEvaluated   uint64
+	OptimizerDuration time.Duration
 }
 
 func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, options SearchOptions) evaluationReport {
@@ -436,7 +444,9 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		evaluated := e.evaluateCurrent(ctx, evaluationCandidates, amount)
 
 		optimizerCandidates := selectOptimizerCandidates(evaluated, options.OptimizerRoutesPerAsset)
+		optimizerStarted := time.Now()
 		optimized := e.optimizeRoutes(ctx, asset, optimizerCandidates, amount, options.OptimizerSamplesPerRoute)
+		report.OptimizerDuration += time.Since(optimizerStarted)
 		report.OptimizerRuns += optimized.OptimizerRuns
 		report.OptimizerSamples += optimized.OptimizerSamples
 	}
@@ -586,6 +596,49 @@ func routeVolatility(route routes.Route, signals map[string]volatility.Signal, w
 		total += signals[strings.ToLower(pool.Address)].Score(weight)
 	}
 	return total / float64(len(route.Hops))
+}
+
+func (e *Engine) loanAssets() []string {
+	assets := make([]string, 0, len(e.amounts))
+	for asset, amount := range e.amounts {
+		if amount != nil && amount.Sign() > 0 {
+			assets = append(assets, asset)
+		}
+	}
+	sort.Strings(assets)
+	if len(assets) == 0 {
+		return e.market.ExecutionAssets()
+	}
+	return assets
+}
+
+func routesByHop(input []routes.Route) map[int]int {
+	out := make(map[int]int)
+	for _, route := range input {
+		out[len(route.Hops)]++
+	}
+	return out
+}
+
+func routeDEXDiversity(input []routes.Route) map[string]int {
+	out := make(map[string]int)
+	for _, route := range input {
+		seen := make(map[pools.DEX]struct{})
+		for _, hop := range route.Hops {
+			seen[hop.DEX] = struct{}{}
+		}
+		switch len(seen) {
+		case 0:
+			out["unknown"]++
+		case 1:
+			for dexName := range seen {
+				out[string(dexName)]++
+			}
+		default:
+			out["cross_venue"]++
+		}
+	}
+	return out
 }
 
 func (e *Engine) Snapshot() Snapshot {

@@ -24,19 +24,28 @@ func Build(base string, intermediates []string, byPair map[Pair][]pools.Pool, ma
 // flash-loan asset and therefore creates a materially different execution.
 // Token ordering is normalized only for deterministic output, never ranking.
 func BuildAll(assets []string, byPair map[Pair][]pools.Pool, maxRoutes int) []Route {
+	return BuildForStarts(assets, assets, byPair, maxRoutes)
+}
+
+// BuildForStarts enumerates cycles over the full market graph while limiting
+// loan/start assets to the supplied starts. This lets market-only dynamic
+// tokens improve path discovery without consuming route budget as non-executable
+// flash-loan starts.
+func BuildForStarts(starts, assets []string, byPair map[Pair][]pools.Pool, maxRoutes int) []Route {
 	if maxRoutes < 1 {
 		return nil
 	}
 	assets = uniqueSorted(assets)
-	if len(assets) < 2 {
+	starts = uniqueSorted(starts)
+	if len(assets) < 2 || len(starts) == 0 {
 		return nil
 	}
 	// A global first-come cap would give alphabetically earlier symbols more
 	// routes. Reserve an equal bounded share for every possible loan asset;
 	// economic ranking happens after quotes, never during enumeration.
-	perAsset := (maxRoutes + len(assets) - 1) / len(assets)
+	perAsset := (maxRoutes + len(starts) - 1) / len(starts)
 	var output []Route
-	for _, start := range assets {
+	for _, start := range starts {
 		intermediates := make([]string, 0, len(assets)-1)
 		for _, asset := range assets {
 			if asset != start {

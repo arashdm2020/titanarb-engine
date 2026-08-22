@@ -167,9 +167,7 @@ func main() {
 				case outcome := <-marketEngine.Events:
 					fields := map[string]any{"reason": outcome.Reason, "source_block": trigger.Block}
 					if outcome.Opportunity != nil {
-						fields["route"] = outcome.Opportunity.Route.String()
-						fields["expected_profit"] = outcome.Opportunity.ExpectedProfit.String()
-						fields["source_block"] = outcome.Opportunity.SourceBlock
+						mergeFields(fields, opportunityTelemetry(outcome.Opportunity))
 					}
 					switch outcome.Type {
 					case opportunity.Rejected:
@@ -258,8 +256,11 @@ func main() {
 				"blocks_coalesced": coalesced, "rpc_calls": rpcCalls,
 				"active_universe_assets": strings.Join(report.UniverseAssets, ","),
 				"added_dynamic_assets":   strings.Join(report.DynamicAssets, ","),
+				"universe_decisions":     strings.Join(report.UniverseDecisions, "; "),
 				"route_count_before":     report.RouteCountBefore,
 				"route_count_after":      report.RouteCountAfter,
+				"cycles_by_hop":          intMapString(report.RoutesByHop),
+				"dex_diversity":          stringIntMapString(report.DEXRoutes),
 			}
 			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)
 			publish(operationSink, observability.Performance, "market_cycle", telegram.Info, "market cycle complete", fields)
@@ -369,7 +370,6 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 	if err != nil {
 		return nil, config.MarketConfig{}, err
 	}
-	marketConfig, dynamicAssets := marketConfigWithApprovedDynamicAssets(coreMarketConfig)
 	amount, err := rawEnv("TITANARB_MARKET_AMOUNT_RAW")
 	if err != nil {
 		return nil, config.MarketConfig{}, err
@@ -378,6 +378,11 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 	if err != nil {
 		return nil, config.MarketConfig{}, err
 	}
+	coreDiscoverer := pools.NewDiscoverer(client, coreMarketConfig.UniswapFactory, coreMarketConfig.CamelotFactory, coreMarketConfig.UniswapFeeTiers)
+	coreUni := quotes.NewUniswapV3(client, coreMarketConfig.UniswapQuoterV2, metrics)
+	coreCamelot := quotes.NewCamelot(client, coreMarketConfig.CamelotQuoter, metrics)
+	coreAmounts := marketAmounts(coreMarketConfig, amount)
+	marketConfig, dynamicAssets, universeDecisions := marketConfigWithApprovedDynamicAssets(coreMarketConfig, coreDiscoverer, client, coreUni, coreCamelot, coreAmounts)
 	discoverer := pools.NewDiscoverer(client, marketConfig.UniswapFactory, marketConfig.CamelotFactory, marketConfig.UniswapFeeTiers)
 	uni := quotes.NewUniswapV3(client, marketConfig.UniswapQuoterV2, metrics)
 	camelot := quotes.NewCamelot(client, marketConfig.CamelotQuoter, metrics)
@@ -391,7 +396,6 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 	quoteWorkers := boundedWorkerCount("TITANARB_QUOTE_WORKERS", 8)
 	marketCost := opportunity.NewCachedCostModel(opportunity.ArbitrumCostModel{Service: feeService}, 10*time.Second)
 	evaluator := opportunity.New(client, marketConfig, uni, camelot, marketCost, minimum, quoteWorkers, metrics)
-	amounts := marketAmounts(coreMarketConfig, amount)
 	liquidityProvider := func(ctx context.Context, asset string) (*big.Int, error) {
 		token, ok := marketConfig.Tokens[asset]
 		if !ok {
@@ -423,8 +427,8 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 		return available, nil
 	}
 
-	engine := market.NewWithAmounts(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, amounts, 4, metrics, liquidityProvider)
-	engine.SetUniverseTelemetry(assetSymbols(marketConfig, marketConfig.ExecutionAssets()), assetSymbols(marketConfig, dynamicAssets))
+	engine := market.NewWithAmounts(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, coreAmounts, 4, metrics, liquidityProvider)
+	engine.SetUniverseTelemetry(assetSymbols(marketConfig, marketConfig.ExecutionAssets()), assetSymbols(marketConfig, dynamicAssets), universeDecisions)
 	return engine, coreMarketConfig, nil
 }
 
@@ -461,7 +465,7 @@ func marketAmounts(marketConfig config.MarketConfig, legacyAmount *big.Int) map[
 	return amounts
 }
 
-func marketConfigWithApprovedDynamicAssets(core config.MarketConfig) (config.MarketConfig, []string) {
+func marketConfigWithApprovedDynamicAssets(core config.MarketConfig, discoverer universe.PairDiscoverer, caller universe.ChainCaller, uni, camelot quotes.Quoter, amounts map[string]*big.Int) (config.MarketConfig, []string, []string) {
 	managerTokens := make(map[string]config.Token)
 	for _, symbol := range core.ExecutionAssets() {
 		if token, ok := core.Tokens[symbol]; ok {
@@ -469,13 +473,36 @@ func marketConfigWithApprovedDynamicAssets(core config.MarketConfig) (config.Mar
 		}
 	}
 	registry := universe.New(managerTokens)
-	execution := assetSet(core.ExecutionAssets())
+	manager := universe.NewManager(core.ExecutionAssets(), universe.DefaultPolicy())
+	report, err := (universe.Scanner{
+		Market:     core,
+		Discoverer: discoverer,
+		Caller:     caller,
+		Quoter: func(pool pools.Pool) quotes.Quoter {
+			switch pool.DEX {
+			case pools.UniswapV3:
+				return uni
+			case pools.CamelotV3:
+				return camelot
+			default:
+				return nil
+			}
+		},
+		AmountRaw: amounts,
+	}).Scan(context.Background())
+	var decision universe.Decision
+	if err == nil {
+		decision = manager.Select(report)
+	}
+	addedSymbols := decision.AddedAssets
+	if len(addedSymbols) == 0 {
+		// Deterministic bootstrap: USDC.e remains the first operator-approved
+		// market-only dynamic candidate if a startup scan cannot complete.
+		addedSymbols = approvedDynamicUniverseCandidates(core)
+	}
 	var added []string
-	for _, symbol := range approvedDynamicUniverseCandidates(core) {
-		if _, alreadyExecution := execution[symbol]; alreadyExecution {
-			continue
-		}
-		token, ok := core.Tokens[symbol]
+	for _, symbol := range addedSymbols {
+		token, ok := tokenBySymbol(core, symbol)
 		if !ok {
 			continue
 		}
@@ -484,7 +511,7 @@ func marketConfigWithApprovedDynamicAssets(core config.MarketConfig) (config.Mar
 	}
 	expanded := core
 	expanded.ExecutionAssetNames = registry.TokenNames()
-	return expanded, added
+	return expanded, added, universeDecisionStrings(decision, err)
 }
 
 func approvedDynamicUniverseCandidates(marketConfig config.MarketConfig) []string {
@@ -494,6 +521,33 @@ func approvedDynamicUniverseCandidates(marketConfig config.MarketConfig) []strin
 		}
 	}
 	return nil
+}
+
+func tokenBySymbol(marketConfig config.MarketConfig, symbol string) (config.Token, bool) {
+	if token, ok := marketConfig.Tokens[symbol]; ok {
+		return token, true
+	}
+	for key, token := range marketConfig.Tokens {
+		if token.Symbol == symbol {
+			return token, key != ""
+		}
+	}
+	return config.Token{}, false
+}
+
+func universeDecisionStrings(decision universe.Decision, scanErr error) []string {
+	var out []string
+	if scanErr != nil {
+		out = append(out, "scan_failed:"+fmt.Sprintf("%T", scanErr))
+	}
+	for _, item := range decision.Candidates {
+		out = append(out, fmt.Sprintf("%s=%s(score=%.2f,reason=%s)", item.Symbol, item.Action, item.Score, item.Reason))
+	}
+	for _, asset := range decision.RemovedAssets {
+		out = append(out, asset+"=removed")
+	}
+	sort.Strings(out)
+	return out
 }
 
 func assetSet(assets []string) map[string]struct{} {
@@ -527,6 +581,76 @@ func routeUsesOnlyAssets(route []string, allowed map[string]struct{}) bool {
 		}
 	}
 	return true
+}
+
+func opportunityTelemetry(opp *opportunity.Opportunity) map[string]any {
+	fields := map[string]any{
+		"route":           opp.Route.String(),
+		"source_block":    opp.SourceBlock,
+		"amount_in":       decimalString(opp.AmountIn),
+		"amount_out":      decimalString(opp.AmountOut),
+		"gross_profit":    decimalString(opp.GrossProfit),
+		"aave_premium":    decimalString(opp.AavePremium),
+		"l2_fee":          decimalString(opp.GasEstimate),
+		"l1_data_fee":     decimalString(opp.L1DataFee),
+		"expected_profit": decimalString(opp.ExpectedProfit),
+		"min_profit":      decimalString(opp.MinProfit),
+		"dex_path":        dexPath(opp),
+	}
+	return fields
+}
+
+func mergeFields(dst map[string]any, src map[string]any) {
+	for key, value := range src {
+		dst[key] = value
+	}
+}
+
+func decimalString(value *big.Int) string {
+	if value == nil {
+		return "0"
+	}
+	return value.String()
+}
+
+func dexPath(opp *opportunity.Opportunity) string {
+	parts := make([]string, 0, len(opp.Hops))
+	for _, hop := range opp.Hops {
+		parts = append(parts, string(hop.Pool.DEX))
+	}
+	return strings.Join(parts, " -> ")
+}
+
+func intMapString(values map[int]int) string {
+	if len(values) == 0 {
+		return ""
+	}
+	keys := make([]int, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Ints(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, fmt.Sprintf("%d:%d", key, values[key]))
+	}
+	return strings.Join(out, ",")
+}
+
+func stringIntMapString(values map[string]int) string {
+	if len(values) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, fmt.Sprintf("%s:%d", key, values[key]))
+	}
+	return strings.Join(out, ",")
 }
 
 // buildPhase4Engine is read-only by construction: it has no signer,
