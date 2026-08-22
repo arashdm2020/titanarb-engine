@@ -2,6 +2,7 @@ package main
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,5 +79,31 @@ func TestMarketSearchOptionsFollowRiskDepth(t *testing.T) {
 	}
 	if aggressive.OptimizerSamplesPerRoute <= balanced.OptimizerSamplesPerRoute {
 		t.Fatalf("aggressive optimizer samples did not increase: %#v <= %#v", aggressive, balanced)
+	}
+}
+
+func TestApprovedDynamicAssetExpandsMarketOnlyUniverse(t *testing.T) {
+	core := config.MarketConfig{
+		BaseAsset:           "USDC",
+		ExecutionAssetNames: []string{"USDC", "WETH"},
+		Tokens: map[string]config.Token{
+			"USDC":                       {Symbol: "USDC", Address: "0x0000000000000000000000000000000000000001", Decimals: 6},
+			"WETH":                       {Symbol: "WETH", Address: "0x0000000000000000000000000000000000000002", Decimals: 18},
+			"USDC_E_BRIDGED_ALTERNATIVE": {Symbol: "USDC.e", Address: "0x0000000000000000000000000000000000000003", Decimals: 6},
+		},
+	}
+
+	expanded, added := marketConfigWithApprovedDynamicAssets(core)
+	if len(added) != 1 || added[0] != "USDC_E_BRIDGED_ALTERNATIVE" {
+		t.Fatalf("USDC.e dynamic candidate not approved through universe manager: %v", added)
+	}
+	if got := strings.Join(core.ExecutionAssets(), ","); got != "USDC,WETH" {
+		t.Fatalf("core execution assets changed: %s", got)
+	}
+	if got := strings.Join(expanded.ExecutionAssets(), ","); got != "USDC,USDC_E_BRIDGED_ALTERNATIVE,WETH" {
+		t.Fatalf("market universe not expanded: %s", got)
+	}
+	if routeUsesOnlyAssets([]string{"USDC", "USDC_E_BRIDGED_ALTERNATIVE", "USDC"}, assetSet(core.ExecutionAssets())) {
+		t.Fatal("dynamic route was incorrectly execution eligible")
 	}
 }

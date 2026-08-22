@@ -36,6 +36,8 @@ type Engine struct {
 	optimizer        optimizer.Optimizer
 	liquidity        func(context.Context, string) (*big.Int, error)
 	routeCache       []routes.Route
+	universeAssets   []string
+	dynamicAssets    []string
 	cyclesSinceFull  uint64
 	lastMaxHops      int
 	lastMaxRoutes    int
@@ -60,6 +62,10 @@ type CycleReport struct {
 	RoutesEvaluated   uint64
 	Duration          time.Duration
 	Routes            []routes.Route
+	UniverseAssets    []string
+	DynamicAssets     []string
+	RouteCountBefore  int
+	RouteCountAfter   int
 }
 
 const fullReconcileEvery = 240
@@ -115,7 +121,14 @@ func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, ca
 			validAmounts[symbol] = new(big.Int).Set(amount)
 		}
 	}
-	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity}
+	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.ExecutionAssets()}
+}
+
+func (e *Engine) SetUniverseTelemetry(active, dynamic []string) {
+	e.statsMu.Lock()
+	defer e.statsMu.Unlock()
+	e.universeAssets = append([]string(nil), active...)
+	e.dynamicAssets = append([]string(nil), dynamic...)
 }
 
 // Cycle refreshes the deployed executor's complete allow-listed universe,
@@ -153,6 +166,11 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	options = options.Normalized()
 	started := time.Now()
 	report := CycleReport{StateBlock: stateBlock}
+	report.RouteCountBefore = len(e.routeCache)
+	e.statsMu.RLock()
+	report.UniverseAssets = append([]string(nil), e.universeAssets...)
+	report.DynamicAssets = append([]string(nil), e.dynamicAssets...)
+	e.statsMu.RUnlock()
 	if maxHops < 2 {
 		maxHops = 2
 	}
@@ -222,6 +240,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.RoutesEvaluated = evaluation.RoutesEvaluated
 	report.Duration = time.Since(started)
 	report.Routes = routesFound
+	report.RouteCountAfter = len(routesFound)
 	if stateBlock > 0 {
 		e.lastStateBlock = stateBlock
 	}

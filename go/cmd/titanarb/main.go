@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"syscall"
@@ -37,6 +38,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/safety"
 	"github.com/titanarb/titanarb-go/internal/scheduler"
 	"github.com/titanarb/titanarb-go/internal/telegram"
+	"github.com/titanarb/titanarb-go/internal/universe"
 	ws "github.com/titanarb/titanarb-go/internal/websocket"
 )
 
@@ -142,6 +144,7 @@ func main() {
 	var marketScheduler *scheduler.Latest
 	if marketEngine != nil {
 		var recordedCoalesced uint64
+		executionAssets := assetSet(marketCfg.ExecutionAssets())
 		marketScheduler = scheduler.New(func(runCtx context.Context, trigger scheduler.Trigger) {
 			cycleStarted := time.Now()
 			before := m.Snapshot()
@@ -178,6 +181,13 @@ func main() {
 						found++
 						log.Event(logger.Info, string(outcome.Type), "market", "profitable candidate detected", fields)
 						alert(operationSink, observability.Opportunities, string(outcome.Type), telegram.Info, "profitable candidate detected", fields)
+						if outcome.Opportunity != nil && !routeUsesOnlyAssets(outcome.Opportunity.Route.Symbols, executionAssets) {
+							fields["execution_eligible"] = false
+							fields["decision"] = "market_only_dynamic_universe"
+							log.Event(logger.Info, "dynamic_candidate_found", "market", "profitable dynamic-universe candidate is not in execution allow-list", fields)
+							publish(operationSink, observability.Opportunities, "dynamic_candidate_found", telegram.Info, "profitable dynamic-universe candidate is not in execution allow-list", fields)
+							continue
+						}
 						if executionPipeline != nil {
 							result := executionPipeline.Process(cycleCtx, outcome.Opportunity)
 							if strings.HasPrefix(result.Reason, "stale candidate:") {
@@ -246,6 +256,10 @@ func main() {
 				"quote_duration_ms": report.QuoteDuration.Milliseconds(), "optimizer_duration_ms": report.OptimizerDuration.Milliseconds(),
 				"optimizer_runs": report.OptimizerRuns, "optimizer_samples": report.OptimizerSamples, "cycle_lag_blocks": lag,
 				"blocks_coalesced": coalesced, "rpc_calls": rpcCalls,
+				"active_universe_assets": strings.Join(report.UniverseAssets, ","),
+				"added_dynamic_assets":   strings.Join(report.DynamicAssets, ","),
+				"route_count_before":     report.RouteCountBefore,
+				"route_count_after":      report.RouteCountAfter,
 			}
 			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)
 			publish(operationSink, observability.Performance, "market_cycle", telegram.Info, "market cycle complete", fields)
@@ -351,10 +365,11 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 	if os.Getenv("TITANARB_MARKET_ENGINE") != "true" {
 		return nil, config.MarketConfig{}, nil
 	}
-	marketConfig, err := loadMarketConfig()
+	coreMarketConfig, err := loadMarketConfig()
 	if err != nil {
 		return nil, config.MarketConfig{}, err
 	}
+	marketConfig, dynamicAssets := marketConfigWithApprovedDynamicAssets(coreMarketConfig)
 	amount, err := rawEnv("TITANARB_MARKET_AMOUNT_RAW")
 	if err != nil {
 		return nil, config.MarketConfig{}, err
@@ -376,7 +391,7 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 	quoteWorkers := boundedWorkerCount("TITANARB_QUOTE_WORKERS", 8)
 	marketCost := opportunity.NewCachedCostModel(opportunity.ArbitrumCostModel{Service: feeService}, 10*time.Second)
 	evaluator := opportunity.New(client, marketConfig, uni, camelot, marketCost, minimum, quoteWorkers, metrics)
-	amounts := marketAmounts(marketConfig, amount)
+	amounts := marketAmounts(coreMarketConfig, amount)
 	liquidityProvider := func(ctx context.Context, asset string) (*big.Int, error) {
 		token, ok := marketConfig.Tokens[asset]
 		if !ok {
@@ -408,7 +423,9 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 		return available, nil
 	}
 
-	return market.NewWithAmounts(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, amounts, 4, metrics, liquidityProvider), marketConfig, nil
+	engine := market.NewWithAmounts(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, amounts, 4, metrics, liquidityProvider)
+	engine.SetUniverseTelemetry(assetSymbols(marketConfig, marketConfig.ExecutionAssets()), assetSymbols(marketConfig, dynamicAssets))
+	return engine, coreMarketConfig, nil
 }
 
 func boundedWorkerCount(name string, fallback int) int {
@@ -442,6 +459,74 @@ func marketAmounts(marketConfig config.MarketConfig, legacyAmount *big.Int) map[
 		amounts[marketConfig.BaseAsset] = new(big.Int).Set(legacyAmount)
 	}
 	return amounts
+}
+
+func marketConfigWithApprovedDynamicAssets(core config.MarketConfig) (config.MarketConfig, []string) {
+	managerTokens := make(map[string]config.Token)
+	for _, symbol := range core.ExecutionAssets() {
+		if token, ok := core.Tokens[symbol]; ok {
+			managerTokens[symbol] = token
+		}
+	}
+	registry := universe.New(managerTokens)
+	execution := assetSet(core.ExecutionAssets())
+	var added []string
+	for _, symbol := range approvedDynamicUniverseCandidates(core) {
+		if _, alreadyExecution := execution[symbol]; alreadyExecution {
+			continue
+		}
+		token, ok := core.Tokens[symbol]
+		if !ok {
+			continue
+		}
+		registry.AddToken(symbol, token)
+		added = append(added, symbol)
+	}
+	expanded := core
+	expanded.ExecutionAssetNames = registry.TokenNames()
+	return expanded, added
+}
+
+func approvedDynamicUniverseCandidates(marketConfig config.MarketConfig) []string {
+	for key, token := range marketConfig.Tokens {
+		if key == "USDC_E_BRIDGED_ALTERNATIVE" || token.Symbol == "USDC.e" {
+			return []string{key}
+		}
+	}
+	return nil
+}
+
+func assetSet(assets []string) map[string]struct{} {
+	out := make(map[string]struct{}, len(assets))
+	for _, asset := range assets {
+		out[asset] = struct{}{}
+	}
+	return out
+}
+
+func assetSymbols(marketConfig config.MarketConfig, assets []string) []string {
+	out := make([]string, 0, len(assets))
+	for _, asset := range assets {
+		if token, ok := marketConfig.Tokens[asset]; ok && token.Symbol != "" {
+			out = append(out, token.Symbol)
+		} else {
+			out = append(out, asset)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+func routeUsesOnlyAssets(route []string, allowed map[string]struct{}) bool {
+	if len(route) == 0 {
+		return false
+	}
+	for _, asset := range route {
+		if _, ok := allowed[asset]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // buildPhase4Engine is read-only by construction: it has no signer,
