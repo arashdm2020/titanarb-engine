@@ -67,6 +67,34 @@ const maxOptimizerRoutesPerAsset = 2
 const maxEvaluationRoutesPerAsset = 12
 const optimizerSamplesPerRoute = 8
 
+type SearchOptions struct {
+	EvaluationRoutesPerAsset int
+	OptimizerRoutesPerAsset  int
+	OptimizerSamplesPerRoute int
+}
+
+func DefaultSearchOptions() SearchOptions {
+	return SearchOptions{
+		EvaluationRoutesPerAsset: maxEvaluationRoutesPerAsset,
+		OptimizerRoutesPerAsset:  maxOptimizerRoutesPerAsset,
+		OptimizerSamplesPerRoute: optimizerSamplesPerRoute,
+	}
+}
+
+func (o SearchOptions) Normalized() SearchOptions {
+	defaults := DefaultSearchOptions()
+	if o.EvaluationRoutesPerAsset < 1 {
+		o.EvaluationRoutesPerAsset = defaults.EvaluationRoutesPerAsset
+	}
+	if o.OptimizerRoutesPerAsset < 1 {
+		o.OptimizerRoutesPerAsset = defaults.OptimizerRoutesPerAsset
+	}
+	if o.OptimizerSamplesPerRoute < 2 {
+		o.OptimizerSamplesPerRoute = defaults.OptimizerSamplesPerRoute
+	}
+	return o
+}
+
 func New(market config.MarketConfig, discoverer *pools.Discoverer, cache *cache.PoolCache, evaluator *opportunity.Engine, amount *big.Int, workers int, metrics *metrics.Metrics) *Engine {
 	amounts := map[string]*big.Int{}
 	if amount != nil && market.BaseAsset != "" {
@@ -116,6 +144,13 @@ func (e *Engine) CycleWithSearch(ctx context.Context, maxHops, maxRoutes int, vo
 // refreshes in between. A zero stateBlock keeps backwards-compatible latest
 // reads for tests and callers without a WSS trigger.
 func (e *Engine) CycleAt(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int, volatilityWeight float64) (CycleReport, error) {
+	return e.CycleAtWithSearchOptions(ctx, stateBlock, maxHops, maxRoutes, volatilityWeight, DefaultSearchOptions())
+}
+
+// CycleAtWithSearchOptions lets runtime risk profiles widen or narrow the
+// read-only market search envelope without touching execution safety gates.
+func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int, volatilityWeight float64, options SearchOptions) (CycleReport, error) {
+	options = options.Normalized()
 	started := time.Now()
 	report := CycleReport{StateBlock: stateBlock}
 	if maxHops < 2 {
@@ -180,7 +215,7 @@ func (e *Engine) CycleAt(ctx context.Context, stateBlock uint64, maxHops, maxRou
 	e.cycles = uint64(len(routesFound))
 	e.statsMu.Unlock()
 	quoteStarted := time.Now()
-	evaluation := e.evaluate(ctx, affected)
+	evaluation := e.evaluate(ctx, affected, options)
 	report.QuoteDuration = time.Since(quoteStarted)
 	report.OptimizerRuns = evaluation.OptimizerRuns
 	report.OptimizerSamples = evaluation.OptimizerSamples
@@ -363,7 +398,7 @@ type evaluationReport struct {
 	RoutesEvaluated  uint64
 }
 
-func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route) evaluationReport {
+func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, options SearchOptions) evaluationReport {
 	report := evaluationReport{}
 	byAsset := make(map[string][]routes.Route)
 	for _, route := range candidates {
@@ -377,12 +412,12 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route) evalua
 			// raw units or manufacture a USD conversion.
 			continue
 		}
-		evaluationCandidates := boundedRoutes(candidates, maxEvaluationRoutesPerAsset)
+		evaluationCandidates := boundedRoutes(candidates, options.EvaluationRoutesPerAsset)
 		report.RoutesEvaluated += uint64(len(evaluationCandidates))
 		evaluated := e.evaluateCurrent(ctx, evaluationCandidates, amount)
 
-		optimizerCandidates := selectOptimizerCandidates(evaluated, maxOptimizerRoutesPerAsset)
-		optimized := e.optimizeRoutes(ctx, asset, optimizerCandidates, amount)
+		optimizerCandidates := selectOptimizerCandidates(evaluated, options.OptimizerRoutesPerAsset)
+		optimized := e.optimizeRoutes(ctx, asset, optimizerCandidates, amount, options.OptimizerSamplesPerRoute)
 		report.OptimizerRuns += optimized.OptimizerRuns
 		report.OptimizerSamples += optimized.OptimizerSamples
 	}
@@ -569,7 +604,7 @@ func boundedRoutes(candidates []routes.Route, limit int) []routes.Route {
 	return candidates[:limit]
 }
 
-func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []routes.Route, current *big.Int) evaluationReport {
+func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []routes.Route, current *big.Int, samples int) evaluationReport {
 	report := evaluationReport{}
 	if current == nil || current.Sign() <= 0 {
 		return report
@@ -603,7 +638,7 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 				return optimizer.Range{
 					Min:     min,
 					Max:     max,
-					Samples: optimizerSamplesPerRoute,
+					Samples: samples,
 				}
 			}(),
 		)

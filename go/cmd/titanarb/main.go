@@ -151,7 +151,7 @@ func main() {
 			if runtimeRisk != nil {
 				settings = runtimeRisk.Snapshot()
 			}
-			report, cycleErr := marketEngine.CycleAt(cycleCtx, trigger.Block, settings.RouteSearchDepth, routeBudget(settings), settings.VolatilityWeight)
+			report, cycleErr := marketEngine.CycleAtWithSearchOptions(cycleCtx, trigger.Block, settings.RouteSearchDepth, routeBudget(settings), settings.VolatilityWeight, marketSearchOptions(settings))
 			if cycleErr != nil {
 				log.Event(logger.Warn, "health_check_failed", "market", "market cycle failed", map[string]any{"block": trigger.Block, "error_type": fmt.Sprintf("%T", cycleErr)})
 				publish(operationSink, observability.Errors, "market_cycle_failed", telegram.Warning, "market cycle failed", map[string]any{"block": trigger.Block, "error_type": fmt.Sprintf("%T", cycleErr)})
@@ -480,6 +480,31 @@ func routeBudget(settings runtimeconfig.Settings) int {
 		depth = 32
 	}
 	return depth * 32
+}
+
+func marketSearchOptions(settings runtimeconfig.Settings) market.SearchOptions {
+	depth := settings.OptimizerDepth
+	if depth < 2 {
+		depth = 2
+	}
+	if depth > 32 {
+		depth = 32
+	}
+	return market.SearchOptions{
+		EvaluationRoutesPerAsset: clampInt(depth*4, 8, 96),
+		OptimizerRoutesPerAsset:  clampInt(depth/2, 2, 16),
+		OptimizerSamplesPerRoute: clampInt(depth*2, 4, 64),
+	}
+}
+
+func clampInt(value, minimum, maximum int) int {
+	if value < minimum {
+		return minimum
+	}
+	if value > maximum {
+		return maximum
+	}
+	return value
 }
 
 func publish(sink *operations.Sink, category, event string, severity telegram.Severity, message string, fields map[string]any) {

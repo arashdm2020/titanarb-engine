@@ -94,3 +94,11 @@ func TestSelectOptimizerCandidatesPrefersBestNearMisses(t *testing.T) {
 		}
 	}
 }
+
+func TestSearchOptionsNormalizeToSafeDefaults(t *testing.T) {
+	got := (SearchOptions{}).Normalized()
+	defaults := DefaultSearchOptions()
+	if got != defaults {
+		t.Fatalf("zero search options did not normalize to defaults: got %#v want %#v", got, defaults)
+	}
+}

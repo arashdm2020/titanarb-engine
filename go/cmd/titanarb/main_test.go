@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/titanarb/titanarb-go/internal/config"
+	"github.com/titanarb/titanarb-go/internal/runtimeconfig"
 )
 
 func TestLegacyRawAmountIsNotCopiedAcrossAssets(t *testing.T) {
@@ -62,5 +63,20 @@ func TestQuoteWorkerCountIsBounded(t *testing.T) {
 	t.Setenv("TITANARB_QUOTE_WORKERS", "0")
 	if got := boundedWorkerCount("TITANARB_QUOTE_WORKERS", 8); got != 1 {
 		t.Fatalf("lower bound ignored: %d", got)
+	}
+}
+
+func TestMarketSearchOptionsFollowRiskDepth(t *testing.T) {
+	balanced := marketSearchOptions(runtimeconfig.Defaults(runtimeconfig.Balanced))
+	aggressive := marketSearchOptions(runtimeconfig.Defaults(runtimeconfig.Aggressive))
+
+	if aggressive.EvaluationRoutesPerAsset <= balanced.EvaluationRoutesPerAsset {
+		t.Fatalf("aggressive evaluation breadth did not increase: %#v <= %#v", aggressive, balanced)
+	}
+	if aggressive.OptimizerRoutesPerAsset <= balanced.OptimizerRoutesPerAsset {
+		t.Fatalf("aggressive optimizer breadth did not increase: %#v <= %#v", aggressive, balanced)
+	}
+	if aggressive.OptimizerSamplesPerRoute <= balanced.OptimizerSamplesPerRoute {
+		t.Fatalf("aggressive optimizer samples did not increase: %#v <= %#v", aggressive, balanced)
 	}
 }
