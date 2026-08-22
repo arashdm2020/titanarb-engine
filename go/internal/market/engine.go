@@ -63,7 +63,7 @@ type CycleReport struct {
 }
 
 const fullReconcileEvery = 240
-const maxOptimizerRoutesPerAsset = 4
+const maxOptimizerRoutesPerAsset = 2
 const maxEvaluationRoutesPerAsset = 12
 const optimizerSamplesPerRoute = 8
 
@@ -377,16 +377,89 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route) evalua
 			// raw units or manufacture a USD conversion.
 			continue
 		}
-		optimizerCandidates := boundedRoutes(candidates, maxOptimizerRoutesPerAsset)
+		evaluationCandidates := boundedRoutes(candidates, maxEvaluationRoutesPerAsset)
+		report.RoutesEvaluated += uint64(len(evaluationCandidates))
+		evaluated := e.evaluateCurrent(ctx, evaluationCandidates, amount)
+
+		optimizerCandidates := selectOptimizerCandidates(evaluated, maxOptimizerRoutesPerAsset)
 		optimized := e.optimizeRoutes(ctx, asset, optimizerCandidates, amount)
 		report.OptimizerRuns += optimized.OptimizerRuns
 		report.OptimizerSamples += optimized.OptimizerSamples
-
-		evaluationCandidates := boundedRoutes(candidates, maxEvaluationRoutesPerAsset)
-		report.RoutesEvaluated += uint64(len(evaluationCandidates))
-		e.evaluator.EvaluateMany(ctx, evaluationCandidates, amount)
 	}
 	return report
+}
+
+type evaluatedRoute struct {
+	route routes.Route
+	score *big.Int
+}
+
+func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route, amount *big.Int) []evaluatedRoute {
+	if len(candidates) == 0 {
+		return nil
+	}
+	jobs := make(chan routes.Route)
+	results := make(chan evaluatedRoute, len(candidates))
+	var wg sync.WaitGroup
+	for i := 0; i < e.discoveryWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for route := range jobs {
+				op, err := e.evaluator.Evaluate(ctx, route, amount)
+				if err != nil || op == nil || op.ExpectedProfit == nil {
+					continue
+				}
+				results <- evaluatedRoute{route: route, score: new(big.Int).Set(op.ExpectedProfit)}
+			}
+		}()
+	}
+	for _, route := range candidates {
+		select {
+		case jobs <- route:
+		case <-ctx.Done():
+			close(jobs)
+			wg.Wait()
+			close(results)
+			return collectEvaluated(results)
+		}
+	}
+	close(jobs)
+	wg.Wait()
+	close(results)
+	return collectEvaluated(results)
+}
+
+func collectEvaluated(results <-chan evaluatedRoute) []evaluatedRoute {
+	var evaluated []evaluatedRoute
+	for result := range results {
+		evaluated = append(evaluated, result)
+	}
+	return evaluated
+}
+
+func selectOptimizerCandidates(evaluated []evaluatedRoute, limit int) []routes.Route {
+	if limit < 1 || len(evaluated) == 0 {
+		return nil
+	}
+	sort.SliceStable(evaluated, func(i, j int) bool {
+		left, right := evaluated[i].score, evaluated[j].score
+		if left == nil || right == nil {
+			return right == nil
+		}
+		if left.Cmp(right) != 0 {
+			return left.Cmp(right) > 0
+		}
+		return evaluated[i].route.String() < evaluated[j].route.String()
+	})
+	if len(evaluated) > limit {
+		evaluated = evaluated[:limit]
+	}
+	selected := make([]routes.Route, 0, len(evaluated))
+	for _, item := range evaluated {
+		selected = append(selected, item.route)
+	}
+	return selected
 }
 
 func poolChanged(before, after pools.Pool) bool {
@@ -534,11 +607,11 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 				}
 			}(),
 		)
+		report.OptimizerSamples += uint64(best.Evaluated)
 
 		if err != nil {
 			continue
 		}
-		report.OptimizerSamples += uint64(best.Evaluated)
 
 		// Optimizer-selected amount becomes the evaluation amount only when
 		// economics are positive. Negative candidates remain rejected.

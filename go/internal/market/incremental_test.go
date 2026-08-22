@@ -72,3 +72,25 @@ func TestBoundedRoutesCapsHotPathWork(t *testing.T) {
 		t.Fatalf("optimizer candidates were not capped: %d", len(got))
 	}
 }
+
+func TestSelectOptimizerCandidatesPrefersBestNearMisses(t *testing.T) {
+	evaluated := []evaluatedRoute{
+		{route: routes.Route{Symbols: []string{"ARB", "USDC", "ARB"}}, score: big.NewInt(-50)},
+		{route: routes.Route{Symbols: []string{"WETH", "ARB", "WETH"}}, score: big.NewInt(10)},
+		{route: routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}}, score: big.NewInt(10)},
+		{route: routes.Route{Symbols: []string{"USDT", "ARB", "USDT"}}, score: big.NewInt(-5)},
+	}
+
+	selected := selectOptimizerCandidates(evaluated, 2)
+	if len(selected) != 2 {
+		t.Fatalf("selected %d optimizer candidates", len(selected))
+	}
+
+	got := []string{selected[0].String(), selected[1].String()}
+	want := []string{"USDC -> WETH -> USDC", "WETH -> ARB -> WETH"}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Fatalf("candidate %d mismatch: got %q want %q", i, got[i], want[i])
+		}
+	}
+}
