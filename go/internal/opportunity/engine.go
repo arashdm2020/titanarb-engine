@@ -92,15 +92,18 @@ func feeToBaseRaw(component *big.Int, totalUSD, totalETH *big.Rat, decimals uint
 }
 
 type Engine struct {
-	caller    Caller
-	market    config.MarketConfig
-	uni       quotes.Quoter
-	camelot   quotes.Quoter
-	cost      CostModel
-	metrics   *metrics.Metrics
-	minProfit *big.Int
-	workers   int
-	Events    chan Event
+	caller        Caller
+	market        config.MarketConfig
+	uni           quotes.Quoter
+	camelot       quotes.Quoter
+	cost          CostModel
+	metrics       *metrics.Metrics
+	minProfit     *big.Int
+	workers       int
+	Events        chan Event
+	premiumMu     sync.Mutex
+	premiumBPS    *big.Int
+	premiumExpiry time.Time
 }
 
 func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost CostModel, minProfit *big.Int, workers int, m *metrics.Metrics) *Engine {
@@ -111,6 +114,53 @@ func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost 
 	// cycle of diagnostic events so a burst of routine rejections cannot hide a
 	// later profitable candidate before the runner drains the cycle.
 	return &Engine{caller: c, market: market, uni: uni, camelot: camelot, cost: cost, minProfit: new(big.Int).Set(minProfit), workers: workers, metrics: m, Events: make(chan Event, 4096)}
+}
+
+type cachedCostEntry struct {
+	l2, l1 *big.Int
+	until  time.Time
+}
+
+type CachedCostModel struct {
+	Base CostModel
+	TTL  time.Duration
+
+	mu    sync.Mutex
+	cache map[string]cachedCostEntry
+}
+
+func NewCachedCostModel(base CostModel, ttl time.Duration) *CachedCostModel {
+	return &CachedCostModel{Base: base, TTL: ttl, cache: make(map[string]cachedCostEntry)}
+}
+
+func (m *CachedCostModel) Estimate(ctx context.Context, asset config.Token, route routes.Route, hops []Hop) (*big.Int, *big.Int, error) {
+	if m == nil || m.Base == nil {
+		return nil, nil, fmt.Errorf("cached cost model requires a base model")
+	}
+	if m.TTL <= 0 {
+		return m.Base.Estimate(ctx, asset, route, hops)
+	}
+	key := fmt.Sprintf("%s:%d:%d", asset.Address, asset.Decimals, len(hops))
+	now := time.Now()
+
+	m.mu.Lock()
+	if entry, ok := m.cache[key]; ok && now.Before(entry.until) {
+		l2 := new(big.Int).Set(entry.l2)
+		l1 := new(big.Int).Set(entry.l1)
+		m.mu.Unlock()
+		return l2, l1, nil
+	}
+	m.mu.Unlock()
+
+	l2, l1, err := m.Base.Estimate(ctx, asset, route, hops)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	m.mu.Lock()
+	m.cache[key] = cachedCostEntry{l2: new(big.Int).Set(l2), l1: new(big.Int).Set(l1), until: now.Add(m.TTL)}
+	m.mu.Unlock()
+	return l2, l1, nil
 }
 
 // EvaluateSilent performs the same economic checks as Evaluate but never emits
@@ -307,6 +357,23 @@ func (e *Engine) EvaluateMany(ctx context.Context, candidates []routes.Route, am
 }
 
 func (e *Engine) aavePremium(ctx context.Context, amount *big.Int) (*big.Int, error) {
+	bps, err := e.aavePremiumBPS(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return new(big.Int).Div(new(big.Int).Mul(amount, bps), big.NewInt(10_000)), nil
+}
+
+func (e *Engine) aavePremiumBPS(ctx context.Context) (*big.Int, error) {
+	now := time.Now()
+	e.premiumMu.Lock()
+	if e.premiumBPS != nil && now.Before(e.premiumExpiry) {
+		bps := new(big.Int).Set(e.premiumBPS)
+		e.premiumMu.Unlock()
+		return bps, nil
+	}
+	e.premiumMu.Unlock()
+
 	raw, err := e.caller.EthCall(ctx, map[string]string{"to": e.market.AavePool, "data": dex.StaticCall("FLASHLOAN_PREMIUM_TOTAL()")})
 	if err != nil {
 		return nil, err
@@ -316,7 +383,12 @@ func (e *Engine) aavePremium(ctx context.Context, amount *big.Int) (*big.Int, er
 		return nil, err
 	}
 	bps := dex.WordUint(words[0])
-	return new(big.Int).Div(new(big.Int).Mul(amount, bps), big.NewInt(10_000)), nil
+
+	e.premiumMu.Lock()
+	e.premiumBPS = new(big.Int).Set(bps)
+	e.premiumExpiry = now.Add(10 * time.Second)
+	e.premiumMu.Unlock()
+	return bps, nil
 }
 func (e *Engine) emit(event Event) {
 	select {

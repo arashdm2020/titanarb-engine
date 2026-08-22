@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"math/big"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -18,6 +19,20 @@ type caller struct{}
 
 func (caller) EthCall(context.Context, map[string]string) (string, error) {
 	return "0x" + hex.EncodeToString(dex.UintWord(big.NewInt(5))), nil
+}
+
+type countingCaller struct{ calls atomic.Uint64 }
+
+func (c *countingCaller) EthCall(context.Context, map[string]string) (string, error) {
+	c.calls.Add(1)
+	return "0x" + hex.EncodeToString(dex.UintWord(big.NewInt(5))), nil
+}
+
+type countingCost struct{ calls atomic.Uint64 }
+
+func (c *countingCost) Estimate(context.Context, config.Token, routes.Route, []Hop) (*big.Int, *big.Int, error) {
+	c.calls.Add(1)
+	return big.NewInt(10), big.NewInt(20), nil
 }
 
 type quoter struct{}
@@ -48,5 +63,48 @@ func TestEvaluateAndWorkerShutdown(t *testing.T) {
 	case <-done:
 	case <-time.After(time.Second):
 		t.Fatal("workers did not stop")
+	}
+}
+
+func TestAavePremiumIsShortLivedCached(t *testing.T) {
+	a := "0x0000000000000000000000000000000000000001"
+	b := "0x0000000000000000000000000000000000000002"
+	market := config.MarketConfig{AavePool: "0x0000000000000000000000000000000000000003", Tokens: map[string]config.Token{"USDC": token("USDC", a), "WETH": token("WETH", b)}}
+	p := pools.Pool{Address: "p", Token0: a, Token1: b, DEX: pools.UniswapV3, Fee: 500, Liquidity: big.NewInt(1)}
+	route := routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}, Hops: []pools.Pool{p, p}}
+	c := &countingCaller{}
+	e := New(c, market, quoter{}, quoter{}, StaticCostModel{L2Fee: big.NewInt(1), L1Fee: big.NewInt(1)}, big.NewInt(1), 1, nil)
+	for i := 0; i < 3; i++ {
+		if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := c.calls.Load(); got != 1 {
+		t.Fatalf("premium bps was not cached: calls=%d", got)
+	}
+}
+
+func TestCachedCostModelCachesByAssetAndHopCount(t *testing.T) {
+	base := &countingCost{}
+	model := NewCachedCostModel(base, time.Minute)
+	asset := token("USDC", "0x0000000000000000000000000000000000000001")
+	route := routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}, Hops: []pools.Pool{{}, {}}}
+	if _, _, err := model.Estimate(context.Background(), asset, route, []Hop{{}, {}}); err != nil {
+		t.Fatal(err)
+	}
+	l2, _, err := model.Estimate(context.Background(), asset, route, []Hop{{}, {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	l2.SetInt64(999)
+	l2, _, err = model.Estimate(context.Background(), asset, route, []Hop{{}, {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.Cmp(big.NewInt(10)) != 0 {
+		t.Fatalf("cached value was mutated by caller: %s", l2)
+	}
+	if got := base.calls.Load(); got != 1 {
+		t.Fatalf("base cost model was not cached: calls=%d", got)
 	}
 }

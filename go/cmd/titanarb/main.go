@@ -374,7 +374,8 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 	}
 	feeService := fees.New(client, marketConfig.ArbGasInfo, marketConfig.ETHUSDFeed, safetyBPS)
 	quoteWorkers := boundedWorkerCount("TITANARB_QUOTE_WORKERS", 8)
-	evaluator := opportunity.New(client, marketConfig, uni, camelot, opportunity.ArbitrumCostModel{Service: feeService}, minimum, quoteWorkers, metrics)
+	marketCost := opportunity.NewCachedCostModel(opportunity.ArbitrumCostModel{Service: feeService}, 10*time.Second)
+	evaluator := opportunity.New(client, marketConfig, uni, camelot, marketCost, minimum, quoteWorkers, metrics)
 	amounts := marketAmounts(marketConfig, amount)
 	liquidityProvider := func(ctx context.Context, asset string) (*big.Int, error) {
 		token, ok := marketConfig.Tokens[asset]
