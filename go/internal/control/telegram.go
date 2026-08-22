@@ -22,10 +22,22 @@ type Authorizer struct {
 }
 
 func (a Authorizer) Allowed(r Request) bool {
-	if strings.TrimSpace(a.ChatID) == "" || strings.TrimSpace(r.ChatID) != strings.TrimSpace(a.ChatID) {
-		return false
+	chatID := strings.TrimSpace(r.ChatID)
+	senderID := strings.TrimSpace(r.SenderID)
+	allowedChatID := strings.TrimSpace(a.ChatID)
+	adminID := strings.TrimSpace(a.AdminID)
+
+	// Allow commands posted directly in the configured Telegram channel/chat.
+	if allowedChatID != "" && chatID == allowedChatID {
+		return adminID == "" || senderID == "" || senderID == adminID || senderID == allowedChatID
 	}
-	return strings.TrimSpace(a.AdminID) == "" || strings.TrimSpace(r.SenderID) == strings.TrimSpace(a.AdminID)
+
+	// Allow the configured admin to control TitanArb from a private chat.
+	if adminID != "" && chatID == adminID && senderID == adminID {
+		return true
+	}
+
+	return false
 }
 
 type Handler struct {
