@@ -46,3 +46,29 @@ func TestRefreshRoutesDropsInactivePool(t *testing.T) {
 		t.Fatalf("active route was removed: %#v", got)
 	}
 }
+
+func TestCapLoanMaxUsesAaveLiquidityAsUpperBound(t *testing.T) {
+	configured := big.NewInt(1_000)
+	if got := capLoanMax(configured, big.NewInt(250)); got.Cmp(big.NewInt(250)) != 0 {
+		t.Fatalf("available liquidity did not cap max: %s", got)
+	}
+	if got := capLoanMax(configured, big.NewInt(2_000)); got.Cmp(configured) != 0 {
+		t.Fatalf("larger liquidity expanded max: %s", got)
+	}
+	if got := capLoanMax(configured, nil); got.Cmp(configured) != 0 {
+		t.Fatalf("nil liquidity changed max: %s", got)
+	}
+}
+
+func TestBoundedRoutesCapsHotPathWork(t *testing.T) {
+	var candidates []routes.Route
+	for i := 0; i < maxEvaluationRoutesPerAsset+5; i++ {
+		candidates = append(candidates, routes.Route{Symbols: []string{"A", "B", "A"}})
+	}
+	if got := boundedRoutes(candidates, maxEvaluationRoutesPerAsset); len(got) != maxEvaluationRoutesPerAsset {
+		t.Fatalf("evaluation candidates were not capped: %d", len(got))
+	}
+	if got := boundedRoutes(candidates, maxOptimizerRoutesPerAsset); len(got) != maxOptimizerRoutesPerAsset {
+		t.Fatalf("optimizer candidates were not capped: %d", len(got))
+	}
+}

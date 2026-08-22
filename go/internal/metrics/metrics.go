@@ -30,10 +30,13 @@ type CycleSample struct {
 	DurationMS       uint64 `json:"market_cycle_duration_ms"`
 	QuoteDurationMS  uint64 `json:"quote_duration_ms"`
 	OptimizerMS      uint64 `json:"optimizer_duration_ms"`
+	OptimizerRuns    uint64 `json:"optimizer_runs"`
+	OptimizerSamples uint64 `json:"optimizer_samples"`
 	LagBlocks        uint64 `json:"cycle_lag_blocks"`
 	DirtyPools       uint64 `json:"dirty_pools"`
 	RoutesRecomputed uint64 `json:"routes_recomputed"`
 	RoutesReused     uint64 `json:"routes_reused"`
+	RoutesEvaluated  uint64 `json:"routes_evaluated_cycle"`
 	RPCCalls         uint64 `json:"rpc_calls_cycle"`
 }
 type Snapshot struct {

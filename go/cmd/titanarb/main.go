@@ -233,16 +233,18 @@ func main() {
 			m.ObserveMarketCycle(metrics.CycleSample{
 				BlockToStartMS: uint64(blockToStart.Milliseconds()),
 				DurationMS:     uint64(duration.Milliseconds()), QuoteDurationMS: uint64(report.QuoteDuration.Milliseconds()),
-				OptimizerMS: uint64(report.OptimizerDuration.Milliseconds()), LagBlocks: lag, DirtyPools: report.DirtyPools,
-				RoutesRecomputed: report.RoutesRecomputed, RoutesReused: report.RoutesReused, RPCCalls: rpcCalls,
+				OptimizerMS: uint64(report.OptimizerDuration.Milliseconds()), OptimizerRuns: report.OptimizerRuns, OptimizerSamples: report.OptimizerSamples,
+				LagBlocks: lag, DirtyPools: report.DirtyPools, RoutesRecomputed: report.RoutesRecomputed, RoutesReused: report.RoutesReused,
+				RoutesEvaluated: report.RoutesEvaluated, RPCCalls: rpcCalls,
 			})
 			fields := map[string]any{
 				"block": report.StateBlock, "full_reconcile": report.FullReconcile, "cycles": len(report.Routes),
-				"routes_recomputed": report.RoutesRecomputed, "routes_reused": report.RoutesReused,
+				"routes_recomputed": report.RoutesRecomputed, "routes_reused": report.RoutesReused, "routes_evaluated_cycle": report.RoutesEvaluated,
 				"quotes": after.Quotes - before.Quotes, "quote_failures": quoteFailed,
 				"rejected_min_profit": rejected, "profitable_candidates": found, "stale_candidates": stale,
 				"dirty_pools": report.DirtyPools, "block_to_cycle_start_ms": blockToStart.Milliseconds(), "duration_ms": duration.Milliseconds(),
-				"quote_duration_ms": report.QuoteDuration.Milliseconds(), "optimizer_duration_ms": report.OptimizerDuration.Milliseconds(), "cycle_lag_blocks": lag,
+				"quote_duration_ms": report.QuoteDuration.Milliseconds(), "optimizer_duration_ms": report.OptimizerDuration.Milliseconds(),
+				"optimizer_runs": report.OptimizerRuns, "optimizer_samples": report.OptimizerSamples, "cycle_lag_blocks": lag,
 				"blocks_coalesced": coalesced, "rpc_calls": rpcCalls,
 			}
 			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)

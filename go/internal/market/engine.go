@@ -3,7 +3,6 @@ package market
 
 import (
 	"context"
-	"fmt"
 	"math/big"
 	"sort"
 	"strings"
@@ -56,11 +55,17 @@ type CycleReport struct {
 	RoutesReused      uint64
 	QuoteDuration     time.Duration
 	OptimizerDuration time.Duration
+	OptimizerRuns     uint64
+	OptimizerSamples  uint64
+	RoutesEvaluated   uint64
 	Duration          time.Duration
 	Routes            []routes.Route
 }
 
 const fullReconcileEvery = 240
+const maxOptimizerRoutesPerAsset = 4
+const maxEvaluationRoutesPerAsset = 12
+const optimizerSamplesPerRoute = 8
 
 func New(market config.MarketConfig, discoverer *pools.Discoverer, cache *cache.PoolCache, evaluator *opportunity.Engine, amount *big.Int, workers int, metrics *metrics.Metrics) *Engine {
 	amounts := map[string]*big.Int{}
@@ -175,8 +180,11 @@ func (e *Engine) CycleAt(ctx context.Context, stateBlock uint64, maxHops, maxRou
 	e.cycles = uint64(len(routesFound))
 	e.statsMu.Unlock()
 	quoteStarted := time.Now()
-	e.evaluate(ctx, affected)
+	evaluation := e.evaluate(ctx, affected)
 	report.QuoteDuration = time.Since(quoteStarted)
+	report.OptimizerRuns = evaluation.OptimizerRuns
+	report.OptimizerSamples = evaluation.OptimizerSamples
+	report.RoutesEvaluated = evaluation.RoutesEvaluated
 	report.Duration = time.Since(started)
 	report.Routes = routesFound
 	if stateBlock > 0 {
@@ -263,21 +271,7 @@ func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, 
 	}
 	e.cache.Replace(discovered)
 
-	pairCount := 0
-	for _, pools := range byPair {
-		if len(pools) > 0 {
-			pairCount++
-		}
-	}
-	fmt.Printf("pair_distribution pairs=%d symbols=%d\n", pairCount, len(symbols))
-
 	routesFound := routes.BuildAll(symbols, byPair, maxRoutes)
-
-	hopDistribution := make(map[int]int)
-	for _, route := range routesFound {
-		hopDistribution[len(route.Hops)]++
-	}
-	fmt.Printf("route_distribution=%v total=%d\n", hopDistribution, len(routesFound))
 
 	filtered := routesFound[:0]
 	for _, route := range routesFound {
@@ -363,7 +357,14 @@ func poolsByAddress(all []pools.Pool, selected map[string]struct{}) []pools.Pool
 	return result
 }
 
-func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route) {
+type evaluationReport struct {
+	OptimizerRuns    uint64
+	OptimizerSamples uint64
+	RoutesEvaluated  uint64
+}
+
+func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route) evaluationReport {
+	report := evaluationReport{}
 	byAsset := make(map[string][]routes.Route)
 	for _, route := range candidates {
 		byAsset[route.Symbols[0]] = append(byAsset[route.Symbols[0]], route)
@@ -376,8 +377,16 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route) {
 			// raw units or manufacture a USD conversion.
 			continue
 		}
-		e.optimizeRoutes(ctx, asset, candidates, amount)
+		optimizerCandidates := boundedRoutes(candidates, maxOptimizerRoutesPerAsset)
+		optimized := e.optimizeRoutes(ctx, asset, optimizerCandidates, amount)
+		report.OptimizerRuns += optimized.OptimizerRuns
+		report.OptimizerSamples += optimized.OptimizerSamples
+
+		evaluationCandidates := boundedRoutes(candidates, maxEvaluationRoutesPerAsset)
+		report.RoutesEvaluated += uint64(len(evaluationCandidates))
+		e.evaluator.EvaluateMany(ctx, evaluationCandidates, amount)
 	}
+	return report
 }
 
 func poolChanged(before, after pools.Pool) bool {
@@ -480,29 +489,34 @@ func (a optimizerAdapter) Evaluate(ctx context.Context, asset string, route grap
 	}, nil
 }
 
-func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []routes.Route, current *big.Int) {
+func boundedRoutes(candidates []routes.Route, limit int) []routes.Route {
+	if limit < 1 || len(candidates) <= limit {
+		return candidates
+	}
+	return candidates[:limit]
+}
+
+func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []routes.Route, current *big.Int) evaluationReport {
+	report := evaluationReport{}
 	if current == nil || current.Sign() <= 0 {
-		return
+		return report
 	}
 
 	max := new(big.Int).Mul(current, big.NewInt(10))
 
 	if e.liquidity != nil {
-		if available, err := e.liquidity(ctx, asset); err == nil && available != nil && available.Cmp(max) > 0 {
-			max = available
+		if available, err := e.liquidity(ctx, asset); err == nil {
+			max = capLoanMax(max, available)
 		}
 	}
 
 	for _, route := range candidates {
-		if len(route.Hops) > 2 {
-			fmt.Printf("optimizer_route_candidate asset=%s route=%s hops=%d\n", asset, route.String(), len(route.Hops))
-		}
-
 		graphRoute := graph.Route{
 			Assets: append([]string(nil), route.Symbols...),
 			Hops:   append([]pools.Pool(nil), route.Hops...),
 		}
 
+		report.OptimizerRuns++
 		best, err := e.optimizer.Optimize(
 			ctx,
 			optimizerAdapter{evaluator: e.evaluator},
@@ -516,44 +530,15 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 				return optimizer.Range{
 					Min:     min,
 					Max:     max,
-					Samples: 32,
+					Samples: optimizerSamplesPerRoute,
 				}
 			}(),
 		)
 
 		if err != nil {
-			fmt.Printf(
-				"optimizer_shadow_failed asset=%s route=%s reason=%s\n",
-				asset,
-				route.String(),
-				err.Error(),
-			)
 			continue
 		}
-
-		if best.Amount != nil && best.NetProfit != nil {
-			fmt.Printf(
-				"optimizer_shadow asset=%s route=%s amount=%s profit=%s evaluated=%d\n",
-				asset,
-				route.String(),
-				best.Amount.String(),
-				best.NetProfit.String(),
-				best.Evaluated,
-			)
-		}
-
-		// Shadow telemetry only.
-		// The selected amount is NOT used for execution yet.
-		if best.Amount != nil {
-			fmt.Printf(
-				"optimizer_shadow asset=%s current=%s optimized=%s profit=%s evaluated=%d\n",
-				asset,
-				current.String(),
-				best.Amount.String(),
-				best.NetProfit.String(),
-				best.Evaluated,
-			)
-		}
+		report.OptimizerSamples += uint64(best.Evaluated)
 
 		// Optimizer-selected amount becomes the evaluation amount only when
 		// economics are positive. Negative candidates remain rejected.
@@ -565,6 +550,16 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 			_, _ = e.evaluator.Evaluate(ctx, optimizedRoute, best.Amount)
 		}
 	}
+	return report
+}
 
-	e.evaluator.EvaluateMany(ctx, candidates, current)
+func capLoanMax(configured, available *big.Int) *big.Int {
+	if configured == nil {
+		return nil
+	}
+	max := new(big.Int).Set(configured)
+	if available != nil && available.Sign() > 0 && available.Cmp(max) < 0 {
+		max = new(big.Int).Set(available)
+	}
+	return max
 }
