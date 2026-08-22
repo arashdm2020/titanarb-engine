@@ -72,13 +72,14 @@ func buildFrom(start string, intermediates []string, byPair map[Pair][]pools.Poo
 
 	// Reserve bounded capacity across hop depths so short cycles do not
 	// consume the entire route budget before longer cycles are considered.
-	perHopLimit := maximum / 3
-	if perHopLimit < 1 {
-		perHopLimit = 1
-	}
-
+	perHopLimits := splitLimit(maximum, 3)
 	var output []Route
 	for hops := 2; hops <= 4; hops++ {
+		hopLimit := perHopLimits[hops-2]
+		if hopLimit < 1 {
+			continue
+		}
+		hopRoutes := make([]Route, 0, hopLimit)
 		for _, path := range permutations(intermediates, hops-1) {
 			symbols := append([]string{start}, path...)
 			symbols = append(symbols, start)
@@ -95,14 +96,33 @@ func buildFrom(start string, intermediates []string, byPair map[Pair][]pools.Poo
 			if !valid {
 				continue
 			}
-			before := len(output)
-			appendCombinations(symbols, choices, 0, nil, &output, before+perHopLimit)
-			if len(output) >= maximum {
-				return output
+			appendCombinations(symbols, choices, 0, nil, &hopRoutes, hopLimit)
+			if len(hopRoutes) >= hopLimit {
+				break
 			}
+		}
+		output = append(output, hopRoutes...)
+		if len(output) >= maximum {
+			return output[:maximum]
 		}
 	}
 	return output
+}
+
+func splitLimit(total, buckets int) []int {
+	if buckets < 1 {
+		return nil
+	}
+	out := make([]int, buckets)
+	base := total / buckets
+	remainder := total % buckets
+	for i := range out {
+		out[i] = base
+		if i < remainder {
+			out[i]++
+		}
+	}
+	return out
 }
 
 func uniqueSorted(values []string) []string {

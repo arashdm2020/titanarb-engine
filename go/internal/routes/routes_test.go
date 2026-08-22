@@ -124,3 +124,29 @@ func TestBuildForStartsUsesDynamicAssetsOnlyAsIntermediates(t *testing.T) {
 		t.Fatalf("dynamic asset was not used as an intermediate: %#v", got)
 	}
 }
+
+func TestBuildForStartsBalancesHopDepthWhenTwoHopCanExhaustBudget(t *testing.T) {
+	assets := []string{"USDC", "WETH", "ARB", "USDT", "USDC_E"}
+	pairs := make(map[Pair][]pools.Pool)
+	for _, from := range assets {
+		for _, to := range assets {
+			if from == to {
+				continue
+			}
+			pairs[Pair{From: from, To: to}] = []pools.Pool{
+				{Address: from + to + "1", DEX: pools.UniswapV3, Liquidity: big.NewInt(1)},
+				{Address: from + to + "2", DEX: pools.CamelotV3, Liquidity: big.NewInt(1)},
+				{Address: from + to + "3", DEX: pools.UniswapV3, Liquidity: big.NewInt(1)},
+			}
+		}
+	}
+
+	got := BuildForStarts([]string{"USDC"}, assets, pairs, 60)
+	counts := make(map[int]int)
+	for _, route := range got {
+		counts[len(route.Hops)]++
+	}
+	if counts[2] == 60 || counts[3] == 0 || counts[4] == 0 {
+		t.Fatalf("hop-depth budget was monopolized by short cycles: %+v", counts)
+	}
+}
