@@ -60,6 +60,14 @@ func buildFrom(start string, intermediates []string, byPair map[Pair][]pools.Poo
 	if maximum < 1 {
 		return nil
 	}
+
+	// Reserve bounded capacity across hop depths so short cycles do not
+	// consume the entire route budget before longer cycles are considered.
+	perHopLimit := maximum / 3
+	if perHopLimit < 1 {
+		perHopLimit = 1
+	}
+
 	var output []Route
 	for hops := 2; hops <= 4; hops++ {
 		for _, path := range permutations(intermediates, hops-1) {
@@ -78,7 +86,8 @@ func buildFrom(start string, intermediates []string, byPair map[Pair][]pools.Poo
 			if !valid {
 				continue
 			}
-			appendCombinations(symbols, choices, 0, nil, &output, maximum)
+			before := len(output)
+			appendCombinations(symbols, choices, 0, nil, &output, before+perHopLimit)
 			if len(output) >= maximum {
 				return output
 			}

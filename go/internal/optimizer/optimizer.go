@@ -87,9 +87,10 @@ func (o Optimizer) Optimize(ctx context.Context, evaluator Evaluator, asset stri
 	best := OptimalLoan{Asset: asset, Route: route, NetProfit: new(big.Int).Neg(big.NewInt(1))}
 	for out := range results {
 		best.Evaluated++
-		if out.err != nil || !out.evaluation.Executable || out.evaluation.NetProfit == nil || out.evaluation.NetProfit.Sign() <= 0 {
+		if out.err != nil || out.evaluation.NetProfit == nil {
 			continue
 		}
+
 		if best.Amount == nil || out.evaluation.NetProfit.Cmp(best.NetProfit) > 0 {
 			best.Amount = new(big.Int).Set(out.evaluation.Amount)
 			best.NetProfit = new(big.Int).Set(out.evaluation.NetProfit)

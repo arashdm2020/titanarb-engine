@@ -18,6 +18,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/config"
 	"github.com/titanarb/titanarb-go/internal/control"
 	"github.com/titanarb/titanarb-go/internal/dashboard"
+	"github.com/titanarb/titanarb-go/internal/dex"
 	"github.com/titanarb/titanarb-go/internal/execution"
 	"github.com/titanarb/titanarb-go/internal/fees"
 	"github.com/titanarb/titanarb-go/internal/health"
@@ -373,7 +374,38 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 	quoteWorkers := boundedWorkerCount("TITANARB_QUOTE_WORKERS", 8)
 	evaluator := opportunity.New(client, marketConfig, uni, camelot, opportunity.ArbitrumCostModel{Service: feeService}, minimum, quoteWorkers, metrics)
 	amounts := marketAmounts(marketConfig, amount)
-	return market.NewWithAmounts(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, amounts, 4, metrics), marketConfig, nil
+	liquidityProvider := func(ctx context.Context, asset string) (*big.Int, error) {
+		token, ok := marketConfig.Tokens[asset]
+		if !ok {
+			return nil, fmt.Errorf("unknown liquidity asset %s", asset)
+		}
+
+		word, err := dex.AddressWord(token.Address)
+		if err != nil {
+			return nil, err
+		}
+
+		raw, err := client.EthCall(ctx, map[string]string{
+			"to":   marketConfig.AavePool,
+			"data": dex.StaticCall("getVirtualUnderlyingBalance(address)", word),
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		words, err := dex.DecodeWords(raw)
+		if err != nil || len(words) == 0 {
+			return nil, fmt.Errorf("invalid aave liquidity response")
+		}
+
+		available := dex.WordUint(words[0])
+		available.Mul(available, big.NewInt(30))
+		available.Div(available, big.NewInt(100))
+
+		return available, nil
+	}
+
+	return market.NewWithAmounts(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, amounts, 4, metrics, liquidityProvider), marketConfig, nil
 }
 
 func boundedWorkerCount(name string, fallback int) int {

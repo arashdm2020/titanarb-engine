@@ -113,6 +113,99 @@ func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost 
 	return &Engine{caller: c, market: market, uni: uni, camelot: camelot, cost: cost, minProfit: new(big.Int).Set(minProfit), workers: workers, metrics: m, Events: make(chan Event, 4096)}
 }
 
+// EvaluateSilent performs the same economic checks as Evaluate but never emits
+// operator events. It is intended for optimizer sampling where intermediate
+// sizes must not become execution candidates.
+func (e *Engine) EvaluateSilent(ctx context.Context, route routes.Route, amount *big.Int) (*Opportunity, error) {
+	if len(route.Hops) < 2 || len(route.Hops) > 4 || len(route.Symbols) != len(route.Hops)+1 {
+		return nil, fmt.Errorf("invalid bounded route")
+	}
+
+	asset, ok := e.market.Tokens[route.Symbols[0]]
+	if !ok || route.Symbols[len(route.Symbols)-1] != route.Symbols[0] {
+		return nil, fmt.Errorf("route must start and end in configured loan asset")
+	}
+
+	current := new(big.Int).Set(amount)
+	hops := make([]Hop, 0, len(route.Hops))
+
+	for i, pool := range route.Hops {
+		in, ok := e.market.Tokens[route.Symbols[i]]
+		if !ok {
+			return nil, fmt.Errorf("unknown token %s", route.Symbols[i])
+		}
+
+		out, ok := e.market.Tokens[route.Symbols[i+1]]
+		if !ok {
+			return nil, fmt.Errorf("unknown token %s", route.Symbols[i+1])
+		}
+
+		if !pool.Supports(in.Address, out.Address) {
+			return nil, fmt.Errorf("pool does not support %s", route.String())
+		}
+
+		var quoter quotes.Quoter
+		switch pool.DEX {
+		case pools.UniswapV3:
+			quoter = e.uni
+		case pools.CamelotV3:
+			quoter = e.camelot
+		default:
+			return nil, fmt.Errorf("unsupported DEX")
+		}
+
+		result, err := quoter.Quote(ctx, quotes.Request{
+			TokenIn:  in.Address,
+			TokenOut: out.Address,
+			AmountIn: current,
+			Pool:     pool,
+		})
+		if err != nil {
+			return nil, err
+		}
+
+		hops = append(hops, Hop{
+			Pool:      pool,
+			AmountIn:  new(big.Int).Set(current),
+			AmountOut: new(big.Int).Set(result.AmountOut),
+			QuoteGas:  result.EstimatedGas,
+			Fee:       result.Fee,
+		})
+
+		current = result.AmountOut
+	}
+
+	premium, err := e.aavePremium(ctx, amount)
+	if err != nil {
+		return nil, err
+	}
+
+	l2, l1, err := e.cost.Estimate(ctx, asset, route, hops)
+	if err != nil {
+		return nil, err
+	}
+
+	result := pricing.Evaluate(pricing.Inputs{
+		AmountIn:    amount,
+		AmountOut:   current,
+		AavePremium: premium,
+		L2Fee:       l2,
+		L1DataFee:   l1,
+		MinProfit:   e.minProfit,
+	})
+
+	return &Opportunity{
+		Route:          route,
+		AmountIn:       new(big.Int).Set(amount),
+		Hops:           hops,
+		ExpectedProfit: result.ExpectedProfit,
+		GasEstimate:    l2,
+		L1DataFee:      l1,
+		Confidence:     "optimizer_sample",
+		Timestamp:      time.Now().UTC(),
+	}, nil
+}
+
 func (e *Engine) Evaluate(ctx context.Context, route routes.Route, amount *big.Int) (*Opportunity, error) {
 	if len(route.Hops) < 2 || len(route.Hops) > 4 || len(route.Symbols) != len(route.Hops)+1 {
 		return nil, fmt.Errorf("invalid bounded route")

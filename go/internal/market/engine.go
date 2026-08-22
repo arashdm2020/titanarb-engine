@@ -3,6 +3,7 @@ package market
 
 import (
 	"context"
+	"fmt"
 	"math/big"
 	"sort"
 	"strings"
@@ -11,8 +12,10 @@ import (
 
 	"github.com/titanarb/titanarb-go/internal/cache"
 	"github.com/titanarb/titanarb-go/internal/config"
+	"github.com/titanarb/titanarb-go/internal/graph"
 	"github.com/titanarb/titanarb-go/internal/metrics"
 	"github.com/titanarb/titanarb-go/internal/opportunity"
+	"github.com/titanarb/titanarb-go/internal/optimizer"
 	"github.com/titanarb/titanarb-go/internal/pools"
 	"github.com/titanarb/titanarb-go/internal/routes"
 	"github.com/titanarb/titanarb-go/internal/volatility"
@@ -31,6 +34,8 @@ type Engine struct {
 	activePools      uint64
 	cycles           uint64
 	volatility       *volatility.Tracker
+	optimizer        optimizer.Optimizer
+	liquidity        func(context.Context, string) (*big.Int, error)
 	routeCache       []routes.Route
 	cyclesSinceFull  uint64
 	lastMaxHops      int
@@ -62,12 +67,12 @@ func New(market config.MarketConfig, discoverer *pools.Discoverer, cache *cache.
 	if amount != nil && market.BaseAsset != "" {
 		amounts[market.BaseAsset] = new(big.Int).Set(amount)
 	}
-	return NewWithAmounts(market, discoverer, cache, evaluator, amounts, workers, metrics)
+	return NewWithAmounts(market, discoverer, cache, evaluator, amounts, workers, metrics, nil)
 }
 
 // NewWithAmounts accepts exact raw units for each loan asset. Callers must not
 // reuse a raw amount across tokens with different decimals or values.
-func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, cache *cache.PoolCache, evaluator *opportunity.Engine, amounts map[string]*big.Int, workers int, metrics *metrics.Metrics) *Engine {
+func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, cache *cache.PoolCache, evaluator *opportunity.Engine, amounts map[string]*big.Int, workers int, metrics *metrics.Metrics, liquidity func(context.Context, string) (*big.Int, error)) *Engine {
 	if workers < 1 {
 		workers = 1
 	}
@@ -77,7 +82,7 @@ func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, ca
 			validAmounts[symbol] = new(big.Int).Set(amount)
 		}
 	}
-	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker()}
+	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity}
 }
 
 // Cycle refreshes the deployed executor's complete allow-listed universe,
@@ -257,7 +262,23 @@ func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, 
 		return nil, firstErr
 	}
 	e.cache.Replace(discovered)
+
+	pairCount := 0
+	for _, pools := range byPair {
+		if len(pools) > 0 {
+			pairCount++
+		}
+	}
+	fmt.Printf("pair_distribution pairs=%d symbols=%d\n", pairCount, len(symbols))
+
 	routesFound := routes.BuildAll(symbols, byPair, maxRoutes)
+
+	hopDistribution := make(map[int]int)
+	for _, route := range routesFound {
+		hopDistribution[len(route.Hops)]++
+	}
+	fmt.Printf("route_distribution=%v total=%d\n", hopDistribution, len(routesFound))
+
 	filtered := routesFound[:0]
 	for _, route := range routesFound {
 		if len(route.Hops) <= maxHops {
@@ -355,7 +376,7 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route) {
 			// raw units or manufacture a USD conversion.
 			continue
 		}
-		e.evaluator.EvaluateMany(ctx, candidates, amount)
+		e.optimizeRoutes(ctx, asset, candidates, amount)
 	}
 }
 
@@ -435,4 +456,115 @@ func (e *Engine) Snapshot() Snapshot {
 	e.statsMu.RLock()
 	defer e.statsMu.RUnlock()
 	return Snapshot{ActivePools: e.activePools, Cycles: e.cycles}
+}
+
+type optimizerAdapter struct {
+	evaluator *opportunity.Engine
+}
+
+func (a optimizerAdapter) Evaluate(ctx context.Context, asset string, route graph.Route, amount *big.Int) (optimizer.Evaluation, error) {
+	r := routes.Route{
+		Symbols: append([]string(nil), route.Assets...),
+		Hops:    append([]pools.Pool(nil), route.Hops...),
+	}
+
+	op, err := a.evaluator.EvaluateSilent(ctx, r, amount)
+	if err != nil {
+		return optimizer.Evaluation{}, err
+	}
+
+	return optimizer.Evaluation{
+		Amount:     new(big.Int).Set(amount),
+		NetProfit:  new(big.Int).Set(op.ExpectedProfit),
+		Executable: op.ExpectedProfit != nil && op.ExpectedProfit.Sign() > 0,
+	}, nil
+}
+
+func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []routes.Route, current *big.Int) {
+	if current == nil || current.Sign() <= 0 {
+		return
+	}
+
+	max := new(big.Int).Mul(current, big.NewInt(10))
+
+	if e.liquidity != nil {
+		if available, err := e.liquidity(ctx, asset); err == nil && available != nil && available.Cmp(max) > 0 {
+			max = available
+		}
+	}
+
+	for _, route := range candidates {
+		if len(route.Hops) > 2 {
+			fmt.Printf("optimizer_route_candidate asset=%s route=%s hops=%d\n", asset, route.String(), len(route.Hops))
+		}
+
+		graphRoute := graph.Route{
+			Assets: append([]string(nil), route.Symbols...),
+			Hops:   append([]pools.Pool(nil), route.Hops...),
+		}
+
+		best, err := e.optimizer.Optimize(
+			ctx,
+			optimizerAdapter{evaluator: e.evaluator},
+			asset,
+			graphRoute,
+			func() optimizer.Range {
+				min := new(big.Int).Div(new(big.Int).Set(current), big.NewInt(10))
+				if min.Sign() <= 0 {
+					min = new(big.Int).Set(current)
+				}
+				return optimizer.Range{
+					Min:     min,
+					Max:     max,
+					Samples: 32,
+				}
+			}(),
+		)
+
+		if err != nil {
+			fmt.Printf(
+				"optimizer_shadow_failed asset=%s route=%s reason=%s\n",
+				asset,
+				route.String(),
+				err.Error(),
+			)
+			continue
+		}
+
+		if best.Amount != nil && best.NetProfit != nil {
+			fmt.Printf(
+				"optimizer_shadow asset=%s route=%s amount=%s profit=%s evaluated=%d\n",
+				asset,
+				route.String(),
+				best.Amount.String(),
+				best.NetProfit.String(),
+				best.Evaluated,
+			)
+		}
+
+		// Shadow telemetry only.
+		// The selected amount is NOT used for execution yet.
+		if best.Amount != nil {
+			fmt.Printf(
+				"optimizer_shadow asset=%s current=%s optimized=%s profit=%s evaluated=%d\n",
+				asset,
+				current.String(),
+				best.Amount.String(),
+				best.NetProfit.String(),
+				best.Evaluated,
+			)
+		}
+
+		// Optimizer-selected amount becomes the evaluation amount only when
+		// economics are positive. Negative candidates remain rejected.
+		if best.Amount != nil && best.NetProfit != nil && best.NetProfit.Sign() > 0 {
+			optimizedRoute := routes.Route{
+				Symbols: append([]string(nil), route.Symbols...),
+				Hops:    append([]pools.Pool(nil), route.Hops...),
+			}
+			_, _ = e.evaluator.Evaluate(ctx, optimizedRoute, best.Amount)
+		}
+	}
+
+	e.evaluator.EvaluateMany(ctx, candidates, current)
 }

@@ -1,0 +1,6 @@
+
+*.before_*
+check_*_tmp.go
+
+*.before_*
+check_*_tmp.go
