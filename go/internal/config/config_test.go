@@ -57,6 +57,7 @@ func TestPrimarySecondaryRPCProviderConfig(t *testing.T) {
 	v["RPC_SECONDARY_MAX_RPS"] = "25"
 	v["RPC_SECONDARY_TARGET_RPS"] = "18"
 	v["RPC_PROVIDER_MAX_BLOCK_LAG"] = "4"
+	v["RPC_READ_TARGET_RPS"] = "17"
 	cfg, err := FromLookup(func(k string) string { return v[k] })
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +76,9 @@ func TestPrimarySecondaryRPCProviderConfig(t *testing.T) {
 	}
 	if cfg.RPCProviders[0].MaxBlockLag != 4 || cfg.RPCProviders[1].MaxBlockLag != 4 {
 		t.Fatalf("provider block lag mismatch: %+v", cfg.RPCProviders)
+	}
+	if cfg.RPCReadTargetRPS != 17 {
+		t.Fatalf("read target RPS mismatch: %+v", cfg)
 	}
 }
 

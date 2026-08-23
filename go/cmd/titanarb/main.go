@@ -76,7 +76,7 @@ func main() {
 		log.Event(logger.Warn, "health_check_failed", "risk", "runtime risk controls unavailable: "+riskErr.Error(), nil)
 		runtimeRisk, _ = runtimeconfig.Open("", runtimeconfig.Defaults(runtimeconfig.Balanced))
 	}
-	rpcClient := rpc.NewManaged(rpcProviderConfigs(cfg), 15*time.Second, 2, m)
+	rpcClient := rpc.NewManagedWithReadBudget(rpcProviderConfigs(cfg), cfg.RPCReadTargetRPS, 15*time.Second, 2, m)
 	rpcClient.SetObserver(func(event rpc.Event) {
 		log.Event(logger.Warn, event.Name, "rpc", "RPC provider changed", map[string]any{"from": event.From, "to": event.To, "transport": event.Transport, "reason": event.Reason})
 		alert(operationSink, observability.Server, event.Name, telegram.Warning, "RPC provider changed", map[string]any{"from": event.From, "to": event.To, "transport": event.Transport, "reason": event.Reason})

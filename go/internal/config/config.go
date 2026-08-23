@@ -25,6 +25,7 @@ type Config struct {
 	HTTPRPCURL               string
 	WSRPCURL                 string
 	RPCProviders             []RPCProviderConfig
+	RPCReadTargetRPS         int
 	FlashExecutorAddress     string
 	UniswapV3Adapter         string
 	CamelotV3Adapter         string
@@ -221,6 +222,7 @@ func FromLookup(get func(string) string) (Config, error) {
 		HTTPRPCURL:           firstNonEmpty(get("RPC_PRIMARY_HTTP"), get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL")),
 		WSRPCURL:             firstNonEmpty(get("RPC_PRIMARY_WSS"), get("WS_RPC_URL"), get("ARBITRUM_WSS_RPC_URL")),
 		RPCProviders:         rpcProvidersFromLookup(get),
+		RPCReadTargetRPS:     int(parseUintDefault(get("RPC_READ_TARGET_RPS"), 0)),
 		FlashExecutorAddress: strings.TrimSpace(get("FLASH_EXECUTOR_ADDRESS")),
 		UniswapV3Adapter:     strings.TrimSpace(get("UNISWAP_V3_ADAPTER")),
 		CamelotV3Adapter:     strings.TrimSpace(get("CAMELOT_V3_ADAPTER")),

@@ -245,6 +245,29 @@ func TestManagedClientRateLimiter(t *testing.T) {
 	}
 }
 
+func TestManagedClientGlobalReadLimiter(t *testing.T) {
+	var quicknodeCalls atomic.Int32
+	var chainstackCalls atomic.Int32
+	quicknode := countingRPCServer(t, &quicknodeCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	chainstack := countingRPCServer(t, &chainstackCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManagedWithReadBudget([]ProviderConfig{
+		{Name: "quicknode", HTTP: quicknode.URL, TargetRPS: 100},
+		{Name: "chainstack", HTTP: chainstack.URL, TargetRPS: 100},
+	}, 2, time.Second, 0, nil)
+	started := time.Now()
+	for i := 0; i < 3; i++ {
+		if _, err := client.BlockNumber(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
+		t.Fatalf("global read limiter did not enforce aggregate RPS: %s", elapsed)
+	}
+	if quicknodeCalls.Load() == 0 || chainstackCalls.Load() == 0 {
+		t.Fatalf("global limiting should not force a single provider quicknode=%d chainstack=%d", quicknodeCalls.Load(), chainstackCalls.Load())
+	}
+}
+
 func TestManagedClientCooldownAvoidsFlapping(t *testing.T) {
 	primary := rpcServer(t, http.StatusTooManyRequests, `rate limited`)
 	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x2"}`)

@@ -36,19 +36,26 @@ func (e *Error) Error() string { return e.Err.Error() }
 func (e *Error) Unwrap() error { return e.Err }
 
 type Client struct {
-	endpoint   string
-	http       *http.Client
-	retries    int
-	metrics    *metrics.Metrics
-	providers  []*providerState
-	mu         sync.Mutex
-	active     int
-	lastSwitch time.Time
-	observer   func(Event)
+	endpoint    string
+	http        *http.Client
+	retries     int
+	metrics     *metrics.Metrics
+	providers   []*providerState
+	readLimiter *rateLimiter
+	mu          sync.Mutex
+	active      int
+	lastSwitch  time.Time
+	observer    func(Event)
 }
 
 func New(endpoint string, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
 	return NewManaged([]ProviderConfig{{Name: "primary", HTTP: endpoint}}, timeout, retries, m)
+}
+
+func NewManagedWithReadBudget(configs []ProviderConfig, readTargetRPS int, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
+	client := newManaged(configs, timeout, retries, m)
+	client.readLimiter = newRateLimiter(readTargetRPS)
+	return client
 }
 
 type ProviderConfig struct {
@@ -99,6 +106,10 @@ type providerState struct {
 }
 
 func NewManaged(configs []ProviderConfig, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
+	return newManaged(configs, timeout, retries, m)
+}
+
+func newManaged(configs []ProviderConfig, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
 	client := &Client{http: &http.Client{Timeout: timeout}, retries: retries, metrics: m}
 	for _, cfg := range configs {
 		cfg.Name = strings.TrimSpace(cfg.Name)
@@ -163,6 +174,9 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 	}
 	var last error
 	for attempt := 0; attempt <= c.retries; attempt++ {
+		if err := c.readLimiter.Wait(ctx); err != nil {
+			return err
+		}
 		provider, providerIndex := c.chooseReadProvider()
 		if provider == nil {
 			return &Error{Network, errors.New("no RPC provider configured")}
