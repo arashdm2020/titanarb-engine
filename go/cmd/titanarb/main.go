@@ -828,7 +828,7 @@ func rpcProviderConfigs(cfg config.Config) []rpc.ProviderConfig {
 		if strings.TrimSpace(provider.HTTP) == "" {
 			continue
 		}
-		out = append(out, rpc.ProviderConfig{Name: provider.Name, HTTP: provider.HTTP, MaxRPS: provider.MaxRPS, TargetRPS: provider.TargetRPS, MaxBlockLag: provider.MaxBlockLag})
+		out = append(out, rpc.ProviderConfig{Name: provider.Name, HTTP: provider.HTTP, MaxRPS: provider.MaxRPS, TargetRPS: provider.TargetRPS, Burst: provider.Burst, MaxBlockLag: provider.MaxBlockLag})
 	}
 	if len(out) == 0 {
 		out = append(out, rpc.ProviderConfig{Name: "primary", HTTP: cfg.HTTPRPCURL})
@@ -867,7 +867,7 @@ func rpcProviderHealthString(snapshots []rpc.ProviderSnapshot) string {
 		if snapshot.Active {
 			active = ":active"
 		}
-		parts = append(parts, fmt.Sprintf("%s=%s%s,block=%d,latency_ms=%d,requests=%d,share_pct=%.1f,target_rps=%d,rate_limited=%d,failures=%d", snapshot.Name, state, active, snapshot.LatestBlock, snapshot.Latency.Milliseconds(), snapshot.Requests, snapshot.SharePct, snapshot.TargetRPS, snapshot.RateLimited, snapshot.Failures))
+		parts = append(parts, fmt.Sprintf("%s=%s%s,block=%d,latency_ms=%d,requests=%d,share_pct=%.1f,target_rps=%d,burst=%d,instantaneous_rps=%.1f,rate_limited=%d,cooldown_remaining_ms=%d,failures=%d", snapshot.Name, state, active, snapshot.LatestBlock, snapshot.Latency.Milliseconds(), snapshot.Requests, snapshot.SharePct, snapshot.TargetRPS, snapshot.Burst, snapshot.InstantaneousRPS, snapshot.RateLimited, snapshot.CooldownRemaining.Milliseconds(), snapshot.Failures))
 	}
 	return strings.Join(parts, ";")
 }

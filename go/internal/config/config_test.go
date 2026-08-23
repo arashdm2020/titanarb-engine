@@ -51,11 +51,13 @@ func TestPrimarySecondaryRPCProviderConfig(t *testing.T) {
 	v["RPC_PRIMARY_WSS"] = "wss://quicknode.example"
 	v["RPC_PRIMARY_MAX_RPS"] = "15"
 	v["RPC_PRIMARY_TARGET_RPS"] = "11"
+	v["RPC_PRIMARY_BURST"] = "1"
 	v["RPC_SECONDARY_NAME"] = "chainstack"
 	v["RPC_SECONDARY_HTTP"] = "https://chainstack.example"
 	v["RPC_SECONDARY_WSS"] = "wss://chainstack.example"
 	v["RPC_SECONDARY_MAX_RPS"] = "25"
 	v["RPC_SECONDARY_TARGET_RPS"] = "18"
+	v["RPC_SECONDARY_BURST"] = "2"
 	v["RPC_PROVIDER_MAX_BLOCK_LAG"] = "4"
 	v["RPC_READ_TARGET_RPS"] = "17"
 	cfg, err := FromLookup(func(k string) string { return v[k] })
@@ -73,6 +75,9 @@ func TestPrimarySecondaryRPCProviderConfig(t *testing.T) {
 	}
 	if cfg.RPCProviders[0].TargetRPS != 11 || cfg.RPCProviders[1].TargetRPS != 18 {
 		t.Fatalf("provider target RPS mismatch: %+v", cfg.RPCProviders)
+	}
+	if cfg.RPCProviders[0].Burst != 1 || cfg.RPCProviders[1].Burst != 2 {
+		t.Fatalf("provider burst mismatch: %+v", cfg.RPCProviders)
 	}
 	if cfg.RPCProviders[0].MaxBlockLag != 4 || cfg.RPCProviders[1].MaxBlockLag != 4 {
 		t.Fatalf("provider block lag mismatch: %+v", cfg.RPCProviders)

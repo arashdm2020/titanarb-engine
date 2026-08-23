@@ -63,6 +63,7 @@ type ProviderConfig struct {
 	HTTP        string
 	MaxRPS      int
 	TargetRPS   int
+	Burst       int
 	MaxBlockLag int
 }
 
@@ -80,6 +81,9 @@ type ProviderSnapshot struct {
 	MaxRPS            int
 	TargetRPS         int
 	SharePct          float64
+	Burst             int
+	InstantaneousRPS  float64
+	CooldownRemaining time.Duration
 }
 
 type Event struct {
@@ -103,6 +107,9 @@ type providerState struct {
 	cooldownUntil      time.Time
 	latestBlock        uint64
 	latestBlockAt      time.Time
+	requestTimes       []time.Time
+	rateLimitStreak    uint64
+	recent429Until     time.Time
 }
 
 func NewManaged(configs []ProviderConfig, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -120,7 +127,7 @@ func newManaged(configs []ProviderConfig, timeout time.Duration, retries int, m 
 		if cfg.Name == "" {
 			cfg.Name = "provider"
 		}
-		client.providers = append(client.providers, &providerState{cfg: cfg, limiter: newRateLimiter(effectiveRPS(cfg))})
+		client.providers = append(client.providers, &providerState{cfg: cfg, limiter: newRateLimiterWithBurst(effectiveRPS(cfg), effectiveBurst(cfg))})
 	}
 	if len(client.providers) > 0 {
 		client.endpoint = client.providers[0].cfg.HTTP
@@ -177,11 +184,11 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 		if err := c.readLimiter.Wait(ctx); err != nil {
 			return err
 		}
-		provider, providerIndex := c.chooseReadProvider()
+		provider, providerIndex, providerDelay := c.chooseReadProvider()
 		if provider == nil {
 			return &Error{Network, errors.New("no RPC provider configured")}
 		}
-		if err := provider.limiter.Wait(ctx); err != nil {
+		if err := waitDelay(ctx, providerDelay); err != nil {
 			return err
 		}
 		c.recordRequest(provider)
@@ -256,7 +263,6 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 		return classify(readErr)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
-		provider.rateLimited++
 		return &Error{HTTP, fmt.Errorf("rpc HTTP status %d", resp.StatusCode)}
 	}
 	if resp.StatusCode >= 500 {
@@ -305,11 +311,11 @@ func (c *Client) chooseProvider() (*providerState, int) {
 	return c.providers[c.active], c.active
 }
 
-func (c *Client) chooseReadProvider() (*providerState, int) {
+func (c *Client) chooseReadProvider() (*providerState, int, time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.providers) == 0 {
-		return nil, -1
+		return nil, -1, 0
 	}
 	now := time.Now()
 	bestBlock := c.bestKnownBlockLocked()
@@ -323,6 +329,9 @@ func (c *Client) chooseReadProvider() (*providerState, int) {
 			continue
 		}
 		score := provider.limiter.Delay()
+		if now.Before(provider.recent429Until) {
+			score += 250 * time.Millisecond
+		}
 		if provider.latencyEMA > 0 {
 			score += provider.latencyEMA / 20
 		}
@@ -346,10 +355,15 @@ func (c *Client) chooseReadProvider() (*providerState, int) {
 		}
 	}
 	if bestIndex == -1 {
-		bestIndex = c.active
+		if len(c.providers) == 1 {
+			bestIndex = 0
+		} else {
+			return nil, -1, 0
+		}
 	}
 	c.active = bestIndex
-	return c.providers[bestIndex], bestIndex
+	provider := c.providers[bestIndex]
+	return provider, bestIndex, provider.limiter.ReserveDelay()
 }
 
 func (c *Client) bestKnownBlockLocked() uint64 {
@@ -381,6 +395,9 @@ func (c *Client) recordRequest(provider *providerState) {
 	}
 	c.mu.Lock()
 	provider.requests++
+	now := time.Now()
+	provider.requestTimes = append(provider.requestTimes, now)
+	provider.requestTimes = pruneRequestTimes(provider.requestTimes, now.Add(-time.Second))
 	c.mu.Unlock()
 }
 
@@ -389,6 +406,7 @@ func (c *Client) recordSuccess(provider *providerState, method string, out any) 
 	defer c.mu.Unlock()
 	provider.consecutiveFailure = 0
 	provider.lastSuccessful = time.Now()
+	provider.rateLimitStreak = 0
 	if method == "eth_blockNumber" {
 		if raw, ok := out.(*string); ok {
 			if block, err := strconv.ParseUint(strings.TrimPrefix(*raw, "0x"), 16, 64); err == nil {
@@ -407,7 +425,10 @@ func (c *Client) recordFailure(provider *providerState, err error) {
 	provider.lastFailure = time.Now()
 	cooldown := 15 * time.Second
 	if failureReason(err) == "rate_limit" {
-		cooldown = 30 * time.Second
+		provider.rateLimited++
+		provider.rateLimitStreak++
+		cooldown = exponentialRateLimitCooldown(provider.rateLimitStreak)
+		provider.recent429Until = time.Now().Add(cooldown + 2*time.Minute)
 	}
 	provider.cooldownUntil = time.Now().Add(cooldown)
 	if provider.consecutiveFailure >= 3 {
@@ -501,12 +522,14 @@ func (c *Client) ActiveProvider() string {
 func (c *Client) Snapshots() []ProviderSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	now := time.Now()
 	var total uint64
 	for _, provider := range c.providers {
 		total += provider.requests
 	}
 	out := make([]ProviderSnapshot, 0, len(c.providers))
 	for i, provider := range c.providers {
+		provider.requestTimes = pruneRequestTimes(provider.requestTimes, now.Add(-time.Second))
 		share := 0.0
 		if total > 0 {
 			share = float64(provider.requests) * 100 / float64(total)
@@ -525,6 +548,9 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 			MaxRPS:            provider.cfg.MaxRPS,
 			TargetRPS:         effectiveRPS(provider.cfg),
 			SharePct:          share,
+			Burst:             effectiveBurst(provider.cfg),
+			InstantaneousRPS:  float64(len(provider.requestTimes)),
+			CooldownRemaining: positiveDuration(provider.cooldownUntil.Sub(now)),
 		})
 	}
 	return out
@@ -537,33 +563,94 @@ func effectiveRPS(cfg ProviderConfig) int {
 	return cfg.MaxRPS
 }
 
+func effectiveBurst(cfg ProviderConfig) int {
+	if cfg.Burst < 1 {
+		return 1
+	}
+	if cfg.Burst > 2 {
+		return 2
+	}
+	return cfg.Burst
+}
+
+func exponentialRateLimitCooldown(streak uint64) time.Duration {
+	if streak < 1 {
+		streak = 1
+	}
+	shift := streak - 1
+	if shift > 3 {
+		shift = 3
+	}
+	return 30 * time.Second * time.Duration(uint64(1)<<shift)
+}
+
+func pruneRequestTimes(values []time.Time, cutoff time.Time) []time.Time {
+	first := 0
+	for first < len(values) && values[first].Before(cutoff) {
+		first++
+	}
+	if first == 0 {
+		return values
+	}
+	return append(values[:0], values[first:]...)
+}
+
+func positiveDuration(value time.Duration) time.Duration {
+	if value < 0 {
+		return 0
+	}
+	return value
+}
+
 type rateLimiter struct {
 	interval time.Duration
+	burst    int
 	mu       sync.Mutex
 	next     time.Time
 }
 
 func newRateLimiter(maxRPS int) *rateLimiter {
+	return newRateLimiterWithBurst(maxRPS, 1)
+}
+
+func newRateLimiterWithBurst(maxRPS, burst int) *rateLimiter {
 	if maxRPS <= 0 {
 		return &rateLimiter{}
 	}
-	return &rateLimiter{interval: time.Second / time.Duration(maxRPS)}
+	if burst < 1 {
+		burst = 1
+	}
+	if burst > 2 {
+		burst = 2
+	}
+	return &rateLimiter{interval: time.Second / time.Duration(maxRPS), burst: burst}
 }
 
 func (l *rateLimiter) Wait(ctx context.Context) error {
 	if l == nil || l.interval <= 0 {
 		return nil
 	}
-	l.mu.Lock()
-	now := time.Now()
-	wait := time.Duration(0)
-	if now.Before(l.next) {
-		wait = l.next.Sub(now)
-		l.next = l.next.Add(l.interval)
-	} else {
-		l.next = now.Add(l.interval)
+	wait := l.ReserveDelay()
+	return waitDelay(ctx, wait)
+}
+
+func (l *rateLimiter) ReserveDelay() time.Duration {
+	if l == nil || l.interval <= 0 {
+		return 0
 	}
-	l.mu.Unlock()
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := time.Now()
+	burstWindow := time.Duration(l.burst-1) * l.interval
+	if l.next.IsZero() || now.After(l.next.Add(burstWindow)) {
+		l.next = now.Add(-time.Duration(l.burst-1) * l.interval)
+	}
+	wait := positiveDuration(l.next.Sub(now))
+	l.next = l.next.Add(l.interval)
+	return wait
+}
+
+func waitDelay(ctx context.Context, wait time.Duration) error {
 	if wait <= 0 {
 		return nil
 	}

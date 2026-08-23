@@ -47,6 +47,7 @@ type RPCProviderConfig struct {
 	WSS         string
 	MaxRPS      int
 	TargetRPS   int
+	Burst       int
 	MaxBlockLag int
 }
 
@@ -248,6 +249,7 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 		WSS:         strings.TrimSpace(get("RPC_PRIMARY_WSS")),
 		MaxRPS:      int(parseUintDefault(get("RPC_PRIMARY_MAX_RPS"), 0)),
 		TargetRPS:   int(parseUintDefault(firstNonEmpty(get("RPC_PRIMARY_TARGET_RPS"), get("RPC_QUICKNODE_TARGET_RPS")), 0)),
+		Burst:       int(parseUintDefault(get("RPC_PRIMARY_BURST"), 1)),
 		MaxBlockLag: int(parseUintDefault(get("RPC_PRIMARY_MAX_BLOCK_LAG"), parseUintDefault(get("RPC_PROVIDER_MAX_BLOCK_LAG"), 5))),
 	}
 	secondary := RPCProviderConfig{
@@ -256,6 +258,7 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 		WSS:         strings.TrimSpace(get("RPC_SECONDARY_WSS")),
 		MaxRPS:      int(parseUintDefault(get("RPC_SECONDARY_MAX_RPS"), 0)),
 		TargetRPS:   int(parseUintDefault(firstNonEmpty(get("RPC_SECONDARY_TARGET_RPS"), get("RPC_CHAINSTACK_TARGET_RPS")), 0)),
+		Burst:       int(parseUintDefault(get("RPC_SECONDARY_BURST"), 1)),
 		MaxBlockLag: int(parseUintDefault(get("RPC_SECONDARY_MAX_BLOCK_LAG"), parseUintDefault(get("RPC_PROVIDER_MAX_BLOCK_LAG"), 5))),
 	}
 	if primary.HTTP == "" {

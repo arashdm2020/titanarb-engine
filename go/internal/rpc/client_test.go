@@ -245,6 +245,58 @@ func TestManagedClientRateLimiter(t *testing.T) {
 	}
 }
 
+func TestRateLimiterConfigurableBurst(t *testing.T) {
+	limiter := newRateLimiterWithBurst(2, 2)
+	if delay := limiter.ReserveDelay(); delay != 0 {
+		t.Fatalf("first token delayed: %s", delay)
+	}
+	if delay := limiter.ReserveDelay(); delay != 0 {
+		t.Fatalf("second burst token delayed: %s", delay)
+	}
+	if delay := limiter.ReserveDelay(); delay < 400*time.Millisecond {
+		t.Fatalf("burst exceeded configured capacity: %s", delay)
+	}
+}
+
+func TestReadSelectionAtomicallyReservesProviderCapacity(t *testing.T) {
+	client := NewManaged([]ProviderConfig{
+		{Name: "quicknode", HTTP: "http://quicknode.invalid", TargetRPS: 2, Burst: 1},
+		{Name: "chainstack", HTTP: "http://chainstack.invalid", TargetRPS: 4, Burst: 1},
+	}, time.Second, 0, nil)
+	selected := map[string]int{}
+	for i := 0; i < 6; i++ {
+		provider, _, _ := client.chooseReadProvider()
+		selected[provider.cfg.Name]++
+	}
+	if selected["quicknode"] == 0 || selected["chainstack"] == 0 {
+		t.Fatalf("both providers must receive reserved work: %+v", selected)
+	}
+	if selected["chainstack"] <= selected["quicknode"] {
+		t.Fatalf("larger provider budget did not receive more reservations: %+v", selected)
+	}
+}
+
+func TestRecent429PenaltySpillsReadsToHealthyProvider(t *testing.T) {
+	client := NewManaged([]ProviderConfig{
+		{Name: "quicknode", HTTP: "http://quicknode.invalid", TargetRPS: 10},
+		{Name: "chainstack", HTTP: "http://chainstack.invalid", TargetRPS: 10},
+	}, time.Second, 0, nil)
+	client.providers[0].recent429Until = time.Now().Add(time.Minute)
+	provider, _, _ := client.chooseReadProvider()
+	if provider.cfg.Name != "chainstack" {
+		t.Fatalf("recently rate-limited provider was selected: %s", provider.cfg.Name)
+	}
+}
+
+func TestRateLimitCooldownIsExponentialAndBounded(t *testing.T) {
+	want := []time.Duration{30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 4 * time.Minute}
+	for i, expected := range want {
+		if got := exponentialRateLimitCooldown(uint64(i + 1)); got != expected {
+			t.Fatalf("streak=%d cooldown=%s want=%s", i+1, got, expected)
+		}
+	}
+}
+
 func TestManagedClientGlobalReadLimiter(t *testing.T) {
 	var quicknodeCalls atomic.Int32
 	var chainstackCalls atomic.Int32
@@ -330,6 +382,7 @@ func TestManagedClientPrimaryRecoveryHysteresis(t *testing.T) {
 	client.mu.Lock()
 	client.lastSwitch = time.Now().Add(-3 * time.Minute)
 	client.providers[0].cooldownUntil = time.Now().Add(-time.Second)
+	client.providers[0].recent429Until = time.Now().Add(-time.Second)
 	client.mu.Unlock()
 
 	if block, err := client.BlockNumber(context.Background()); err != nil || block != 0x3 {
