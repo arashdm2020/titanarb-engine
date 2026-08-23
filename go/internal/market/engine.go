@@ -870,11 +870,11 @@ func selectOptimizerCandidates(evaluated []evaluatedRoute, limit int) []optimize
 		}
 		return evaluated[i].route.String() < evaluated[j].route.String()
 	})
-	if len(evaluated) > limit {
-		evaluated = evaluated[:limit]
-	}
 	selected := make([]optimizerCandidate, 0, len(evaluated))
 	for _, item := range evaluated {
+		if !optimizerEligible(item) {
+			continue
+		}
 		candidate := optimizerCandidate{route: item.route, score: item.routeScore}
 		if item.nearMiss != nil {
 			if item.nearMiss.NetProfit != nil {
@@ -888,8 +888,25 @@ func selectOptimizerCandidates(evaluated []evaluatedRoute, limit int) []optimize
 			}
 		}
 		selected = append(selected, candidate)
+		if len(selected) >= limit {
+			break
+		}
 	}
 	return selected
+}
+
+func optimizerEligible(item evaluatedRoute) bool {
+	if item.score != nil && item.score.Sign() > 0 {
+		return true
+	}
+	if item.nearMiss == nil || item.nearMiss.GapToProfit == nil || item.nearMiss.MinProfit == nil || item.nearMiss.MinProfit.Sign() <= 0 {
+		return false
+	}
+	// Optimizer work is expensive. Run it only when the first-pass economics are
+	// close enough that sizing can plausibly matter. Far-below routes remain in
+	// near-miss memory and pre-quote ranking, but do not receive deep samples.
+	limit := new(big.Int).Mul(item.nearMiss.MinProfit, big.NewInt(3))
+	return item.nearMiss.GapToProfit.Cmp(limit) <= 0
 }
 
 func (e *Engine) routeFailureSnapshot() map[string]uint64 {

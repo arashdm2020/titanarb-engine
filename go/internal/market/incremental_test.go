@@ -76,11 +76,12 @@ func TestBoundedRoutesCapsHotPathWork(t *testing.T) {
 }
 
 func TestSelectOptimizerCandidatesPrefersBestNearMisses(t *testing.T) {
+	closeMiss := &nearmiss.Record{GapToProfit: big.NewInt(1), MinProfit: big.NewInt(10), NetProfit: big.NewInt(-9)}
 	evaluated := []evaluatedRoute{
-		{route: routes.Route{Symbols: []string{"ARB", "USDC", "ARB"}}, score: big.NewInt(-50)},
-		{route: routes.Route{Symbols: []string{"WETH", "ARB", "WETH"}}, score: big.NewInt(10)},
-		{route: routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}}, score: big.NewInt(10)},
-		{route: routes.Route{Symbols: []string{"USDT", "ARB", "USDT"}}, score: big.NewInt(-5)},
+		{route: routes.Route{Symbols: []string{"ARB", "USDC", "ARB"}}, score: big.NewInt(-50), nearMiss: closeMiss},
+		{route: routes.Route{Symbols: []string{"WETH", "ARB", "WETH"}}, score: big.NewInt(10), nearMiss: closeMiss},
+		{route: routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}}, score: big.NewInt(10), nearMiss: closeMiss},
+		{route: routes.Route{Symbols: []string{"USDT", "ARB", "USDT"}}, score: big.NewInt(-5), nearMiss: closeMiss},
 	}
 
 	selected := selectOptimizerCandidates(evaluated, 2)
@@ -98,9 +99,10 @@ func TestSelectOptimizerCandidatesPrefersBestNearMisses(t *testing.T) {
 }
 
 func TestSelectOptimizerCandidatesUsesRouteScoreBeforeRawProfit(t *testing.T) {
+	closeMiss := &nearmiss.Record{GapToProfit: big.NewInt(1), MinProfit: big.NewInt(10), NetProfit: big.NewInt(-9)}
 	evaluated := []evaluatedRoute{
-		{route: routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}}, score: big.NewInt(100), routeScore: 1_000},
-		{route: routes.Route{Symbols: []string{"ARB", "WETH", "ARB"}}, score: big.NewInt(50), routeScore: 5_000},
+		{route: routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}}, score: big.NewInt(100), routeScore: 1_000, nearMiss: closeMiss},
+		{route: routes.Route{Symbols: []string{"ARB", "WETH", "ARB"}}, score: big.NewInt(50), routeScore: 5_000, nearMiss: closeMiss},
 	}
 	selected := selectOptimizerCandidates(evaluated, 1)
 	if len(selected) != 1 || selected[0].route.String() != "ARB -> WETH -> ARB" {
@@ -126,6 +128,18 @@ func TestOptimizerProbeStopsStructurallyBadRoute(t *testing.T) {
 	best.NetProfit = big.NewInt(1)
 	if shouldStopOptimizerAfterProbe(candidate, best, big.NewInt(1_000_000_000)) {
 		t.Fatal("positive probe result must remain eligible")
+	}
+}
+
+func TestSelectOptimizerCandidatesSkipsFarBelowThreshold(t *testing.T) {
+	route := routes.Route{Symbols: []string{"USDC", "ARB", "USDC"}}
+	far := &nearmiss.Record{GapToProfit: big.NewInt(100), MinProfit: big.NewInt(10), NetProfit: big.NewInt(-90)}
+	if got := selectOptimizerCandidates([]evaluatedRoute{{route: route, score: big.NewInt(-90), routeScore: 6_000, nearMiss: far}}, 1); len(got) != 0 {
+		t.Fatalf("far-below route received optimizer budget: %+v", got)
+	}
+	close := &nearmiss.Record{GapToProfit: big.NewInt(20), MinProfit: big.NewInt(10), NetProfit: big.NewInt(-10)}
+	if got := selectOptimizerCandidates([]evaluatedRoute{{route: route, score: big.NewInt(-10), routeScore: 6_000, nearMiss: close}}, 1); len(got) != 1 {
+		t.Fatalf("near-threshold route did not receive optimizer budget: %+v", got)
 	}
 }
 
