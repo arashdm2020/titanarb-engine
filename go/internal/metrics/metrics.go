@@ -21,7 +21,7 @@ type Metrics struct {
 	blocksCoalesced                                                        atomic.Uint64
 	maxLagBlocks                                                           atomic.Uint64
 	latencyMu                                                              sync.Mutex
-	cycleSamples, quoteSamples                                             []uint64
+	cycleSamples, quoteSamples, rpsMilliSamples                            []uint64
 	lastCycle                                                              CycleSample
 }
 
@@ -73,6 +73,8 @@ type Snapshot struct {
 	MaxLagBlocks          uint64      `json:"max_cycle_lag_blocks"`
 	RoutesPerSecond       float64     `json:"routes_per_second"`
 	QuotesPerSecond       float64     `json:"quotes_per_second"`
+	AverageRPS            float64     `json:"average_rpc_requests_per_second"`
+	P95RPS                float64     `json:"p95_rpc_requests_per_second"`
 }
 
 func New() *Metrics                                { return &Metrics{started: time.Now()} }
@@ -112,12 +114,16 @@ func (m *Metrics) ObserveMarketCycle(sample CycleSample) {
 	m.lastCycle = sample
 	m.cycleSamples = appendBounded(m.cycleSamples, sample.DurationMS, 2048)
 	m.quoteSamples = appendBounded(m.quoteSamples, sample.QuoteDurationMS, 2048)
+	if sample.DurationMS > 0 {
+		m.rpsMilliSamples = appendBounded(m.rpsMilliSamples, sample.RPCCalls*1_000_000/sample.DurationMS, 2048)
+	}
 }
 func (m *Metrics) Snapshot() Snapshot {
 	m.latencyMu.Lock()
 	last := m.lastCycle
 	cycles := append([]uint64(nil), m.cycleSamples...)
 	quotes := append([]uint64(nil), m.quoteSamples...)
+	rps := append([]uint64(nil), m.rpsMilliSamples...)
 	m.latencyMu.Unlock()
 	uptime := uint64(time.Since(m.started).Seconds())
 	if uptime == 0 {
@@ -139,6 +145,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		MedianQuoteMS: percentile(quotes, 50), P95QuoteMS: percentile(quotes, 95),
 		MaxLagBlocks: m.maxLagBlocks.Load(), RoutesPerSecond: float64(m.routesEvaluated.Load()) / float64(uptime),
 		QuotesPerSecond: float64(m.quotes.Load()) / float64(uptime),
+		AverageRPS:      float64(m.rpcCalls.Load()) / float64(uptime), P95RPS: float64(percentile(rps, 95)) / 1_000,
 	}
 }
 func (m *Metrics) WriteJSON(w io.Writer) error { return json.NewEncoder(w).Encode(m.Snapshot()) }

@@ -187,3 +187,56 @@ func TestQuoteCacheDeduplicatesConcurrentSameBlockQuotes(t *testing.T) {
 		t.Fatalf("dedupe hit was not recorded: %+v", stats)
 	}
 }
+
+func TestPersistentQuoteCacheReusesUnchangedPoolAndInvalidatesDirtyPool(t *testing.T) {
+	a := "0x0000000000000000000000000000000000000001"
+	b := "0x0000000000000000000000000000000000000002"
+	poolAddress := "0x00000000000000000000000000000000000000cc"
+	market := config.MarketConfig{AavePool: "0x0000000000000000000000000000000000000003", Tokens: map[string]config.Token{"USDC": token("USDC", a), "WETH": token("WETH", b)}}
+	p := pools.Pool{Address: poolAddress, Token0: a, Token1: b, DEX: pools.UniswapV3, Fee: 500, Liquidity: big.NewInt(1), LastUpdatedBlock: 100}
+	route := routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}, Hops: []pools.Pool{p, p}}
+	q := &countingQuoter{}
+	e := New(caller{}, market, q, q, StaticCostModel{L2Fee: big.NewInt(1), L1Fee: big.NewInt(1)}, big.NewInt(1), 1, nil)
+
+	e.PrepareQuoteCache(100, nil, true)
+	if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+		t.Fatal(err)
+	}
+	e.PrepareQuoteCache(101, map[string]struct{}{}, true)
+	if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+		t.Fatal(err)
+	}
+	if got := q.calls.Load(); got != 2 {
+		t.Fatalf("unchanged pool was requoted across state: calls=%d", got)
+	}
+
+	e.PrepareQuoteCache(102, map[string]struct{}{poolAddress: {}}, true)
+	if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+		t.Fatal(err)
+	}
+	if got := q.calls.Load(); got != 4 {
+		t.Fatalf("dirty pool cache was not invalidated: calls=%d", got)
+	}
+	stats := e.QuoteCacheStats()
+	if stats.Invalidations != 2 || stats.Misses != 2 {
+		t.Fatalf("unexpected cache telemetry: %+v", stats)
+	}
+}
+
+func TestQuoteCacheRollbackUsesLegacyPerCycleState(t *testing.T) {
+	a := "0x0000000000000000000000000000000000000001"
+	b := "0x0000000000000000000000000000000000000002"
+	market := config.MarketConfig{AavePool: "0x0000000000000000000000000000000000000003", Tokens: map[string]config.Token{"USDC": token("USDC", a), "WETH": token("WETH", b)}}
+	p := pools.Pool{Address: "0x00000000000000000000000000000000000000dd", Token0: a, Token1: b, DEX: pools.UniswapV3, Fee: 500, Liquidity: big.NewInt(1), LastUpdatedBlock: 100}
+	route := routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}, Hops: []pools.Pool{p, p}}
+	q := &countingQuoter{}
+	e := New(caller{}, market, q, q, StaticCostModel{L2Fee: big.NewInt(1), L1Fee: big.NewInt(1)}, big.NewInt(1), 1, nil)
+
+	e.PrepareQuoteCache(100, nil, false)
+	_, _ = e.EvaluateSilent(context.Background(), route, big.NewInt(1000))
+	e.PrepareQuoteCache(101, nil, false)
+	_, _ = e.EvaluateSilent(context.Background(), route, big.NewInt(1000))
+	if got := q.calls.Load(); got != 4 {
+		t.Fatalf("legacy per-cycle behavior was not restored: calls=%d", got)
+	}
+}

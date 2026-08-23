@@ -97,35 +97,41 @@ func feeToBaseRaw(component *big.Int, totalUSD, totalETH *big.Rat, decimals uint
 }
 
 type Engine struct {
-	caller        Caller
-	market        config.MarketConfig
-	uni           quotes.Quoter
-	camelot       quotes.Quoter
-	cost          CostModel
-	metrics       *metrics.Metrics
-	minProfit     *big.Int
-	workers       int
-	Events        chan Event
-	premiumMu     sync.Mutex
-	premiumBPS    *big.Int
-	premiumExpiry time.Time
-	quoteMu       sync.Mutex
-	quoteBlock    uint64
-	quoteCache    map[string]*quoteCacheEntry
-	quoteHits     uint64
-	quoteDedup    uint64
+	caller             Caller
+	market             config.MarketConfig
+	uni                quotes.Quoter
+	camelot            quotes.Quoter
+	cost               CostModel
+	metrics            *metrics.Metrics
+	minProfit          *big.Int
+	workers            int
+	Events             chan Event
+	premiumMu          sync.Mutex
+	premiumBPS         *big.Int
+	premiumExpiry      time.Time
+	quoteMu            sync.Mutex
+	quoteBlock         uint64
+	quoteCache         map[string]*quoteCacheEntry
+	quotePersistent    bool
+	quoteHits          uint64
+	quoteDedup         uint64
+	quoteMisses        uint64
+	quoteInvalidations uint64
 }
 
 type QuoteCacheStats struct {
-	Hits      uint64
-	DedupHits uint64
-	Entries   int
+	Hits          uint64
+	DedupHits     uint64
+	Misses        uint64
+	Invalidations uint64
+	Entries       int
 }
 
 type quoteCacheEntry struct {
 	ready  chan struct{}
 	result quotes.Result
 	err    error
+	pool   string
 }
 
 func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost CostModel, minProfit *big.Int, workers int, m *metrics.Metrics) *Engine {
@@ -144,13 +150,50 @@ func (e *Engine) ResetQuoteCache(block uint64) {
 	e.quoteCache = make(map[string]*quoteCacheEntry)
 	e.quoteHits = 0
 	e.quoteDedup = 0
+	e.quoteMisses = 0
+	e.quoteInvalidations = 0
 	e.quoteMu.Unlock()
+}
+
+// PrepareQuoteCache starts a market state while optionally retaining entries
+// for pools whose mutable state did not change. Dirty pool entries alone are
+// invalidated; callers still get the legacy per-cycle cache when persistent is
+// false. No quote is generated merely to populate this cache.
+func (e *Engine) PrepareQuoteCache(block uint64, dirty map[string]struct{}, persistent bool) {
+	e.quoteMu.Lock()
+	defer e.quoteMu.Unlock()
+	e.quoteBlock = block
+	e.quotePersistent = persistent
+	e.quoteHits = 0
+	e.quoteDedup = 0
+	e.quoteMisses = 0
+	e.quoteInvalidations = 0
+	if e.quoteCache == nil || !persistent {
+		e.quoteCache = make(map[string]*quoteCacheEntry)
+		return
+	}
+	for key, entry := range e.quoteCache {
+		if entry == nil {
+			delete(e.quoteCache, key)
+			continue
+		}
+		if _, changed := dirty[entry.pool]; changed {
+			delete(e.quoteCache, key)
+			e.quoteInvalidations++
+		}
+	}
+	// The active route universe is bounded, but size optimization can introduce
+	// many amounts over time. Bound memory without adding an eviction RPC path.
+	if len(e.quoteCache) > 32_768 {
+		e.quoteInvalidations += uint64(len(e.quoteCache))
+		e.quoteCache = make(map[string]*quoteCacheEntry)
+	}
 }
 
 func (e *Engine) QuoteCacheStats() QuoteCacheStats {
 	e.quoteMu.Lock()
 	defer e.quoteMu.Unlock()
-	return QuoteCacheStats{Hits: e.quoteHits, DedupHits: e.quoteDedup, Entries: len(e.quoteCache)}
+	return QuoteCacheStats{Hits: e.quoteHits, DedupHits: e.quoteDedup, Misses: e.quoteMisses, Invalidations: e.quoteInvalidations, Entries: len(e.quoteCache)}
 }
 
 type cachedCostEntry struct {
@@ -403,8 +446,10 @@ func (e *Engine) quote(ctx context.Context, quoter quotes.Quoter, req quotes.Req
 		e.quoteMu.Unlock()
 		return result, err
 	}
-	entry := &quoteCacheEntry{ready: make(chan struct{})}
+	pool := strings.ToLower(req.Pool.Address)
+	entry := &quoteCacheEntry{ready: make(chan struct{}), pool: pool}
 	e.quoteCache[key] = entry
+	e.quoteMisses++
 	e.quoteMu.Unlock()
 
 	result, err := quoter.Quote(ctx, req)
@@ -426,9 +471,14 @@ func (e *Engine) quoteKey(req quotes.Request) string {
 	}
 	e.quoteMu.Lock()
 	block := e.quoteBlock
+	persistent := e.quotePersistent
 	e.quoteMu.Unlock()
+	stateVersion := block
+	if persistent && req.Pool.LastUpdatedBlock > 0 {
+		stateVersion = req.Pool.LastUpdatedBlock
+	}
 	return strings.Join([]string{
-		fmt.Sprintf("%d", block),
+		fmt.Sprintf("%d", stateVersion),
 		strings.ToLower(req.Pool.Address),
 		string(req.Pool.DEX),
 		fmt.Sprintf("%d", req.Pool.Fee),

@@ -38,6 +38,27 @@ func TestPoolChangedUsesMutableState(t *testing.T) {
 	}
 }
 
+func TestChangedPoolAddressesOnlyInvalidatesChangedState(t *testing.T) {
+	unchanged := pools.Pool{Address: "0x1", Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20)}
+	changedBefore := pools.Pool{Address: "0x2", Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20)}
+	changedAfter := changedBefore
+	changedAfter.SqrtPriceX96 = big.NewInt(21)
+	added := pools.Pool{Address: "0x3", Liquidity: big.NewInt(1), SqrtPriceX96: big.NewInt(1)}
+	removed := pools.Pool{Address: "0x4", Liquidity: big.NewInt(1), SqrtPriceX96: big.NewInt(1)}
+	dirty := changedPoolAddresses([]pools.Pool{unchanged, changedBefore, removed}, []pools.Pool{unchanged, changedAfter, added})
+	if len(dirty) != 3 {
+		t.Fatalf("unexpected dirty set: %+v", dirty)
+	}
+	if _, ok := dirty["0x1"]; ok {
+		t.Fatal("unchanged pool was invalidated")
+	}
+	for _, address := range []string{"0x2", "0x3", "0x4"} {
+		if _, ok := dirty[address]; !ok {
+			t.Fatalf("missing dirty pool %s", address)
+		}
+	}
+}
+
 func TestUnchangedLoggedPoolCanBeRemovedFromDirtySet(t *testing.T) {
 	p := pools.Pool{Address: "0x0000000000000000000000000000000000000001", Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20)}
 	dirty := map[string]struct{}{p.Address: {}}
@@ -183,6 +204,31 @@ func TestSearchOptionsNormalizeToSafeDefaults(t *testing.T) {
 	defaults := DefaultSearchOptions()
 	if got != defaults {
 		t.Fatalf("zero search options did not normalize to defaults: got %#v want %#v", got, defaults)
+	}
+}
+
+func TestSearchOptionsPreserveExplicitRollbackFlags(t *testing.T) {
+	got := (SearchOptions{OptimizationFlagsSet: true, PersistentQuoteCache: false, AdaptiveOptimizer: false, EarlyStop: false}).Normalized()
+	if got.PersistentQuoteCache || got.AdaptiveOptimizer || got.EarlyStop {
+		t.Fatalf("rollback flags were overwritten: %#v", got)
+	}
+}
+
+func TestRefineOptimizerRangeNarrowsAroundProbeWinner(t *testing.T) {
+	minimum, maximum := refineOptimizerRange(big.NewInt(100), big.NewInt(900), big.NewInt(500))
+	if minimum.Cmp(big.NewInt(300)) != 0 || maximum.Cmp(big.NewInt(700)) != 0 {
+		t.Fatalf("unexpected refined range: %s..%s", minimum, maximum)
+	}
+}
+
+func TestScoreDecilesRelatePreQuoteScoreToGap(t *testing.T) {
+	input := []evaluatedRoute{
+		{route: routes.Route{Symbols: []string{"A", "B", "A"}}, preQuoteScore: 9_000, quoteSuccessful: true, nearMiss: &nearmiss.Record{GapToProfit: big.NewInt(1), MinProfit: big.NewInt(10)}},
+		{route: routes.Route{Symbols: []string{"C", "D", "C"}}, preQuoteScore: 1_000, quoteSuccessful: true, nearMiss: &nearmiss.Record{GapToProfit: big.NewInt(9), MinProfit: big.NewInt(10)}},
+	}
+	quality := scoreDecileQuality(input)
+	if quality["d1"]["best_gap_to_threshold_bps"].(float64) >= quality["d6"]["best_gap_to_threshold_bps"].(float64) {
+		t.Fatalf("score deciles did not preserve economic ordering: %+v", quality)
 	}
 }
 

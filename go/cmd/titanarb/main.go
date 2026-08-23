@@ -256,6 +256,7 @@ func main() {
 				LagBlocks: lag, DirtyPools: report.DirtyPools, RoutesRecomputed: report.RoutesRecomputed, RoutesReused: report.RoutesReused,
 				RoutesEvaluated: report.RoutesEvaluated, RPCCalls: rpcCalls,
 			})
+			rolling := m.Snapshot()
 			fields := map[string]any{
 				"block": report.StateBlock, "full_reconcile": report.FullReconcile, "cycles": len(report.Routes),
 				"routes_recomputed": report.RoutesRecomputed, "routes_reused": report.RoutesReused, "routes_evaluated_cycle": report.RoutesEvaluated,
@@ -265,37 +266,53 @@ func main() {
 				"quote_duration_ms": report.QuoteDuration.Milliseconds(), "optimizer_duration_ms": report.OptimizerDuration.Milliseconds(),
 				"optimizer_runs": report.OptimizerRuns, "optimizer_samples": report.OptimizerSamples, "cycle_lag_blocks": lag,
 				"blocks_coalesced": coalesced, "rpc_calls": rpcCalls,
-				"rpc_calls_by_stage":          stringUintMapString(report.RPCCallsByStage),
-				"quote_cache_hits":            report.QuoteCacheHits,
-				"quote_dedup_hits":            report.QuoteDedupHits,
-				"optimizer_samples_saved":     report.OptimizerSaved,
-				"routes_skipped_by_prequote":  report.RoutesSkippedByPreQuote,
-				"avg_rps":                     fmt.Sprintf("%.2f", avgRPS),
-				"p95_rps":                     fmt.Sprintf("%.2f", avgRPS),
-				"active_universe_assets":      strings.Join(report.UniverseAssets, ","),
-				"added_dynamic_assets":        strings.Join(report.DynamicAssets, ","),
-				"universe_decisions":          strings.Join(report.UniverseDecisions, "; "),
-				"route_count_before":          report.RouteCountBefore,
-				"route_count_after":           report.RouteCountAfter,
-				"cycles_by_hop":               intMapString(report.RoutesByHop),
-				"dex_diversity":               stringIntMapString(report.DEXRoutes),
-				"top_near_misses":             report.TopNearMisses,
-				"route_score_distribution":    stringIntMapString(report.RouteScores),
-				"optimizer_budget_allocation": stringIntMapString(report.OptimizerBudget),
-				"rejection_reasons":           stringIntMapString(report.RejectionReasons),
-				"prequote_ranking_enabled":    report.PreQuoteRanking,
-				"exploit_selected":            report.ExploitSelected,
-				"explore_selected":            report.ExploreSelected,
-				"memory_routes":               report.MemoryRoutes,
-				"avg_pre_quote_score":         report.AvgPreQuoteScore,
-				"cross_venue_evaluated":       report.CrossVenueQuoted,
-				"same_dex_evaluated":          report.SameDEXQuoted,
-				"routes_considered":           report.RoutesConsidered,
-				"routes_quoted":               report.RoutesEvaluated,
-				"quote_age_blocks":            report.QuoteAgeBlocks,
-				"active_rpc_provider":         rpcClient.ActiveProvider(),
-				"active_wss_provider":         w.ActiveProvider(),
-				"rpc_provider_health":         rpcProviderHealthString(rpcClient.Snapshots()),
+				"rpc_calls_by_stage":               stringUintMapString(report.RPCCallsByStage),
+				"rpc_calls_pool_refresh":           report.RPCCallsPoolRefresh,
+				"rpc_calls_initial_quotes":         report.RPCCallsInitialQuotes,
+				"rpc_calls_optimizer":              report.RPCCallsOptimizer,
+				"rpc_calls_economics":              report.RPCCallsEconomics,
+				"quote_cache_hits":                 report.QuoteCacheHits,
+				"quote_cache_misses":               report.QuoteCacheMisses,
+				"quote_dedup_hits":                 report.QuoteDedupHits,
+				"quote_cache_invalidations":        report.QuoteCacheInvalidations,
+				"optimizer_samples_requested":      report.OptimizerRequested,
+				"optimizer_samples_executed":       report.OptimizerSamples,
+				"optimizer_samples_saved":          report.OptimizerSaved,
+				"routes_deep_optimized":            report.RoutesDeepOptimized,
+				"routes_probe_only":                report.RoutesProbeOnly,
+				"routes_skipped_deep_optimization": report.RoutesSkippedDeep,
+				"routes_skipped_by_prequote":       report.RoutesSkippedByPreQuote,
+				"rpc_per_evaluated_route":          fmt.Sprintf("%.2f", report.RPCPerEvaluatedRoute),
+				"rpc_per_optimizer_route":          fmt.Sprintf("%.2f", report.RPCPerOptimizerRoute),
+				"avg_rps":                          fmt.Sprintf("%.2f", rolling.AverageRPS),
+				"cycle_rps":                        fmt.Sprintf("%.2f", avgRPS),
+				"p95_rps":                          fmt.Sprintf("%.2f", rolling.P95RPS),
+				"p95_cycle_duration_ms":            rolling.P95CycleMS,
+				"score_decile_economics":           report.ScoreDeciles,
+				"active_universe_assets":           strings.Join(report.UniverseAssets, ","),
+				"added_dynamic_assets":             strings.Join(report.DynamicAssets, ","),
+				"universe_decisions":               strings.Join(report.UniverseDecisions, "; "),
+				"route_count_before":               report.RouteCountBefore,
+				"route_count_after":                report.RouteCountAfter,
+				"cycles_by_hop":                    intMapString(report.RoutesByHop),
+				"dex_diversity":                    stringIntMapString(report.DEXRoutes),
+				"top_near_misses":                  report.TopNearMisses,
+				"route_score_distribution":         stringIntMapString(report.RouteScores),
+				"optimizer_budget_allocation":      stringIntMapString(report.OptimizerBudget),
+				"rejection_reasons":                stringIntMapString(report.RejectionReasons),
+				"prequote_ranking_enabled":         report.PreQuoteRanking,
+				"exploit_selected":                 report.ExploitSelected,
+				"explore_selected":                 report.ExploreSelected,
+				"memory_routes":                    report.MemoryRoutes,
+				"avg_pre_quote_score":              report.AvgPreQuoteScore,
+				"cross_venue_evaluated":            report.CrossVenueQuoted,
+				"same_dex_evaluated":               report.SameDEXQuoted,
+				"routes_considered":                report.RoutesConsidered,
+				"routes_quoted":                    report.RoutesEvaluated,
+				"quote_age_blocks":                 report.QuoteAgeBlocks,
+				"active_rpc_provider":              rpcClient.ActiveProvider(),
+				"active_wss_provider":              w.ActiveProvider(),
+				"rpc_provider_health":              rpcProviderHealthString(rpcClient.Snapshots()),
 			}
 			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)
 			publish(operationSink, observability.Performance, "market_cycle", telegram.Info, "market cycle complete", fields)
@@ -768,9 +785,38 @@ func marketSearchOptions(settings runtimeconfig.Settings) market.SearchOptions {
 		EvaluationRoutesPerAsset: clampInt(depth*4, 8, 96),
 		OptimizerRoutesPerAsset:  clampInt(depth/2, 2, 16),
 		OptimizerSamplesPerRoute: clampInt(depth*2, 4, 64),
+		OptimizerSamplesPerCycle: optimizerSampleBudget(),
 		DisablePreQuoteRanking:   strings.EqualFold(strings.TrimSpace(os.Getenv("PREQUOTE_RANKING_ENABLED")), "false"),
 		ExploreRatioBPS:          preQuoteExploreBPS(),
+		PersistentQuoteCache:     envEnabled("QUOTE_CACHE_ENABLED", true),
+		AdaptiveOptimizer:        envEnabled("ADAPTIVE_OPTIMIZER_ENABLED", true),
+		EarlyStop:                envEnabled("RPC_EARLY_STOP_ENABLED", true),
+		OptimizationFlagsSet:     true,
 	}
+}
+
+func optimizerSampleBudget() int {
+	raw := strings.TrimSpace(os.Getenv("OPTIMIZER_SAMPLE_BUDGET"))
+	if raw == "" {
+		return 32
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 32
+	}
+	return clampInt(value, 2, 512)
+}
+
+func envEnabled(name string, fallback bool) bool {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return fallback
+	}
+	value, err := strconv.ParseBool(raw)
+	if err != nil {
+		return fallback
+	}
+	return value
 }
 
 func rpcProviderConfigs(cfg config.Config) []rpc.ProviderConfig {

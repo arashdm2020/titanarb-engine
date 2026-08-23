@@ -19,8 +19,8 @@ func TestCountersAndJSON(t *testing.T) {
 	m.IncUniswapQuotes()
 	m.IncCamelotQuotes()
 	m.AddBlocksCoalesced(3)
-	m.ObserveMarketCycle(CycleSample{DurationMS: 200, QuoteDurationMS: 150, LagBlocks: 2, RoutesRecomputed: 10, RoutesReused: 90})
-	m.ObserveMarketCycle(CycleSample{DurationMS: 100, QuoteDurationMS: 50, LagBlocks: 0, RoutesRecomputed: 5, RoutesReused: 95})
+	m.ObserveMarketCycle(CycleSample{DurationMS: 200, QuoteDurationMS: 150, LagBlocks: 2, RoutesRecomputed: 10, RoutesReused: 90, RPCCalls: 2})
+	m.ObserveMarketCycle(CycleSample{DurationMS: 100, QuoteDurationMS: 50, LagBlocks: 0, RoutesRecomputed: 5, RoutesReused: 95, RPCCalls: 1})
 	s := m.Snapshot()
 	if s.BlocksReceived != 1 || s.RPCErrors != 1 || s.WSSDisconnects != 1 || s.WSSReconnects != 1 {
 		t.Fatalf("unexpected snapshot: %+v", s)
@@ -33,6 +33,9 @@ func TestCountersAndJSON(t *testing.T) {
 	}
 	if s.BlocksCoalesced != 3 || s.MedianCycleMS != 100 || s.P95CycleMS != 200 || s.MaxCycleMS != 200 || s.CycleLatency.LagBlocks != 0 || s.MaxLagBlocks != 2 {
 		t.Fatalf("missing latency/coalescing metrics: %+v", s)
+	}
+	if s.P95RPS != 10 {
+		t.Fatalf("unexpected p95 RPC rate: %+v", s)
 	}
 	var b bytes.Buffer
 	if err := m.WriteJSON(&b); err != nil {

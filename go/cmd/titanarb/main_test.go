@@ -92,6 +92,20 @@ func TestMarketSearchOptionsFollowRiskDepth(t *testing.T) {
 	}
 }
 
+func TestMarketSearchOptimizationFlagsAndBudget(t *testing.T) {
+	t.Setenv("QUOTE_CACHE_ENABLED", "false")
+	t.Setenv("ADAPTIVE_OPTIMIZER_ENABLED", "false")
+	t.Setenv("RPC_EARLY_STOP_ENABLED", "false")
+	t.Setenv("OPTIMIZER_SAMPLE_BUDGET", "24")
+	options := marketSearchOptions(runtimeconfig.Defaults(runtimeconfig.Balanced))
+	if options.PersistentQuoteCache || options.AdaptiveOptimizer || options.EarlyStop {
+		t.Fatalf("rollback flags were not applied: %#v", options)
+	}
+	if options.OptimizerSamplesPerCycle != 24 || !options.OptimizationFlagsSet {
+		t.Fatalf("optimizer budget/config marker mismatch: %#v", options)
+	}
+}
+
 func TestApprovedDynamicAssetExpandsMarketOnlyUniverse(t *testing.T) {
 	core := config.MarketConfig{
 		BaseAsset:           "USDC",
