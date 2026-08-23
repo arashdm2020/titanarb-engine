@@ -95,7 +95,7 @@ type CycleReport struct {
 }
 
 const fullReconcileEvery = 240
-const incrementalRefreshBatchBlocks = 4
+const incrementalRefreshBatchBlocks = 8
 const maxOptimizerRoutesPerAsset = 2
 const maxEvaluationRoutesPerAsset = 12
 const optimizerSamplesPerRoute = 8

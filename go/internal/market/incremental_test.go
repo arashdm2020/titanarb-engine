@@ -62,13 +62,13 @@ func TestIdleCycleDoesNotAdvanceFullReconcileCounter(t *testing.T) {
 }
 
 func TestIncrementalRefreshBatchesSmallBlockDeltas(t *testing.T) {
-	if !shouldDeferIncrementalRefresh(100, 103, 4) {
+	if !shouldDeferIncrementalRefresh(100, 107, 8) {
 		t.Fatal("small block delta should be batched")
 	}
-	if shouldDeferIncrementalRefresh(100, 104, 4) {
+	if shouldDeferIncrementalRefresh(100, 108, 8) {
 		t.Fatal("batch boundary should refresh")
 	}
-	if shouldDeferIncrementalRefresh(0, 1, 4) {
+	if shouldDeferIncrementalRefresh(0, 1, 8) {
 		t.Fatal("first observed block must not be deferred")
 	}
 }
