@@ -109,6 +109,7 @@ type Engine struct {
 	premiumMu          sync.Mutex
 	premiumBPS         *big.Int
 	premiumExpiry      time.Time
+	premiumFlight      *premiumCall
 	quoteMu            sync.Mutex
 	quoteBlock         uint64
 	quoteCache         map[string]*quoteCacheEntry
@@ -132,6 +133,12 @@ type quoteCacheEntry struct {
 	result quotes.Result
 	err    error
 	pool   string
+}
+
+type premiumCall struct {
+	ready chan struct{}
+	bps   *big.Int
+	err   error
 }
 
 func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost CostModel, minProfit *big.Int, workers int, m *metrics.Metrics) *Engine {
@@ -205,12 +212,19 @@ type CachedCostModel struct {
 	Base CostModel
 	TTL  time.Duration
 
-	mu    sync.Mutex
-	cache map[string]cachedCostEntry
+	mu       sync.Mutex
+	cache    map[string]cachedCostEntry
+	inflight map[string]*costCall
+}
+
+type costCall struct {
+	ready  chan struct{}
+	l2, l1 *big.Int
+	err    error
 }
 
 func NewCachedCostModel(base CostModel, ttl time.Duration) *CachedCostModel {
-	return &CachedCostModel{Base: base, TTL: ttl, cache: make(map[string]cachedCostEntry)}
+	return &CachedCostModel{Base: base, TTL: ttl, cache: make(map[string]cachedCostEntry), inflight: make(map[string]*costCall)}
 }
 
 func (m *CachedCostModel) Estimate(ctx context.Context, asset config.Token, route routes.Route, hops []Hop) (*big.Int, *big.Int, error) {
@@ -230,16 +244,40 @@ func (m *CachedCostModel) Estimate(ctx context.Context, asset config.Token, rout
 		m.mu.Unlock()
 		return l2, l1, nil
 	}
+	if call, ok := m.inflight[key]; ok {
+		ready := call.ready
+		m.mu.Unlock()
+		select {
+		case <-ready:
+			if call.err != nil {
+				return nil, nil, call.err
+			}
+			return new(big.Int).Set(call.l2), new(big.Int).Set(call.l1), nil
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		}
+	}
+	if m.inflight == nil {
+		m.inflight = make(map[string]*costCall)
+	}
+	call := &costCall{ready: make(chan struct{})}
+	m.inflight[key] = call
 	m.mu.Unlock()
 
 	l2, l1, err := m.Base.Estimate(ctx, asset, route, hops)
+	m.mu.Lock()
+	delete(m.inflight, key)
+	call.err = err
+	if err == nil {
+		call.l2 = new(big.Int).Set(l2)
+		call.l1 = new(big.Int).Set(l1)
+		m.cache[key] = cachedCostEntry{l2: new(big.Int).Set(l2), l1: new(big.Int).Set(l1), until: time.Now().Add(m.TTL)}
+	}
+	close(call.ready)
+	m.mu.Unlock()
 	if err != nil {
 		return nil, nil, err
 	}
-
-	m.mu.Lock()
-	m.cache[key] = cachedCostEntry{l2: new(big.Int).Set(l2), l1: new(big.Int).Set(l1), until: now.Add(m.TTL)}
-	m.mu.Unlock()
 	return l2, l1, nil
 }
 
@@ -549,23 +587,56 @@ func (e *Engine) aavePremiumBPS(ctx context.Context) (*big.Int, error) {
 		e.premiumMu.Unlock()
 		return bps, nil
 	}
+	if call := e.premiumFlight; call != nil {
+		ready := call.ready
+		e.premiumMu.Unlock()
+		select {
+		case <-ready:
+			if call.err != nil {
+				return nil, call.err
+			}
+			return new(big.Int).Set(call.bps), nil
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	call := &premiumCall{ready: make(chan struct{})}
+	e.premiumFlight = call
 	e.premiumMu.Unlock()
 
 	raw, err := e.caller.EthCall(ctx, map[string]string{"to": e.market.AavePool, "data": dex.StaticCall("FLASHLOAN_PREMIUM_TOTAL()")})
 	if err != nil {
+		e.finishPremiumCall(call, nil, err)
 		return nil, err
 	}
 	words, err := dex.DecodeWords(raw)
 	if err != nil {
+		e.finishPremiumCall(call, nil, err)
 		return nil, err
 	}
 	bps := dex.WordUint(words[0])
 
 	e.premiumMu.Lock()
 	e.premiumBPS = new(big.Int).Set(bps)
-	e.premiumExpiry = now.Add(10 * time.Second)
+	e.premiumExpiry = time.Now().Add(10 * time.Second)
+	e.premiumFlight = nil
+	call.bps = new(big.Int).Set(bps)
+	close(call.ready)
 	e.premiumMu.Unlock()
 	return bps, nil
+}
+
+func (e *Engine) finishPremiumCall(call *premiumCall, bps *big.Int, err error) {
+	e.premiumMu.Lock()
+	defer e.premiumMu.Unlock()
+	if e.premiumFlight == call {
+		e.premiumFlight = nil
+	}
+	call.err = err
+	if bps != nil {
+		call.bps = new(big.Int).Set(bps)
+	}
+	close(call.ready)
 }
 func (e *Engine) emit(event Event) {
 	select {

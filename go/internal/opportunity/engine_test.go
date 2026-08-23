@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"math/big"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -28,10 +29,40 @@ func (c *countingCaller) EthCall(context.Context, map[string]string) (string, er
 	return "0x" + hex.EncodeToString(dex.UintWord(big.NewInt(5))), nil
 }
 
+type delayedCountingCaller struct {
+	calls atomic.Uint64
+	delay time.Duration
+}
+
+func (c *delayedCountingCaller) EthCall(ctx context.Context, _ map[string]string) (string, error) {
+	c.calls.Add(1)
+	select {
+	case <-time.After(c.delay):
+	case <-ctx.Done():
+		return "", ctx.Err()
+	}
+	return "0x" + hex.EncodeToString(dex.UintWord(big.NewInt(5))), nil
+}
+
 type countingCost struct{ calls atomic.Uint64 }
 
 func (c *countingCost) Estimate(context.Context, config.Token, routes.Route, []Hop) (*big.Int, *big.Int, error) {
 	c.calls.Add(1)
+	return big.NewInt(10), big.NewInt(20), nil
+}
+
+type delayedCountingCost struct {
+	calls atomic.Uint64
+	delay time.Duration
+}
+
+func (c *delayedCountingCost) Estimate(ctx context.Context, _ config.Token, _ routes.Route, _ []Hop) (*big.Int, *big.Int, error) {
+	c.calls.Add(1)
+	select {
+	case <-time.After(c.delay):
+	case <-ctx.Done():
+		return nil, nil, ctx.Err()
+	}
 	return big.NewInt(10), big.NewInt(20), nil
 }
 
@@ -101,6 +132,25 @@ func TestAavePremiumIsShortLivedCached(t *testing.T) {
 	}
 }
 
+func TestAavePremiumCoalescesConcurrentRefresh(t *testing.T) {
+	c := &delayedCountingCaller{delay: 20 * time.Millisecond}
+	e := New(c, config.MarketConfig{AavePool: "0x0000000000000000000000000000000000000003"}, quoter{}, quoter{}, StaticCostModel{L2Fee: big.NewInt(1), L1Fee: big.NewInt(1)}, big.NewInt(1), 8, nil)
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, err := e.aavePremiumBPS(context.Background()); err != nil {
+				t.Errorf("premium: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := c.calls.Load(); got != 1 {
+		t.Fatalf("concurrent premium refreshes were not coalesced: calls=%d", got)
+	}
+}
+
 func TestCachedCostModelCachesByAssetAndHopCount(t *testing.T) {
 	base := &countingCost{}
 	model := NewCachedCostModel(base, time.Minute)
@@ -123,6 +173,27 @@ func TestCachedCostModelCachesByAssetAndHopCount(t *testing.T) {
 	}
 	if got := base.calls.Load(); got != 1 {
 		t.Fatalf("base cost model was not cached: calls=%d", got)
+	}
+}
+
+func TestCachedCostModelCoalescesConcurrentMisses(t *testing.T) {
+	base := &delayedCountingCost{delay: 20 * time.Millisecond}
+	model := NewCachedCostModel(base, time.Minute)
+	asset := token("USDC", "0x0000000000000000000000000000000000000001")
+	route := routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}, Hops: []pools.Pool{{}, {}}}
+	var wg sync.WaitGroup
+	for i := 0; i < 16; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := model.Estimate(context.Background(), asset, route, []Hop{{}, {}}); err != nil {
+				t.Errorf("estimate: %v", err)
+			}
+		}()
+	}
+	wg.Wait()
+	if got := base.calls.Load(); got != 1 {
+		t.Fatalf("concurrent cost misses were not coalesced: calls=%d", got)
 	}
 }
 
