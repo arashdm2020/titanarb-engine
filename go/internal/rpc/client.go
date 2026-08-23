@@ -530,13 +530,17 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 	out := make([]ProviderSnapshot, 0, len(c.providers))
 	for i, provider := range c.providers {
 		provider.requestTimes = pruneRequestTimes(provider.requestTimes, now.Add(-time.Second))
+		unavailableUntil := provider.cooldownUntil
+		if provider.recent429Until.After(unavailableUntil) {
+			unavailableUntil = provider.recent429Until
+		}
 		share := 0.0
 		if total > 0 {
 			share = float64(provider.requests) * 100 / float64(total)
 		}
 		out = append(out, ProviderSnapshot{
 			Name:              provider.cfg.Name,
-			Healthy:           time.Now().After(provider.cooldownUntil),
+			Healthy:           now.After(unavailableUntil),
 			Active:            i == c.active,
 			Requests:          provider.requests,
 			RateLimited:       provider.rateLimited,
@@ -550,7 +554,7 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 			SharePct:          share,
 			Burst:             effectiveBurst(provider.cfg),
 			InstantaneousRPS:  float64(len(provider.requestTimes)),
-			CooldownRemaining: positiveDuration(provider.cooldownUntil.Sub(now)),
+			CooldownRemaining: positiveDuration(unavailableUntil.Sub(now)),
 		})
 	}
 	return out
