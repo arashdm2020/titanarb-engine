@@ -268,6 +268,16 @@ func main() {
 				"route_score_distribution":    stringIntMapString(report.RouteScores),
 				"optimizer_budget_allocation": stringIntMapString(report.OptimizerBudget),
 				"rejection_reasons":           stringIntMapString(report.RejectionReasons),
+				"prequote_ranking_enabled":    report.PreQuoteRanking,
+				"exploit_selected":            report.ExploitSelected,
+				"explore_selected":            report.ExploreSelected,
+				"memory_routes":               report.MemoryRoutes,
+				"avg_pre_quote_score":         report.AvgPreQuoteScore,
+				"cross_venue_evaluated":       report.CrossVenueQuoted,
+				"same_dex_evaluated":          report.SameDEXQuoted,
+				"routes_considered":           report.RoutesConsidered,
+				"routes_quoted":               report.RoutesEvaluated,
+				"quote_age_blocks":            report.QuoteAgeBlocks,
 			}
 			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)
 			publish(operationSink, observability.Performance, "market_cycle", telegram.Info, "market cycle complete", fields)
@@ -724,7 +734,21 @@ func marketSearchOptions(settings runtimeconfig.Settings) market.SearchOptions {
 		EvaluationRoutesPerAsset: clampInt(depth*4, 8, 96),
 		OptimizerRoutesPerAsset:  clampInt(depth/2, 2, 16),
 		OptimizerSamplesPerRoute: clampInt(depth*2, 4, 64),
+		DisablePreQuoteRanking:   strings.EqualFold(strings.TrimSpace(os.Getenv("PREQUOTE_RANKING_ENABLED")), "false"),
+		ExploreRatioBPS:          preQuoteExploreBPS(),
 	}
+}
+
+func preQuoteExploreBPS() int {
+	raw := strings.TrimSpace(os.Getenv("PREQUOTE_EXPLORE_BPS"))
+	if raw == "" {
+		return 2_000
+	}
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return 2_000
+	}
+	return clampInt(value, 0, 5_000)
 }
 
 func clampInt(value, minimum, maximum int) int {

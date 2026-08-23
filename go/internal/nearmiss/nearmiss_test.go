@@ -69,3 +69,46 @@ func TestSnapshotSortsClosestNearMisses(t *testing.T) {
 		t.Fatalf("unexpected snapshot ordering: %+v", got)
 	}
 }
+
+func TestRouteMemoryUsesNeutralPriorForUnseenRoutes(t *testing.T) {
+	memory := NewRouteMemory(16)
+	same := memory.PreQuoteScore(PreQuoteInput{Key: "same", CrossVenue: false})
+	cross := memory.PreQuoteScore(PreQuoteInput{Key: "cross", CrossVenue: true})
+	if same <= 0 {
+		t.Fatalf("unseen same-DEX route started unusably low: %d", same)
+	}
+	if cross <= same {
+		t.Fatalf("cross-venue soft prior missing: cross=%d same=%d", cross, same)
+	}
+}
+
+func TestRouteMemoryNearMissImprovesPriorityAndLosingRouteDecays(t *testing.T) {
+	memory := NewRouteMemory(16)
+	good := Record{CrossVenue: true, QuoteSuccessful: true, SufficientLiquidity: true, HopCount: 2, GapToProfit: big.NewInt(500), NetProfit: big.NewInt(-1), Score: 5_000}
+	bad := Record{CrossVenue: true, QuoteSuccessful: true, SufficientLiquidity: true, HopCount: 2, GapToProfit: big.NewInt(1_000_000_000_000), NetProfit: big.NewInt(-1), FailureCount: 10, Score: 1_000, RejectionReason: "profitability threshold not met"}
+	memory.Observe("good", good, 100)
+	memory.Observe("bad", bad, 100)
+	if memory.PreQuoteScore(PreQuoteInput{Key: "good", CrossVenue: true, CurrentBlock: 101}) <= memory.PreQuoteScore(PreQuoteInput{Key: "bad", CrossVenue: true, CurrentBlock: 101}) {
+		t.Fatalf("historical near-miss did not improve priority")
+	}
+	before := memory.PreQuoteScore(PreQuoteInput{Key: "bad", CrossVenue: true, CurrentBlock: 101})
+	memory.MarkDirty("bad", 102)
+	after := memory.PreQuoteScore(PreQuoteInput{Key: "bad", CrossVenue: true, CurrentBlock: 102})
+	if after <= before {
+		t.Fatalf("dirty update did not revive down-ranked route: before=%d after=%d", before, after)
+	}
+}
+
+func TestRouteMemoryPrunesOldestEntries(t *testing.T) {
+	memory := NewRouteMemory(2)
+	record := Record{QuoteSuccessful: true, SufficientLiquidity: true, Score: 1_000}
+	memory.Observe("old", record, 1)
+	memory.Observe("mid", record, 2)
+	memory.Observe("new", record, 3)
+	if memory.Len() != 2 {
+		t.Fatalf("memory was not bounded: %d", memory.Len())
+	}
+	if _, ok := memory.Stats("old"); ok {
+		t.Fatalf("oldest route was not pruned")
+	}
+}

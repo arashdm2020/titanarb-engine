@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/titanarb/titanarb-go/internal/nearmiss"
 	"github.com/titanarb/titanarb-go/internal/pools"
 	"github.com/titanarb/titanarb-go/internal/routes"
 )
@@ -121,4 +122,114 @@ func TestSearchOptionsNormalizeToSafeDefaults(t *testing.T) {
 	if got != defaults {
 		t.Fatalf("zero search options did not normalize to defaults: got %#v want %#v", got, defaults)
 	}
+}
+
+func TestSelectEvaluationCandidatesCrossVenueRanksHigherWhenSignalsEqual(t *testing.T) {
+	engine := &Engine{routeMemory: nearmiss.NewRouteMemory(16)}
+	same := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.UniswapV3}, "1", "2")
+	cross := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3}, "3", "4")
+	selected, stats := engine.selectEvaluationCandidates([]routes.Route{same, cross}, SearchOptions{EvaluationRoutesPerAsset: 1, ExploreRatioBPS: 0}.Normalized(), nil, 1, 100)
+	if len(selected) != 1 || routeKey(selected[0]) != routeKey(cross) {
+		t.Fatalf("cross-venue route was not selected first: %+v", selected)
+	}
+	if stats.CrossVenue != 1 || stats.SameDEX != 0 || stats.Exploit != 1 {
+		t.Fatalf("selection telemetry mismatch: %+v", stats)
+	}
+}
+
+func TestSelectEvaluationCandidatesSameDEXRemainsEligible(t *testing.T) {
+	engine := &Engine{routeMemory: nearmiss.NewRouteMemory(16)}
+	same := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.UniswapV3}, "1", "2")
+	selected, stats := engine.selectEvaluationCandidates([]routes.Route{same}, SearchOptions{EvaluationRoutesPerAsset: 4, ExploreRatioBPS: 0}.Normalized(), nil, 1, 100)
+	if len(selected) != 1 || routeKey(selected[0]) != routeKey(same) {
+		t.Fatalf("same-DEX route was incorrectly excluded: %+v", selected)
+	}
+	if stats.SameDEX != 1 {
+		t.Fatalf("same-DEX telemetry mismatch: %+v", stats)
+	}
+}
+
+func TestSelectEvaluationCandidatesHistoricalNearMissImprovesPriority(t *testing.T) {
+	engine := &Engine{routeMemory: nearmiss.NewRouteMemory(16)}
+	near := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3}, "1", "2")
+	unknown := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3}, "3", "4")
+	engine.routeMemory.Observe(routeKey(near), nearmiss.Record{CrossVenue: true, QuoteSuccessful: true, SufficientLiquidity: true, HopCount: 2, GapToProfit: big.NewInt(1_000), Score: 5_000}, 90)
+	selected, _ := engine.selectEvaluationCandidates([]routes.Route{unknown, near}, SearchOptions{EvaluationRoutesPerAsset: 1, ExploreRatioBPS: 0}.Normalized(), nil, 1, 100)
+	if len(selected) != 1 || routeKey(selected[0]) != routeKey(near) {
+		t.Fatalf("near-miss history did not drive pre-quote priority: %+v", selected)
+	}
+}
+
+func TestSelectEvaluationCandidatesExploresUnseenRoutes(t *testing.T) {
+	engine := &Engine{routeMemory: nearmiss.NewRouteMemory(16)}
+	known := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3}, "1", "2")
+	unseen := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.UniswapV3}, "3", "4")
+	engine.routeMemory.Observe(routeKey(known), nearmiss.Record{CrossVenue: true, QuoteSuccessful: true, SufficientLiquidity: true, HopCount: 2, GapToProfit: big.NewInt(1_000), Score: 6_000}, 90)
+	selected, stats := engine.selectEvaluationCandidates([]routes.Route{known, unseen}, SearchOptions{EvaluationRoutesPerAsset: 2, ExploreRatioBPS: 5_000}.Normalized(), nil, 1, 100)
+	if len(selected) != 2 {
+		t.Fatalf("selection did not fill budget: %+v", selected)
+	}
+	if stats.Explore != 1 || routeKey(selected[1]) != routeKey(unseen) {
+		t.Fatalf("unseen route did not receive exploration slot: selected=%+v stats=%+v", selected, stats)
+	}
+}
+
+func TestSelectEvaluationCandidatesNoDuplicateRoutes(t *testing.T) {
+	engine := &Engine{routeMemory: nearmiss.NewRouteMemory(16)}
+	route := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3}, "1", "2")
+	selected, _ := engine.selectEvaluationCandidates([]routes.Route{route, route, route}, SearchOptions{EvaluationRoutesPerAsset: 3, ExploreRatioBPS: 5_000}.Normalized(), nil, 1, 100)
+	if len(selected) != 1 {
+		t.Fatalf("duplicate route admitted: %d", len(selected))
+	}
+}
+
+func TestSelectEvaluationCandidatesDisabledUsesLegacyOrder(t *testing.T) {
+	engine := &Engine{routeMemory: nearmiss.NewRouteMemory(16)}
+	same := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.UniswapV3}, "1", "2")
+	cross := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3}, "3", "4")
+	selected, _ := engine.selectEvaluationCandidates([]routes.Route{same, cross}, SearchOptions{EvaluationRoutesPerAsset: 1, DisablePreQuoteRanking: true, ExploreRatioBPS: 5_000}.Normalized(), nil, 1, 100)
+	if len(selected) != 1 || routeKey(selected[0]) != routeKey(same) {
+		t.Fatalf("disabled scorer did not preserve legacy first route: %+v", selected)
+	}
+}
+
+func TestPreQuoteSelectionImprovesCandidateClassWithoutIncreasingBudget(t *testing.T) {
+	engine := &Engine{routeMemory: nearmiss.NewRouteMemory(128)}
+	var candidates []routes.Route
+	for i := 0; i < 12; i++ {
+		candidates = append(candidates, testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.UniswapV3}, string(rune('a'+i)), string(rune('m'+i))))
+	}
+	for i := 0; i < 12; i++ {
+		route := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3}, string(rune('A'+i)), string(rune('M'+i)))
+		engine.routeMemory.Observe(routeKey(route), nearmiss.Record{CrossVenue: true, QuoteSuccessful: true, SufficientLiquidity: true, HopCount: 2, GapToProfit: big.NewInt(1_000), Score: 5_000}, 90)
+		candidates = append(candidates, route)
+	}
+	legacy, legacyStats := engine.selectEvaluationCandidates(candidates, SearchOptions{EvaluationRoutesPerAsset: 8, DisablePreQuoteRanking: true, ExploreRatioBPS: 2_000}.Normalized(), nil, 1, 100)
+	updated, updatedStats := engine.selectEvaluationCandidates(candidates, SearchOptions{EvaluationRoutesPerAsset: 8, ExploreRatioBPS: 2_000}.Normalized(), nil, 1, 100)
+	if len(legacy) != len(updated) || len(updated) != 8 {
+		t.Fatalf("selection changed quote budget: legacy=%d updated=%d", len(legacy), len(updated))
+	}
+	if updatedStats.CrossVenue <= legacyStats.CrossVenue {
+		t.Fatalf("pre-quote selection did not improve cross-venue share: legacy=%+v updated=%+v", legacyStats, updatedStats)
+	}
+	if updatedStats.Explore == 0 {
+		t.Fatalf("exploration slots were not used: %+v", updatedStats)
+	}
+}
+
+func testRoute(start string, dexes []pools.DEX, suffixes ...string) routes.Route {
+	symbols := []string{start}
+	for i := range dexes {
+		symbols = append(symbols, string(rune('A'+i)))
+	}
+	symbols[len(symbols)-1] = start
+	hops := make([]pools.Pool, len(dexes))
+	for i, dexName := range dexes {
+		suffix := "0"
+		if i < len(suffixes) {
+			suffix = suffixes[i]
+		}
+		hops[i] = pools.Pool{Address: "0x000000000000000000000000000000000000000" + suffix, DEX: dexName, Liquidity: big.NewInt(1)}
+	}
+	return routes.Route{Symbols: symbols, Hops: hops}
 }

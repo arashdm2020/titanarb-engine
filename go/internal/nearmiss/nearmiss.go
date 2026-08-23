@@ -8,6 +8,7 @@ import (
 	"math/big"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/titanarb/titanarb-go/internal/opportunity"
@@ -38,6 +39,157 @@ type Record struct {
 	CrossVenue          bool
 	FailureCount        uint64
 	Timestamp           time.Time
+}
+
+type RouteStats struct {
+	GapEMA          float64
+	NetProfitEMA    float64
+	QuoteSuccessEMA float64
+	FailureEMA      float64
+	LastScore       int64
+	LastSeenBlock   uint64
+	LastDirtyBlock  uint64
+	CrossVenue      bool
+	Observations    uint64
+	LastLatencyMS   float64
+}
+
+type RouteMemory struct {
+	mu        sync.RWMutex
+	routes    map[string]RouteStats
+	maxRoutes int
+}
+
+type PreQuoteInput struct {
+	Key          string
+	CrossVenue   bool
+	Volatility   float64
+	CurrentBlock uint64
+}
+
+func NewRouteMemory(maxRoutes int) *RouteMemory {
+	if maxRoutes < 1 {
+		maxRoutes = 4096
+	}
+	return &RouteMemory{routes: make(map[string]RouteStats), maxRoutes: maxRoutes}
+}
+
+func (m *RouteMemory) Observe(key string, record Record, block uint64) {
+	key = strings.TrimSpace(key)
+	if m == nil || key == "" {
+		return
+	}
+	stats := RouteStats{
+		GapEMA:          magnitude(record.GapToProfit),
+		NetProfitEMA:    signedMagnitude(record.NetProfit),
+		QuoteSuccessEMA: boolFloat(record.QuoteSuccessful),
+		FailureEMA:      boolFloat(record.GapToProfit != nil && record.GapToProfit.Sign() > 0 || strings.TrimSpace(record.RejectionReason) != ""),
+		LastScore:       record.Score,
+		LastSeenBlock:   block,
+		CrossVenue:      record.CrossVenue,
+		Observations:    1,
+		LastLatencyMS:   float64(record.EvaluationLatency.Milliseconds()),
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if previous, ok := m.routes[key]; ok {
+		const alpha = 0.35
+		stats.GapEMA = ema(previous.GapEMA, stats.GapEMA, alpha)
+		stats.NetProfitEMA = ema(previous.NetProfitEMA, stats.NetProfitEMA, alpha)
+		stats.QuoteSuccessEMA = ema(previous.QuoteSuccessEMA, stats.QuoteSuccessEMA, alpha)
+		stats.FailureEMA = ema(previous.FailureEMA, stats.FailureEMA, alpha)
+		stats.LastDirtyBlock = previous.LastDirtyBlock
+		stats.Observations = previous.Observations + 1
+		stats.LastLatencyMS = ema(previous.LastLatencyMS, stats.LastLatencyMS, alpha)
+	}
+	m.routes[key] = stats
+	m.pruneLocked()
+}
+
+func (m *RouteMemory) MarkDirty(key string, block uint64) {
+	key = strings.TrimSpace(key)
+	if m == nil || key == "" {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	stats := m.routes[key]
+	stats.LastDirtyBlock = block
+	stats.FailureEMA *= 0.5
+	m.routes[key] = stats
+}
+
+func (m *RouteMemory) Stats(key string) (RouteStats, bool) {
+	if m == nil {
+		return RouteStats{}, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	stats, ok := m.routes[strings.TrimSpace(key)]
+	return stats, ok
+}
+
+func (m *RouteMemory) Len() int {
+	if m == nil {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return len(m.routes)
+}
+
+func (m *RouteMemory) PreQuoteScore(input PreQuoteInput) int64 {
+	score := int64(1_000)
+	if input.CrossVenue {
+		score += 500
+	}
+	if input.Volatility > 0 {
+		if input.Volatility > 5 {
+			input.Volatility = 5
+		}
+		score += int64(input.Volatility * 150)
+	}
+	stats, ok := m.Stats(input.Key)
+	if !ok || stats.Observations == 0 {
+		return score + 250
+	}
+	score += int64(float64(stats.LastScore-1_000) * 0.55)
+	score += int64((stats.QuoteSuccessEMA - 0.5) * 900)
+	score -= int64(stats.FailureEMA * 700)
+	if stats.GapEMA <= 6 {
+		score += 550
+	} else if stats.GapEMA <= 9 {
+		score += 250
+	}
+	if stats.LastLatencyMS > 0 {
+		score -= int64(stats.LastLatencyMS / 50)
+	}
+	if input.CurrentBlock > stats.LastSeenBlock {
+		age := input.CurrentBlock - stats.LastSeenBlock
+		if age > 240 {
+			score -= int64(minUint64(age-240, 600))
+		}
+	}
+	return score
+}
+
+func (m *RouteMemory) pruneLocked() {
+	if m.maxRoutes < 1 || len(m.routes) <= m.maxRoutes {
+		return
+	}
+	type item struct {
+		key   string
+		block uint64
+	}
+	items := make([]item, 0, len(m.routes))
+	for key, stats := range m.routes {
+		items = append(items, item{key: key, block: stats.LastSeenBlock})
+	}
+	sort.Slice(items, func(i, j int) bool { return items[i].block < items[j].block })
+	for len(m.routes) > m.maxRoutes && len(items) > 0 {
+		delete(m.routes, items[0].key)
+		items = items[1:]
+	}
 }
 
 func FromOpportunity(op *opportunity.Opportunity, reason string, latency time.Duration, failureCount uint64) Record {
@@ -142,6 +294,48 @@ func Score(r Record) int64 {
 	score -= int64(r.EvaluationLatency.Milliseconds() / 25)
 	score += gapBonus(r.GapToProfit)
 	return score
+}
+
+func ema(previous, next, alpha float64) float64 {
+	if alpha <= 0 {
+		return previous
+	}
+	if alpha >= 1 {
+		return next
+	}
+	return previous*(1-alpha) + next*alpha
+}
+
+func boolFloat(value bool) float64 {
+	if value {
+		return 1
+	}
+	return 0
+}
+
+func magnitude(value *big.Int) float64 {
+	if value == nil || value.Sign() == 0 {
+		return 0
+	}
+	return float64(len(new(big.Int).Abs(value).String()))
+}
+
+func signedMagnitude(value *big.Int) float64 {
+	if value == nil || value.Sign() == 0 {
+		return 0
+	}
+	sign := 1.0
+	if value.Sign() < 0 {
+		sign = -1
+	}
+	return sign * magnitude(value)
+}
+
+func minUint64(a, b uint64) uint64 {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func Snapshot(records []Record, limit int) []map[string]any {
