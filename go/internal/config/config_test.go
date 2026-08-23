@@ -44,6 +44,31 @@ func TestGenericRPCEnvironmentNames(t *testing.T) {
 	}
 }
 
+func TestPrimarySecondaryRPCProviderConfig(t *testing.T) {
+	v := validEnv()
+	v["RPC_PRIMARY_NAME"] = "quicknode"
+	v["RPC_PRIMARY_HTTP"] = "https://quicknode.example"
+	v["RPC_PRIMARY_WSS"] = "wss://quicknode.example"
+	v["RPC_PRIMARY_MAX_RPS"] = "15"
+	v["RPC_SECONDARY_NAME"] = "chainstack"
+	v["RPC_SECONDARY_HTTP"] = "https://chainstack.example"
+	v["RPC_SECONDARY_WSS"] = "wss://chainstack.example"
+	v["RPC_SECONDARY_MAX_RPS"] = "25"
+	cfg, err := FromLookup(func(k string) string { return v[k] })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.HTTPRPCURL != "https://quicknode.example" || cfg.WSRPCURL != "wss://quicknode.example" {
+		t.Fatalf("primary provider did not become active config: %+v", cfg)
+	}
+	if len(cfg.RPCProviders) != 2 || cfg.RPCProviders[0].Name != "quicknode" || cfg.RPCProviders[1].Name != "chainstack" {
+		t.Fatalf("provider list mismatch: %+v", cfg.RPCProviders)
+	}
+	if cfg.RPCProviders[0].MaxRPS != 15 || cfg.RPCProviders[1].MaxRPS != 25 {
+		t.Fatalf("provider RPS limits mismatch: %+v", cfg.RPCProviders)
+	}
+}
+
 func TestLoadMarketConfig(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "arbitrum.json")
 	data := `{"aaveV3":{"pool":"0x1111111111111111111111111111111111111111"},"uniswapV3":{"factory":"0x2222222222222222222222222222222222222222","quoterV2":"0x3333333333333333333333333333333333333333"},"camelotV3":{"algebraFactory":"0x4444444444444444444444444444444444444444","quoter":"0x5555555555555555555555555555555555555555"},"chainlink":{"ethUsdFeed":"0x6666666666666666666666666666666666666666"},"routeDiscovery":{"baseAsset":"USDC","intermediateTokens":["WETH"],"uniswapFeeTiers":[500]},"tokens":{"USDC":{"symbol":"USDC","address":"0x7777777777777777777777777777777777777777","decimals":6}}}`

@@ -2,9 +2,11 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"github.com/titanarb/titanarb-go/internal/metrics"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -43,4 +45,129 @@ func TestMockFailure(t *testing.T) {
 	if _, err := New(s.URL, time.Second, 0, nil).BlockNumber(context.Background()); err == nil {
 		t.Fatal("expected failure")
 	}
+}
+
+func TestManagedClientSelectsPrimaryHTTP(t *testing.T) {
+	s := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x123"}`)
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: s.URL}, {Name: "chainstack", HTTP: s.URL}}, time.Second, 0, nil)
+	if got := client.ActiveProvider(); got != "quicknode" {
+		t.Fatalf("active provider=%s", got)
+	}
+	if block, err := client.BlockNumber(context.Background()); err != nil || block != 0x123 {
+		t.Fatalf("block=%d err=%v", block, err)
+	}
+}
+
+func TestManagedClientFailoverOn429(t *testing.T) {
+	primary := rpcServer(t, http.StatusTooManyRequests, `rate limited`)
+	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x456"}`)
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: primary.URL}, {Name: "chainstack", HTTP: secondary.URL}}, time.Second, 1, nil)
+	var event Event
+	client.SetObserver(func(e Event) { event = e })
+	block, err := client.BlockNumber(context.Background())
+	if err != nil || block != 0x456 {
+		t.Fatalf("block=%d err=%v", block, err)
+	}
+	if client.ActiveProvider() != "chainstack" || event.Name != "rpc_failover" || event.Reason != "rate_limit" {
+		t.Fatalf("failover mismatch provider=%s event=%+v", client.ActiveProvider(), event)
+	}
+}
+
+func TestManagedClientFailoverOn5xx(t *testing.T) {
+	primary := rpcServer(t, http.StatusBadGateway, `bad gateway`)
+	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x789"}`)
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: primary.URL}, {Name: "chainstack", HTTP: secondary.URL}}, time.Second, 1, nil)
+	block, err := client.BlockNumber(context.Background())
+	if err != nil || block != 0x789 || client.ActiveProvider() != "chainstack" {
+		t.Fatalf("failover failed block=%d provider=%s err=%v", block, client.ActiveProvider(), err)
+	}
+}
+
+func TestManagedClientRPCRevertDoesNotMarkProviderUnhealthy(t *testing.T) {
+	primary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"error":{"message":"execution reverted"}}`)
+	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: primary.URL}, {Name: "chainstack", HTTP: secondary.URL}}, time.Second, 1, nil)
+	var raw string
+	err := client.Call(context.Background(), "eth_call", []any{}, &raw)
+	var rpcErr *Error
+	if !errors.As(err, &rpcErr) || rpcErr.Kind != RPC {
+		t.Fatalf("expected RPC error, got %T %v", err, err)
+	}
+	if client.ActiveProvider() != "quicknode" {
+		t.Fatalf("valid RPC error caused failover to %s", client.ActiveProvider())
+	}
+}
+
+func TestManagedClientRateLimiter(t *testing.T) {
+	s := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: s.URL, MaxRPS: 2}}, time.Second, 0, nil)
+	started := time.Now()
+	for i := 0; i < 3; i++ {
+		if _, err := client.BlockNumber(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
+		t.Fatalf("rate limiter did not enforce provider RPS: %s", elapsed)
+	}
+}
+
+func TestManagedClientCooldownAvoidsFlapping(t *testing.T) {
+	primary := rpcServer(t, http.StatusTooManyRequests, `rate limited`)
+	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x2"}`)
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: primary.URL}, {Name: "chainstack", HTTP: secondary.URL}}, time.Second, 1, nil)
+	if _, err := client.BlockNumber(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.BlockNumber(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if client.ActiveProvider() != "chainstack" {
+		t.Fatalf("provider flapped back to %s during cooldown", client.ActiveProvider())
+	}
+}
+
+func TestManagedClientSnapshotsTrackProviderBlocks(t *testing.T) {
+	s := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0xabc"}`)
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: s.URL}}, time.Second, 0, nil)
+	_, _ = client.BlockNumber(context.Background())
+	snapshots := client.Snapshots()
+	if len(snapshots) != 1 || snapshots[0].LatestBlock != 0xabc || !snapshots[0].Active {
+		t.Fatalf("snapshot mismatch: %+v", snapshots)
+	}
+}
+
+func TestManagedClientDoesNotDuplicateTransactionBroadcast(t *testing.T) {
+	var primaryCalls atomic.Int32
+	var secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls.Add(1)
+		http.Error(w, "temporary", http.StatusBadGateway)
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryCalls.Add(1)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0xhash"}`))
+	}))
+	defer secondary.Close()
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: primary.URL}, {Name: "chainstack", HTTP: secondary.URL}}, time.Second, 1, nil)
+	if _, err := client.SendRawTransaction(context.Background(), "0xdead"); err == nil {
+		t.Fatal("expected primary broadcast failure")
+	}
+	if primaryCalls.Load() != 1 || secondaryCalls.Load() != 0 {
+		t.Fatalf("broadcast was duplicated primary=%d secondary=%d", primaryCalls.Load(), secondaryCalls.Load())
+	}
+}
+
+func rpcServer(t *testing.T, status int, body string) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+			t.Fatalf("missing JSON content type")
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(s.Close)
+	return s
 }

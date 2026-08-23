@@ -24,6 +24,7 @@ type Config struct {
 	ChainID                  int64
 	HTTPRPCURL               string
 	WSRPCURL                 string
+	RPCProviders             []RPCProviderConfig
 	FlashExecutorAddress     string
 	UniswapV3Adapter         string
 	CamelotV3Adapter         string
@@ -37,6 +38,13 @@ type Config struct {
 	GasLimitMultiplierBPS    uint64
 	PriceMaxStalenessSeconds uint64
 	SequencerGraceSeconds    uint64
+}
+
+type RPCProviderConfig struct {
+	Name   string
+	HTTP   string
+	WSS    string
+	MaxRPS int
 }
 
 // Token is a configured Arbitrum asset. Addresses are deliberately sourced
@@ -208,8 +216,9 @@ func FromLookup(get func(string) string) (Config, error) {
 	}
 	cfg := Config{
 		ChainID:              chainID,
-		HTTPRPCURL:           firstNonEmpty(get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL")),
-		WSRPCURL:             firstNonEmpty(get("WS_RPC_URL"), get("ARBITRUM_WSS_RPC_URL")),
+		HTTPRPCURL:           firstNonEmpty(get("RPC_PRIMARY_HTTP"), get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL")),
+		WSRPCURL:             firstNonEmpty(get("RPC_PRIMARY_WSS"), get("WS_RPC_URL"), get("ARBITRUM_WSS_RPC_URL")),
+		RPCProviders:         rpcProvidersFromLookup(get),
 		FlashExecutorAddress: strings.TrimSpace(get("FLASH_EXECUTOR_ADDRESS")),
 		UniswapV3Adapter:     strings.TrimSpace(get("UNISWAP_V3_ADAPTER")),
 		CamelotV3Adapter:     strings.TrimSpace(get("CAMELOT_V3_ADAPTER")),
@@ -226,6 +235,35 @@ func FromLookup(get func(string) string) (Config, error) {
 		SequencerGraceSeconds:    parseUintDefault(get("SEQUENCER_GRACE_PERIOD_SECONDS"), 3600),
 	}
 	return cfg, cfg.Validate()
+}
+
+func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
+	primary := RPCProviderConfig{
+		Name:   firstNonEmpty(get("RPC_PRIMARY_NAME"), "primary"),
+		HTTP:   strings.TrimSpace(get("RPC_PRIMARY_HTTP")),
+		WSS:    strings.TrimSpace(get("RPC_PRIMARY_WSS")),
+		MaxRPS: int(parseUintDefault(get("RPC_PRIMARY_MAX_RPS"), 0)),
+	}
+	secondary := RPCProviderConfig{
+		Name:   firstNonEmpty(get("RPC_SECONDARY_NAME"), "secondary"),
+		HTTP:   strings.TrimSpace(get("RPC_SECONDARY_HTTP")),
+		WSS:    strings.TrimSpace(get("RPC_SECONDARY_WSS")),
+		MaxRPS: int(parseUintDefault(get("RPC_SECONDARY_MAX_RPS"), 0)),
+	}
+	if primary.HTTP == "" {
+		primary.HTTP = firstNonEmpty(get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL"))
+	}
+	if primary.WSS == "" {
+		primary.WSS = firstNonEmpty(get("WS_RPC_URL"), get("ARBITRUM_WSS_RPC_URL"))
+	}
+	var providers []RPCProviderConfig
+	if primary.HTTP != "" || primary.WSS != "" {
+		providers = append(providers, primary)
+	}
+	if secondary.HTTP != "" || secondary.WSS != "" {
+		providers = append(providers, secondary)
+	}
+	return providers
 }
 
 func parseUintDefault(raw string, fallback uint64) uint64 {

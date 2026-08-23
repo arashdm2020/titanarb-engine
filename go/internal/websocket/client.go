@@ -20,17 +20,50 @@ type NewBlockEvent struct {
 }
 type Client struct {
 	url        string
+	endpoints  []Endpoint
+	active     int
 	log        *logger.Logger
 	metrics    *metrics.Metrics
 	connected  atomic.Bool
 	observer   func(string, map[string]any)
 	observerMu sync.RWMutex
+	mu         sync.Mutex
+}
+
+type Endpoint struct {
+	Name string
+	URL  string
 }
 
 func New(url string, log *logger.Logger, m *metrics.Metrics) *Client {
-	return &Client{url: url, log: log, metrics: m}
+	return NewManaged([]Endpoint{{Name: "primary", URL: url}}, log, m)
+}
+
+func NewManaged(endpoints []Endpoint, log *logger.Logger, m *metrics.Metrics) *Client {
+	client := &Client{log: log, metrics: m}
+	for _, endpoint := range endpoints {
+		if endpoint.URL == "" {
+			continue
+		}
+		if endpoint.Name == "" {
+			endpoint.Name = "provider"
+		}
+		client.endpoints = append(client.endpoints, endpoint)
+	}
+	if len(client.endpoints) > 0 {
+		client.url = client.endpoints[0].URL
+	}
+	return client
 }
 func (c *Client) Connected() bool { return c.connected.Load() }
+func (c *Client) ActiveProvider() string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.endpoints) == 0 {
+		return ""
+	}
+	return c.endpoints[c.active].Name
+}
 
 // SetObserver installs an optional non-critical event observer. The websocket
 // stream never depends on it; callers must make their observer fail-open.
@@ -60,11 +93,16 @@ func (c *Client) Start(ctx context.Context) <-chan NewBlockEvent {
 				return
 			}
 			if reconnecting {
-				c.log.Event(logger.Info, "wss_reconnecting", "websocket", "reconnecting", nil)
-				c.emit("wss_reconnecting", nil)
+				c.log.Event(logger.Info, "wss_reconnecting", "websocket", "reconnecting", map[string]any{"provider": c.ActiveProvider()})
+				c.emit("wss_reconnecting", map[string]any{"provider": c.ActiveProvider()})
 			}
-			conn, _, err := websocket.DefaultDialer.DialContext(ctx, c.url, nil)
+			endpoint := c.currentEndpoint()
+			if endpoint.URL == "" {
+				return
+			}
+			conn, _, err := websocket.DefaultDialer.DialContext(ctx, endpoint.URL, nil)
 			if err != nil {
+				c.failover("connect")
 				if !sleep(ctx, delay) {
 					return
 				}
@@ -74,6 +112,7 @@ func (c *Client) Start(ctx context.Context) <-chan NewBlockEvent {
 			}
 			if err := subscribe(conn); err != nil {
 				_ = conn.Close()
+				c.failover("subscribe")
 				if !sleep(ctx, delay) {
 					return
 				}
@@ -83,11 +122,11 @@ func (c *Client) Start(ctx context.Context) <-chan NewBlockEvent {
 			}
 			if reconnecting {
 				c.metrics.IncWSSReconnects()
-				c.log.Event(logger.Info, "wss_connected", "websocket", "connection restored", nil)
-				c.emit("wss_reconnected", nil)
+				c.log.Event(logger.Info, "wss_connected", "websocket", "connection restored", map[string]any{"provider": c.ActiveProvider()})
+				c.emit("wss_reconnected", map[string]any{"provider": c.ActiveProvider()})
 			} else {
-				c.log.Event(logger.Info, "wss_connected", "websocket", "connected", nil)
-				c.emit("wss_connected", nil)
+				c.log.Event(logger.Info, "wss_connected", "websocket", "connected", map[string]any{"provider": c.ActiveProvider()})
+				c.emit("wss_connected", map[string]any{"provider": c.ActiveProvider()})
 			}
 			c.connected.Store(true)
 			reconnecting = false
@@ -99,12 +138,37 @@ func (c *Client) Start(ctx context.Context) <-chan NewBlockEvent {
 				return
 			}
 			c.metrics.IncWSSDisconnects()
-			c.log.Event(logger.Warn, "wss_disconnected", "websocket", "connection lost; polling fallback remains available", nil)
-			c.emit("wss_disconnected", map[string]any{"http_fallback": "active"})
+			c.log.Event(logger.Warn, "wss_disconnected", "websocket", "connection lost; polling fallback remains available", map[string]any{"provider": c.ActiveProvider()})
+			c.emit("wss_disconnected", map[string]any{"http_fallback": "active", "provider": c.ActiveProvider()})
+			c.failover("disconnect")
 			reconnecting = true
 		}
 	}()
 	return events
+}
+
+func (c *Client) currentEndpoint() Endpoint {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.endpoints) == 0 {
+		return Endpoint{}
+	}
+	return c.endpoints[c.active]
+}
+
+func (c *Client) failover(reason string) {
+	c.mu.Lock()
+	if len(c.endpoints) < 2 {
+		c.mu.Unlock()
+		return
+	}
+	from := c.endpoints[c.active]
+	c.active = (c.active + 1) % len(c.endpoints)
+	to := c.endpoints[c.active]
+	c.url = to.URL
+	c.mu.Unlock()
+	c.log.Event(logger.Warn, "wss_failover", "websocket", "switching websocket provider", map[string]any{"from": from.Name, "to": to.Name, "reason": reason})
+	c.emit("wss_failover", map[string]any{"from": from.Name, "to": to.Name, "reason": reason})
 }
 func subscribe(conn *websocket.Conn) error {
 	return conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": []any{"newHeads"}})

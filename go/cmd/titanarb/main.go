@@ -76,7 +76,11 @@ func main() {
 		log.Event(logger.Warn, "health_check_failed", "risk", "runtime risk controls unavailable: "+riskErr.Error(), nil)
 		runtimeRisk, _ = runtimeconfig.Open("", runtimeconfig.Defaults(runtimeconfig.Balanced))
 	}
-	rpcClient := rpc.New(cfg.HTTPRPCURL, 15*time.Second, 2, m)
+	rpcClient := rpc.NewManaged(rpcProviderConfigs(cfg), 15*time.Second, 2, m)
+	rpcClient.SetObserver(func(event rpc.Event) {
+		log.Event(logger.Warn, event.Name, "rpc", "RPC provider changed", map[string]any{"from": event.From, "to": event.To, "transport": event.Transport, "reason": event.Reason})
+		alert(operationSink, observability.Server, event.Name, telegram.Warning, "RPC provider changed", map[string]any{"from": event.From, "to": event.To, "transport": event.Transport, "reason": event.Reason})
+	})
 	chain, err := rpcClient.ChainID(ctx)
 	if err != nil || chain != config.ArbitrumOneChainID {
 		log.Event(logger.Error, "health_check_failed", "rpc", "unable to validate Arbitrum One", nil)
@@ -90,7 +94,7 @@ func main() {
 	log.Event(logger.Info, "bot_started", "runtime", "TitanArb Go runtime started", map[string]any{"chain_id": chain, "execution_runtime": os.Getenv("TITANARB_EXECUTION_RUNTIME") == "true"})
 	log.Event(logger.Info, "rpc_connected", "rpc", "connected", map[string]any{"latest_block": block})
 	alert(operationSink, observability.Server, "bot_started", telegram.Info, "Go runtime started", map[string]any{"chain_id": chain, "latest_block": block, "broadcast_enabled": cfg.BroadcastEnabled})
-	w := ws.New(cfg.WSRPCURL, log, m)
+	w := ws.NewManaged(wssEndpoints(cfg), log, m)
 	w.SetObserver(func(event string, fields map[string]any) {
 		severity := telegram.Info
 		if event == "wss_disconnected" {
@@ -110,7 +114,7 @@ func main() {
 			Auth: control.Authorizer{ChatID: telegramConfig.ChatID, AdminID: os.Getenv("TELEGRAM_ADMIN_ID")},
 			Risk: runtimeRisk,
 			Status: func() string {
-				return fmt.Sprintf("🟢 TITANARB — STATUS\n🌐 Arbitrum One\n🧠 Risk: %s\n🔌 WSS: %t\n📡 RPC: Healthy", runtimeRisk.Snapshot().Profile, w.Connected())
+				return fmt.Sprintf("🟢 TITANARB — STATUS\n🌐 Arbitrum One\n🧠 Risk: %s\n🔌 WSS: %s %t\n📡 RPC: %s", runtimeRisk.Snapshot().Profile, w.ActiveProvider(), w.Connected(), rpcClient.ActiveProvider())
 			},
 			Market: func() string {
 				marketSnapshot := market.Snapshot{}
@@ -278,6 +282,9 @@ func main() {
 				"routes_considered":           report.RoutesConsidered,
 				"routes_quoted":               report.RoutesEvaluated,
 				"quote_age_blocks":            report.QuoteAgeBlocks,
+				"active_rpc_provider":         rpcClient.ActiveProvider(),
+				"active_wss_provider":         w.ActiveProvider(),
+				"rpc_provider_health":         rpcProviderHealthString(rpcClient.Snapshots()),
 			}
 			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)
 			publish(operationSink, observability.Performance, "market_cycle", telegram.Info, "market cycle complete", fields)
@@ -737,6 +744,59 @@ func marketSearchOptions(settings runtimeconfig.Settings) market.SearchOptions {
 		DisablePreQuoteRanking:   strings.EqualFold(strings.TrimSpace(os.Getenv("PREQUOTE_RANKING_ENABLED")), "false"),
 		ExploreRatioBPS:          preQuoteExploreBPS(),
 	}
+}
+
+func rpcProviderConfigs(cfg config.Config) []rpc.ProviderConfig {
+	if len(cfg.RPCProviders) == 0 {
+		return []rpc.ProviderConfig{{Name: "primary", HTTP: cfg.HTTPRPCURL}}
+	}
+	out := make([]rpc.ProviderConfig, 0, len(cfg.RPCProviders))
+	for _, provider := range cfg.RPCProviders {
+		if strings.TrimSpace(provider.HTTP) == "" {
+			continue
+		}
+		out = append(out, rpc.ProviderConfig{Name: provider.Name, HTTP: provider.HTTP, MaxRPS: provider.MaxRPS})
+	}
+	if len(out) == 0 {
+		out = append(out, rpc.ProviderConfig{Name: "primary", HTTP: cfg.HTTPRPCURL})
+	}
+	return out
+}
+
+func wssEndpoints(cfg config.Config) []ws.Endpoint {
+	if len(cfg.RPCProviders) == 0 {
+		return []ws.Endpoint{{Name: "primary", URL: cfg.WSRPCURL}}
+	}
+	out := make([]ws.Endpoint, 0, len(cfg.RPCProviders))
+	for _, provider := range cfg.RPCProviders {
+		if strings.TrimSpace(provider.WSS) == "" {
+			continue
+		}
+		out = append(out, ws.Endpoint{Name: provider.Name, URL: provider.WSS})
+	}
+	if len(out) == 0 {
+		out = append(out, ws.Endpoint{Name: "primary", URL: cfg.WSRPCURL})
+	}
+	return out
+}
+
+func rpcProviderHealthString(snapshots []rpc.ProviderSnapshot) string {
+	if len(snapshots) == 0 {
+		return ""
+	}
+	parts := make([]string, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		state := "healthy"
+		if !snapshot.Healthy {
+			state = "cooldown"
+		}
+		active := ""
+		if snapshot.Active {
+			active = ":active"
+		}
+		parts = append(parts, fmt.Sprintf("%s=%s%s,block=%d,latency_ms=%d,rate_limited=%d,failures=%d", snapshot.Name, state, active, snapshot.LatestBlock, snapshot.Latency.Milliseconds(), snapshot.RateLimited, snapshot.Failures))
+	}
+	return strings.Join(parts, ";")
 }
 
 func preQuoteExploreBPS() int {
