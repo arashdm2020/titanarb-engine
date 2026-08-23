@@ -98,6 +98,33 @@ func TestManagedClientRPCRevertDoesNotMarkProviderUnhealthy(t *testing.T) {
 	}
 }
 
+func TestManagedClientCallerContextTimeoutDoesNotFailover(t *testing.T) {
+	var secondaryCalls atomic.Int32
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(100 * time.Millisecond)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x1"}`))
+	}))
+	defer primary.Close()
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryCalls.Add(1)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x2"}`))
+	}))
+	defer secondary.Close()
+
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: primary.URL}, {Name: "chainstack", HTTP: secondary.URL}}, time.Second, 1, nil)
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	if _, err := client.BlockNumber(ctx); err == nil {
+		t.Fatal("expected caller context timeout")
+	}
+	if got := client.ActiveProvider(); got != "quicknode" {
+		t.Fatalf("caller context timeout caused failover to %s", got)
+	}
+	if secondaryCalls.Load() != 0 {
+		t.Fatalf("caller context timeout retried on secondary %d times", secondaryCalls.Load())
+	}
+}
+
 func TestManagedClientRateLimiter(t *testing.T) {
 	s := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
 	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: s.URL, MaxRPS: 2}}, time.Second, 0, nil)

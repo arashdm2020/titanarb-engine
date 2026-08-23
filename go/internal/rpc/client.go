@@ -170,6 +170,9 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 			c.recordSuccess(provider, method, out)
 			return nil
 		}
+		if ctx.Err() != nil {
+			return err
+		}
 		if !providerFailure(err) {
 			return err
 		}
@@ -203,6 +206,9 @@ func (c *Client) callOnceNoFailover(ctx context.Context, method string, body []b
 	if err == nil {
 		c.recordSuccess(provider, method, out)
 		return nil
+	}
+	if ctx.Err() != nil {
+		return err
 	}
 	if providerFailure(err) {
 		c.recordFailure(provider, err)
