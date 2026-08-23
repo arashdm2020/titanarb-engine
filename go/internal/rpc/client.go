@@ -36,14 +36,15 @@ func (e *Error) Error() string { return e.Err.Error() }
 func (e *Error) Unwrap() error { return e.Err }
 
 type Client struct {
-	endpoint  string
-	http      *http.Client
-	retries   int
-	metrics   *metrics.Metrics
-	providers []*providerState
-	mu        sync.Mutex
-	active    int
-	observer  func(Event)
+	endpoint   string
+	http       *http.Client
+	retries    int
+	metrics    *metrics.Metrics
+	providers  []*providerState
+	mu         sync.Mutex
+	active     int
+	lastSwitch time.Time
+	observer   func(Event)
 }
 
 func New(endpoint string, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -264,6 +265,9 @@ func (c *Client) chooseProvider() (*providerState, int) {
 		return nil, -1
 	}
 	now := time.Now()
+	if c.active != 0 && len(c.providers) > 1 && now.Sub(c.lastSwitch) > 2*time.Minute && now.After(c.providers[0].cooldownUntil) {
+		c.active = 0
+	}
 	for offset := 0; offset < len(c.providers); offset++ {
 		index := (c.active + offset) % len(c.providers)
 		if now.Before(c.providers[index].cooldownUntil) {
@@ -336,6 +340,7 @@ func (c *Client) failover(from int, reason string) {
 		return
 	}
 	c.active = to
+	c.lastSwitch = time.Now()
 	event := Event{Name: "rpc_failover", From: old.cfg.Name, To: c.providers[to].cfg.Name, Transport: "http", Reason: reason}
 	observer := c.observer
 	c.mu.Unlock()

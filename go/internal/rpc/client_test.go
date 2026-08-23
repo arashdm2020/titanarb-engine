@@ -127,6 +127,66 @@ func TestManagedClientCooldownAvoidsFlapping(t *testing.T) {
 	}
 }
 
+func TestManagedClientPrimaryRecoveryHysteresis(t *testing.T) {
+	var primaryStatus atomic.Int32
+	primaryStatus.Store(http.StatusTooManyRequests)
+	var primaryCalls atomic.Int32
+	var secondaryCalls atomic.Int32
+
+	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		primaryCalls.Add(1)
+		if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+			t.Fatalf("missing JSON content type")
+		}
+		if primaryStatus.Load() != http.StatusOK {
+			http.Error(w, "rate limited", http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x3"}`))
+	}))
+	defer primary.Close()
+
+	secondary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		secondaryCalls.Add(1)
+		if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+			t.Fatalf("missing JSON content type")
+		}
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x2"}`))
+	}))
+	defer secondary.Close()
+
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: primary.URL}, {Name: "chainstack", HTTP: secondary.URL}}, time.Second, 1, nil)
+	if block, err := client.BlockNumber(context.Background()); err != nil || block != 0x2 {
+		t.Fatalf("initial failover block=%d err=%v", block, err)
+	}
+	if got := client.ActiveProvider(); got != "chainstack" {
+		t.Fatalf("expected fallback provider, got %s", got)
+	}
+
+	primaryStatus.Store(http.StatusOK)
+	if block, err := client.BlockNumber(context.Background()); err != nil || block != 0x2 {
+		t.Fatalf("hysteresis fallback block=%d err=%v", block, err)
+	}
+	if got := client.ActiveProvider(); got != "chainstack" {
+		t.Fatalf("primary recovered too early, active=%s", got)
+	}
+
+	client.mu.Lock()
+	client.lastSwitch = time.Now().Add(-3 * time.Minute)
+	client.providers[0].cooldownUntil = time.Now().Add(-time.Second)
+	client.mu.Unlock()
+
+	if block, err := client.BlockNumber(context.Background()); err != nil || block != 0x3 {
+		t.Fatalf("primary recovery block=%d err=%v", block, err)
+	}
+	if got := client.ActiveProvider(); got != "quicknode" {
+		t.Fatalf("primary did not recover after hysteresis window, active=%s", got)
+	}
+	if primaryCalls.Load() != 2 || secondaryCalls.Load() != 2 {
+		t.Fatalf("unexpected request distribution primary=%d secondary=%d", primaryCalls.Load(), secondaryCalls.Load())
+	}
+}
+
 func TestManagedClientSnapshotsTrackProviderBlocks(t *testing.T) {
 	s := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0xabc"}`)
 	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: s.URL}}, time.Second, 0, nil)
