@@ -528,8 +528,13 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 			return nil, result.err
 		}
 		e.cache.Put(result.after)
-		if logErr != nil && poolChanged(result.before, result.after) {
-			dirty[strings.ToLower(result.after.Address)] = struct{}{}
+		address := strings.ToLower(result.after.Address)
+		changed := poolChanged(result.before, result.after)
+		if logErr != nil && changed {
+			dirty[address] = struct{}{}
+		}
+		if logErr == nil && !changed {
+			delete(dirty, address)
 		}
 	}
 	return dirty, nil

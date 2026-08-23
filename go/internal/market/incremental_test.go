@@ -38,6 +38,17 @@ func TestPoolChangedUsesMutableState(t *testing.T) {
 	}
 }
 
+func TestUnchangedLoggedPoolCanBeRemovedFromDirtySet(t *testing.T) {
+	p := pools.Pool{Address: "0x0000000000000000000000000000000000000001", Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20)}
+	dirty := map[string]struct{}{p.Address: {}}
+	if !poolChanged(p, p) {
+		delete(dirty, p.Address)
+	}
+	if len(dirty) != 0 {
+		t.Fatalf("unchanged logged pool remained dirty: %+v", dirty)
+	}
+}
+
 func TestIdleCycleDoesNotAdvanceFullReconcileCounter(t *testing.T) {
 	if shouldAdvanceFullReconcileCounter(nil) {
 		t.Fatal("nil dirty set advanced full reconcile counter")
