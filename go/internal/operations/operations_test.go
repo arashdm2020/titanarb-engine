@@ -29,6 +29,30 @@ func TestSinkPersistsWithoutBlocking(t *testing.T) {
 	}
 }
 
+func TestSinkClonesFieldsOnPublish(t *testing.T) {
+	dir := t.TempDir()
+	s, err := New(dir, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fields := map[string]any{"status": "before", "nested": map[string]any{"value": "safe"}}
+	s.Publish(Event{Category: observability.Performance, Name: "snapshot", Fields: fields})
+	fields["status"] = "after"
+	fields["late"] = "mutation"
+	fields["nested"].(map[string]any)["value"] = "changed"
+	if err := s.Close(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(dir + "/performance.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if !strings.Contains(text, `"status":"before"`) || strings.Contains(text, "mutation") || strings.Contains(text, "changed") {
+		t.Fatalf("fields were not cloned at publish time: %s", text)
+	}
+}
+
 func TestConcurrentPublishAndCloseIsSafe(t *testing.T) {
 	s, err := New(t.TempDir(), nil)
 	if err != nil {

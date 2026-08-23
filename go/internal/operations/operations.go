@@ -50,6 +50,7 @@ func (s *Sink) Publish(event Event) {
 	if event.Category == "" {
 		event.Category = observability.Performance
 	}
+	event.Fields = cloneFields(event.Fields)
 	select {
 	case s.queue <- event:
 	default:
@@ -101,6 +102,22 @@ func stringFields(input map[string]any) map[string]string {
 	}
 	return out
 }
+
+func cloneFields(input map[string]any) map[string]any {
+	if len(input) == 0 {
+		return nil
+	}
+	out := make(map[string]any, len(input))
+	for key, value := range input {
+		if nested, ok := value.(map[string]any); ok {
+			out[key] = cloneFields(nested)
+			continue
+		}
+		out[key] = value
+	}
+	return out
+}
+
 func toString(v any) string {
 	if s, ok := v.(string); ok {
 		return s
