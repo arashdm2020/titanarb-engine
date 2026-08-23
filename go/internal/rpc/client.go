@@ -304,8 +304,13 @@ func (c *Client) recordFailure(provider *providerState, err error) {
 	provider.failures++
 	provider.consecutiveFailure++
 	provider.lastFailure = time.Now()
-	if provider.consecutiveFailure >= 2 || failureReason(err) == "rate_limit" {
-		provider.cooldownUntil = time.Now().Add(15 * time.Second)
+	cooldown := 15 * time.Second
+	if failureReason(err) == "rate_limit" {
+		cooldown = 30 * time.Second
+	}
+	provider.cooldownUntil = time.Now().Add(cooldown)
+	if provider.consecutiveFailure >= 3 {
+		provider.cooldownUntil = time.Now().Add(60 * time.Second)
 	}
 }
 
