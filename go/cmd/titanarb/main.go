@@ -241,6 +241,10 @@ func main() {
 			after := m.Snapshot()
 			rpcCalls := after.RPCCalls - before.RPCCalls
 			duration := report.Duration
+			avgRPS := 0.0
+			if duration > 0 {
+				avgRPS = float64(rpcCalls) / duration.Seconds()
+			}
 			blockToStart := cycleStarted.Sub(trigger.ObservedAt)
 			if blockToStart < 0 {
 				blockToStart = 0
@@ -261,6 +265,13 @@ func main() {
 				"quote_duration_ms": report.QuoteDuration.Milliseconds(), "optimizer_duration_ms": report.OptimizerDuration.Milliseconds(),
 				"optimizer_runs": report.OptimizerRuns, "optimizer_samples": report.OptimizerSamples, "cycle_lag_blocks": lag,
 				"blocks_coalesced": coalesced, "rpc_calls": rpcCalls,
+				"rpc_calls_by_stage":          stringUintMapString(report.RPCCallsByStage),
+				"quote_cache_hits":            report.QuoteCacheHits,
+				"quote_dedup_hits":            report.QuoteDedupHits,
+				"optimizer_samples_saved":     report.OptimizerSaved,
+				"routes_skipped_by_prequote":  report.RoutesSkippedByPreQuote,
+				"avg_rps":                     fmt.Sprintf("%.2f", avgRPS),
+				"p95_rps":                     fmt.Sprintf("%.2f", avgRPS),
 				"active_universe_assets":      strings.Join(report.UniverseAssets, ","),
 				"added_dynamic_assets":        strings.Join(report.DynamicAssets, ","),
 				"universe_decisions":          strings.Join(report.UniverseDecisions, "; "),
@@ -676,6 +687,22 @@ func intMapString(values map[int]int) string {
 }
 
 func stringIntMapString(values map[string]int) string {
+	if len(values) == 0 {
+		return ""
+	}
+	keys := make([]string, 0, len(values))
+	for key := range values {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, fmt.Sprintf("%s:%d", key, values[key]))
+	}
+	return strings.Join(out, ",")
+}
+
+func stringUintMapString(values map[string]uint64) string {
 	if len(values) == 0 {
 		return ""
 	}

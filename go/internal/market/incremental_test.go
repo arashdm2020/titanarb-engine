@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/titanarb/titanarb-go/internal/nearmiss"
+	"github.com/titanarb/titanarb-go/internal/optimizer"
 	"github.com/titanarb/titanarb-go/internal/pools"
 	"github.com/titanarb/titanarb-go/internal/routes"
 )
@@ -111,8 +112,20 @@ func TestSamplesForScoreAllocatesMoreBudgetToHighScoreRoutes(t *testing.T) {
 	base := 8
 	high := samplesForScore(4_500, base)
 	low := samplesForScore(1_000, base)
-	if high <= base || low >= base || low < 2 {
+	if high != base || low != 2 {
 		t.Fatalf("unexpected sample allocation high=%d base=%d low=%d", high, base, low)
+	}
+}
+
+func TestOptimizerProbeStopsStructurallyBadRoute(t *testing.T) {
+	candidate := optimizerCandidate{score: 1_000, minProfit: big.NewInt(1_000_000)}
+	best := optimizer.OptimalLoan{NetProfit: big.NewInt(-1)}
+	if !shouldStopOptimizerAfterProbe(candidate, best, big.NewInt(1_000_000_000)) {
+		t.Fatal("low-score losing route should stop after probe")
+	}
+	best.NetProfit = big.NewInt(1)
+	if shouldStopOptimizerAfterProbe(candidate, best, big.NewInt(1_000_000_000)) {
+		t.Fatal("positive probe result must remain eligible")
 	}
 }
 

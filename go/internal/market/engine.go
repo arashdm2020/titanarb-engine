@@ -55,38 +55,43 @@ type Snapshot struct {
 }
 
 type CycleReport struct {
-	StateBlock        uint64
-	FullReconcile     bool
-	DirtyPools        uint64
-	RoutesRecomputed  uint64
-	RoutesReused      uint64
-	QuoteDuration     time.Duration
-	OptimizerDuration time.Duration
-	OptimizerRuns     uint64
-	OptimizerSamples  uint64
-	RoutesEvaluated   uint64
-	Duration          time.Duration
-	Routes            []routes.Route
-	UniverseAssets    []string
-	DynamicAssets     []string
-	UniverseDecisions []string
-	RouteCountBefore  int
-	RouteCountAfter   int
-	RoutesByHop       map[int]int
-	DEXRoutes         map[string]int
-	TopNearMisses     []map[string]any
-	RouteScores       map[string]int
-	OptimizerBudget   map[string]int
-	RejectionReasons  map[string]int
-	ExploitSelected   uint64
-	ExploreSelected   uint64
-	MemoryRoutes      int
-	AvgPreQuoteScore  int64
-	CrossVenueQuoted  uint64
-	SameDEXQuoted     uint64
-	RoutesConsidered  uint64
-	QuoteAgeBlocks    uint64
-	PreQuoteRanking   bool
+	StateBlock              uint64
+	FullReconcile           bool
+	DirtyPools              uint64
+	RoutesRecomputed        uint64
+	RoutesReused            uint64
+	QuoteDuration           time.Duration
+	OptimizerDuration       time.Duration
+	OptimizerRuns           uint64
+	OptimizerSamples        uint64
+	RoutesEvaluated         uint64
+	Duration                time.Duration
+	Routes                  []routes.Route
+	UniverseAssets          []string
+	DynamicAssets           []string
+	UniverseDecisions       []string
+	RouteCountBefore        int
+	RouteCountAfter         int
+	RoutesByHop             map[int]int
+	DEXRoutes               map[string]int
+	TopNearMisses           []map[string]any
+	RouteScores             map[string]int
+	OptimizerBudget         map[string]int
+	RejectionReasons        map[string]int
+	ExploitSelected         uint64
+	ExploreSelected         uint64
+	MemoryRoutes            int
+	AvgPreQuoteScore        int64
+	CrossVenueQuoted        uint64
+	SameDEXQuoted           uint64
+	RoutesConsidered        uint64
+	QuoteAgeBlocks          uint64
+	PreQuoteRanking         bool
+	RPCCallsByStage         map[string]uint64
+	QuoteCacheHits          uint64
+	QuoteDedupHits          uint64
+	OptimizerSaved          uint64
+	RoutesSkippedByPreQuote uint64
 }
 
 const fullReconcileEvery = 240
@@ -277,6 +282,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	full := len(e.routeCache) == 0 || e.cyclesSinceFull >= fullReconcileEvery || maxHops != e.lastMaxHops || maxRoutes != e.lastMaxRoutes
 	var dirty map[string]struct{}
 	var err error
+	rpcAtStart := e.rpcCalls()
 	if full {
 		e.routeCache, err = e.fullReconcile(ctx, stateBlock, maxHops, maxRoutes)
 		if err != nil {
@@ -300,6 +306,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		}
 		e.cyclesSinceFull++
 	}
+	rpcAfterRefresh := e.rpcCalls()
 	report.DirtyPools = uint64(len(dirty))
 	active := liquidPools(e.cache.Snapshot())
 	signals := map[string]volatility.Signal{}
@@ -326,7 +333,11 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	e.cycles = uint64(len(routesFound))
 	e.statsMu.Unlock()
 	quoteStarted := time.Now()
+	if e.evaluator != nil {
+		e.evaluator.ResetQuoteCache(stateBlock)
+	}
 	evaluation := e.evaluate(ctx, affected, options, signals, volatilityWeight, stateBlock)
+	rpcAfterEvaluation := e.rpcCalls()
 	report.QuoteDuration = time.Since(quoteStarted)
 	report.OptimizerDuration = evaluation.OptimizerDuration
 	report.OptimizerRuns = evaluation.OptimizerRuns
@@ -345,6 +356,14 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.RoutesConsidered = evaluation.RoutesConsidered
 	report.QuoteAgeBlocks = evaluation.QuoteAgeBlocks
 	report.PreQuoteRanking = !options.DisablePreQuoteRanking
+	report.RPCCallsByStage = map[string]uint64{
+		"pool_refresh": safeUint64Delta(rpcAfterRefresh, rpcAtStart),
+		"evaluation":   safeUint64Delta(rpcAfterEvaluation, rpcAfterRefresh),
+	}
+	report.QuoteCacheHits = evaluation.QuoteCacheHits
+	report.QuoteDedupHits = evaluation.QuoteDedupHits
+	report.OptimizerSaved = evaluation.OptimizerSaved
+	report.RoutesSkippedByPreQuote = evaluation.RoutesSkippedByPreQuote
 	report.Duration = time.Since(started)
 	report.Routes = routesFound
 	report.RouteCountAfter = len(routesFound)
@@ -521,20 +540,24 @@ func poolsByAddress(all []pools.Pool, selected map[string]struct{}) []pools.Pool
 }
 
 type evaluationReport struct {
-	OptimizerRuns     uint64
-	OptimizerSamples  uint64
-	RoutesEvaluated   uint64
-	OptimizerDuration time.Duration
-	NearMisses        []nearmiss.Record
-	OptimizerBudget   map[string]int
-	ExploitSelected   uint64
-	ExploreSelected   uint64
-	MemoryRoutes      int
-	AvgPreQuoteScore  int64
-	CrossVenueQuoted  uint64
-	SameDEXQuoted     uint64
-	RoutesConsidered  uint64
-	QuoteAgeBlocks    uint64
+	OptimizerRuns           uint64
+	OptimizerSamples        uint64
+	RoutesEvaluated         uint64
+	OptimizerDuration       time.Duration
+	NearMisses              []nearmiss.Record
+	OptimizerBudget         map[string]int
+	ExploitSelected         uint64
+	ExploreSelected         uint64
+	MemoryRoutes            int
+	AvgPreQuoteScore        int64
+	CrossVenueQuoted        uint64
+	SameDEXQuoted           uint64
+	RoutesConsidered        uint64
+	QuoteAgeBlocks          uint64
+	QuoteCacheHits          uint64
+	QuoteDedupHits          uint64
+	OptimizerSaved          uint64
+	RoutesSkippedByPreQuote uint64
 }
 
 func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, options SearchOptions, signals map[string]volatility.Signal, volatilityWeight float64, stateBlock uint64) evaluationReport {
@@ -553,6 +576,9 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		}
 		evaluationCandidates, selection := e.selectEvaluationCandidates(candidates, options, signals, volatilityWeight, stateBlock)
 		report.RoutesConsidered += uint64(len(candidates))
+		if len(candidates) > len(evaluationCandidates) {
+			report.RoutesSkippedByPreQuote += uint64(len(candidates) - len(evaluationCandidates))
+		}
 		report.ExploitSelected += uint64(selection.Exploit)
 		report.ExploreSelected += uint64(selection.Explore)
 		report.CrossVenueQuoted += uint64(selection.CrossVenue)
@@ -577,6 +603,7 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		report.OptimizerDuration += time.Since(optimizerStarted)
 		report.OptimizerRuns += optimized.OptimizerRuns
 		report.OptimizerSamples += optimized.OptimizerSamples
+		report.OptimizerSaved += optimized.OptimizerSaved
 		if report.OptimizerBudget == nil {
 			report.OptimizerBudget = make(map[string]int)
 		}
@@ -586,6 +613,11 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 	}
 	if e.routeMemory != nil {
 		report.MemoryRoutes = e.routeMemory.Len()
+	}
+	if e.evaluator != nil {
+		stats := e.evaluator.QuoteCacheStats()
+		report.QuoteCacheHits = stats.Hits
+		report.QuoteDedupHits = stats.DedupHits
 	}
 	return report
 }
@@ -814,8 +846,11 @@ func dedupeRoutes(candidates []routes.Route) []routes.Route {
 }
 
 type optimizerCandidate struct {
-	route routes.Route
-	score int64
+	route     routes.Route
+	score     int64
+	netProfit *big.Int
+	minProfit *big.Int
+	gap       *big.Int
 }
 
 func selectOptimizerCandidates(evaluated []evaluatedRoute, limit int) []optimizerCandidate {
@@ -840,7 +875,19 @@ func selectOptimizerCandidates(evaluated []evaluatedRoute, limit int) []optimize
 	}
 	selected := make([]optimizerCandidate, 0, len(evaluated))
 	for _, item := range evaluated {
-		selected = append(selected, optimizerCandidate{route: item.route, score: item.routeScore})
+		candidate := optimizerCandidate{route: item.route, score: item.routeScore}
+		if item.nearMiss != nil {
+			if item.nearMiss.NetProfit != nil {
+				candidate.netProfit = new(big.Int).Set(item.nearMiss.NetProfit)
+			}
+			if item.nearMiss.MinProfit != nil {
+				candidate.minProfit = new(big.Int).Set(item.nearMiss.MinProfit)
+			}
+			if item.nearMiss.GapToProfit != nil {
+				candidate.gap = new(big.Int).Set(item.nearMiss.GapToProfit)
+			}
+		}
+		selected = append(selected, candidate)
 	}
 	return selected
 }
@@ -1060,6 +1107,20 @@ func quoteAgeBlocks(stateBlock, sourceBlock uint64) uint64 {
 	return stateBlock - sourceBlock
 }
 
+func (e *Engine) rpcCalls() uint64 {
+	if e == nil || e.metrics == nil {
+		return 0
+	}
+	return e.metrics.Snapshot().RPCCalls
+}
+
+func safeUint64Delta(after, before uint64) uint64 {
+	if after < before {
+		return 0
+	}
+	return after - before
+}
+
 func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []optimizerCandidate, current *big.Int, samples int) evaluationReport {
 	report := evaluationReport{OptimizerBudget: make(map[string]int)}
 	if current == nil || current.Sign() <= 0 {
@@ -1083,8 +1144,46 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 			Hops:   append([]pools.Pool(nil), route.Hops...),
 		}
 
+		probeSamples := minInt(allocatedSamples, 3)
 		report.OptimizerRuns++
 		best, err := e.optimizer.Optimize(
+			ctx,
+			optimizerAdapter{evaluator: e.evaluator},
+			asset,
+			graphRoute,
+			func() optimizer.Range {
+				min := new(big.Int).Div(new(big.Int).Set(current), big.NewInt(10))
+				if min.Sign() <= 0 {
+					min = new(big.Int).Set(current)
+				}
+				return optimizer.Range{
+					Min:     min,
+					Max:     max,
+					Samples: probeSamples,
+				}
+			}(),
+		)
+		report.OptimizerSamples += uint64(best.Evaluated)
+
+		if err != nil {
+			continue
+		}
+
+		if shouldStopOptimizerAfterProbe(candidate, best, current) || probeSamples >= allocatedSamples {
+			if allocatedSamples > best.Evaluated {
+				report.OptimizerSaved += uint64(allocatedSamples - best.Evaluated)
+			}
+			if best.Amount != nil && best.NetProfit != nil && best.NetProfit.Sign() > 0 {
+				optimizedRoute := routes.Route{
+					Symbols: append([]string(nil), route.Symbols...),
+					Hops:    append([]pools.Pool(nil), route.Hops...),
+				}
+				_, _ = e.evaluator.Evaluate(ctx, optimizedRoute, best.Amount)
+			}
+			continue
+		}
+
+		deep, err := e.optimizer.Optimize(
 			ctx,
 			optimizerAdapter{evaluator: e.evaluator},
 			asset,
@@ -1101,10 +1200,10 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 				}
 			}(),
 		)
-		report.OptimizerSamples += uint64(best.Evaluated)
+		report.OptimizerSamples += uint64(deep.Evaluated)
 
-		if err != nil {
-			continue
+		if err == nil && deep.NetProfit != nil && (best.NetProfit == nil || deep.NetProfit.Cmp(best.NetProfit) > 0) {
+			best = deep
 		}
 
 		// Optimizer-selected amount becomes the evaluation amount only when
@@ -1126,15 +1225,48 @@ func samplesForScore(score int64, base int) int {
 	}
 	switch {
 	case score >= 4_000:
-		return base * 2
+		return base
 	case score < 2_000:
+		return 2
+	default:
 		if base/2 < 2 {
 			return 2
 		}
 		return base / 2
-	default:
-		return base
 	}
+}
+
+func shouldStopOptimizerAfterProbe(candidate optimizerCandidate, best optimizer.OptimalLoan, current *big.Int) bool {
+	if best.NetProfit == nil {
+		return true
+	}
+	if best.NetProfit.Sign() > 0 {
+		return false
+	}
+	if candidate.score < 2_000 {
+		return true
+	}
+	limit := big.NewInt(0)
+	if candidate.minProfit != nil && candidate.minProfit.Sign() > 0 {
+		limit.Mul(candidate.minProfit, big.NewInt(25))
+	}
+	if current != nil && current.Sign() > 0 {
+		byAmount := new(big.Int).Div(new(big.Int).Set(current), big.NewInt(100))
+		if byAmount.Cmp(limit) > 0 {
+			limit = byAmount
+		}
+	}
+	if limit.Sign() <= 0 {
+		limit = big.NewInt(1)
+	}
+	return new(big.Int).Neg(best.NetProfit).Cmp(limit) > 0
+}
+
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
 
 func routeKey(route routes.Route) string {

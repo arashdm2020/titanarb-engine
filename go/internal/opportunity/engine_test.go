@@ -40,6 +40,23 @@ type quoter struct{}
 func (quoter) Quote(_ context.Context, r quotes.Request) (quotes.Result, error) {
 	return quotes.Result{AmountOut: new(big.Int).Add(r.AmountIn, big.NewInt(100))}, nil
 }
+
+type countingQuoter struct {
+	calls atomic.Uint64
+	delay time.Duration
+}
+
+func (q *countingQuoter) Quote(ctx context.Context, r quotes.Request) (quotes.Result, error) {
+	q.calls.Add(1)
+	if q.delay > 0 {
+		select {
+		case <-time.After(q.delay):
+		case <-ctx.Done():
+			return quotes.Result{}, ctx.Err()
+		}
+	}
+	return quotes.Result{AmountOut: new(big.Int).Add(r.AmountIn, big.NewInt(100)), Fee: r.Pool.Fee}, nil
+}
 func token(symbol, address string) config.Token {
 	return config.Token{Symbol: symbol, Address: address, Decimals: 6}
 }
@@ -106,5 +123,67 @@ func TestCachedCostModelCachesByAssetAndHopCount(t *testing.T) {
 	}
 	if got := base.calls.Load(); got != 1 {
 		t.Fatalf("base cost model was not cached: calls=%d", got)
+	}
+}
+
+func TestQuoteCacheReusesSameBlockRouteAmount(t *testing.T) {
+	a := "0x0000000000000000000000000000000000000001"
+	b := "0x0000000000000000000000000000000000000002"
+	market := config.MarketConfig{AavePool: "0x0000000000000000000000000000000000000003", Tokens: map[string]config.Token{"USDC": token("USDC", a), "WETH": token("WETH", b)}}
+	p := pools.Pool{Address: "0x00000000000000000000000000000000000000aa", Token0: a, Token1: b, DEX: pools.UniswapV3, Fee: 500, Liquidity: big.NewInt(1)}
+	route := routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}, Hops: []pools.Pool{p, p}}
+	q := &countingQuoter{}
+	e := New(caller{}, market, q, q, StaticCostModel{L2Fee: big.NewInt(1), L1Fee: big.NewInt(1)}, big.NewInt(1), 1, nil)
+	e.ResetQuoteCache(123)
+
+	if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+		t.Fatal(err)
+	}
+	if got := q.calls.Load(); got != 2 {
+		t.Fatalf("same route+amount+block was not cached: quote calls=%d", got)
+	}
+	stats := e.QuoteCacheStats()
+	if stats.Hits == 0 {
+		t.Fatalf("cache hit was not recorded: %+v", stats)
+	}
+}
+
+func TestQuoteCacheDeduplicatesConcurrentSameBlockQuotes(t *testing.T) {
+	a := "0x0000000000000000000000000000000000000001"
+	b := "0x0000000000000000000000000000000000000002"
+	market := config.MarketConfig{AavePool: "0x0000000000000000000000000000000000000003", Tokens: map[string]config.Token{"USDC": token("USDC", a), "WETH": token("WETH", b)}}
+	p := pools.Pool{Address: "0x00000000000000000000000000000000000000bb", Token0: a, Token1: b, DEX: pools.UniswapV3, Fee: 500, Liquidity: big.NewInt(1)}
+	route := routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}, Hops: []pools.Pool{p, p}}
+	q := &countingQuoter{delay: 20 * time.Millisecond}
+	e := New(caller{}, market, q, q, StaticCostModel{L2Fee: big.NewInt(1), L1Fee: big.NewInt(1)}, big.NewInt(1), 2, nil)
+	e.ResetQuoteCache(123)
+
+	var done atomic.Uint64
+	for i := 0; i < 2; i++ {
+		go func() {
+			if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+				t.Errorf("evaluate failed: %v", err)
+			}
+			done.Add(1)
+		}()
+	}
+	deadline := time.After(time.Second)
+	for done.Load() < 2 {
+		select {
+		case <-deadline:
+			t.Fatal("concurrent evaluations did not finish")
+		default:
+			time.Sleep(time.Millisecond)
+		}
+	}
+	if got := q.calls.Load(); got != 2 {
+		t.Fatalf("concurrent duplicate route was not deduped: quote calls=%d", got)
+	}
+	stats := e.QuoteCacheStats()
+	if stats.DedupHits == 0 {
+		t.Fatalf("dedupe hit was not recorded: %+v", stats)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,6 +109,23 @@ type Engine struct {
 	premiumMu     sync.Mutex
 	premiumBPS    *big.Int
 	premiumExpiry time.Time
+	quoteMu       sync.Mutex
+	quoteBlock    uint64
+	quoteCache    map[string]*quoteCacheEntry
+	quoteHits     uint64
+	quoteDedup    uint64
+}
+
+type QuoteCacheStats struct {
+	Hits      uint64
+	DedupHits uint64
+	Entries   int
+}
+
+type quoteCacheEntry struct {
+	ready  chan struct{}
+	result quotes.Result
+	err    error
 }
 
 func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost CostModel, minProfit *big.Int, workers int, m *metrics.Metrics) *Engine {
@@ -117,7 +135,22 @@ func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost 
 	// The route universe is bounded by the runtime. Keep one complete bounded
 	// cycle of diagnostic events so a burst of routine rejections cannot hide a
 	// later profitable candidate before the runner drains the cycle.
-	return &Engine{caller: c, market: market, uni: uni, camelot: camelot, cost: cost, minProfit: new(big.Int).Set(minProfit), workers: workers, metrics: m, Events: make(chan Event, 4096)}
+	return &Engine{caller: c, market: market, uni: uni, camelot: camelot, cost: cost, minProfit: new(big.Int).Set(minProfit), workers: workers, metrics: m, Events: make(chan Event, 4096), quoteCache: make(map[string]*quoteCacheEntry)}
+}
+
+func (e *Engine) ResetQuoteCache(block uint64) {
+	e.quoteMu.Lock()
+	e.quoteBlock = block
+	e.quoteCache = make(map[string]*quoteCacheEntry)
+	e.quoteHits = 0
+	e.quoteDedup = 0
+	e.quoteMu.Unlock()
+}
+
+func (e *Engine) QuoteCacheStats() QuoteCacheStats {
+	e.quoteMu.Lock()
+	defer e.quoteMu.Unlock()
+	return QuoteCacheStats{Hits: e.quoteHits, DedupHits: e.quoteDedup, Entries: len(e.quoteCache)}
 }
 
 type cachedCostEntry struct {
@@ -208,7 +241,7 @@ func (e *Engine) EvaluateSilent(ctx context.Context, route routes.Route, amount 
 			return nil, fmt.Errorf("unsupported DEX")
 		}
 
-		result, err := quoter.Quote(ctx, quotes.Request{
+		result, err := e.quote(ctx, quoter, quotes.Request{
 			TokenIn:  in.Address,
 			TokenOut: out.Address,
 			AmountIn: current,
@@ -294,7 +327,7 @@ func (e *Engine) Evaluate(ctx context.Context, route routes.Route, amount *big.I
 		} else {
 			return nil, fmt.Errorf("unsupported DEX")
 		}
-		quote, err := quoter.Quote(ctx, quotes.Request{TokenIn: in.Address, TokenOut: out.Address, AmountIn: current, Pool: pool})
+		quote, err := e.quote(ctx, quoter, quotes.Request{TokenIn: in.Address, TokenOut: out.Address, AmountIn: current, Pool: pool})
 		if err != nil {
 			e.emit(Event{Type: QuoteFailed, Reason: err.Error(), Timestamp: time.Now().UTC()})
 			return nil, err
@@ -338,6 +371,78 @@ func (e *Engine) Evaluate(ctx context.Context, route routes.Route, amount *big.I
 		e.emit(Event{Type: Rejected, Opportunity: opportunity, Reason: "profitability threshold not met", Timestamp: opportunity.Timestamp})
 	}
 	return opportunity, nil
+}
+
+func (e *Engine) quote(ctx context.Context, quoter quotes.Quoter, req quotes.Request) (quotes.Result, error) {
+	if e == nil || quoter == nil {
+		return quotes.Result{}, fmt.Errorf("missing quoter")
+	}
+	key := e.quoteKey(req)
+	if key == "" {
+		return quoter.Quote(ctx, req)
+	}
+
+	e.quoteMu.Lock()
+	if e.quoteCache == nil {
+		e.quoteCache = make(map[string]*quoteCacheEntry)
+	}
+	if entry, ok := e.quoteCache[key]; ok {
+		if entry.ready != nil {
+			e.quoteDedup++
+			ready := entry.ready
+			e.quoteMu.Unlock()
+			select {
+			case <-ready:
+				return cloneQuoteResult(entry.result), entry.err
+			case <-ctx.Done():
+				return quotes.Result{}, ctx.Err()
+			}
+		}
+		e.quoteHits++
+		result, err := cloneQuoteResult(entry.result), entry.err
+		e.quoteMu.Unlock()
+		return result, err
+	}
+	entry := &quoteCacheEntry{ready: make(chan struct{})}
+	e.quoteCache[key] = entry
+	e.quoteMu.Unlock()
+
+	result, err := quoter.Quote(ctx, req)
+	entry.result = cloneQuoteResult(result)
+	entry.err = err
+	e.quoteMu.Lock()
+	ready := entry.ready
+	entry.ready = nil
+	e.quoteMu.Unlock()
+	if ready != nil {
+		close(ready)
+	}
+	return result, err
+}
+
+func (e *Engine) quoteKey(req quotes.Request) string {
+	if req.AmountIn == nil || strings.TrimSpace(req.Pool.Address) == "" {
+		return ""
+	}
+	e.quoteMu.Lock()
+	block := e.quoteBlock
+	e.quoteMu.Unlock()
+	return strings.Join([]string{
+		fmt.Sprintf("%d", block),
+		strings.ToLower(req.Pool.Address),
+		string(req.Pool.DEX),
+		fmt.Sprintf("%d", req.Pool.Fee),
+		strings.ToLower(req.TokenIn),
+		strings.ToLower(req.TokenOut),
+		req.AmountIn.String(),
+	}, "|")
+}
+
+func cloneQuoteResult(result quotes.Result) quotes.Result {
+	if result.AmountOut != nil {
+		result.AmountOut = new(big.Int).Set(result.AmountOut)
+	}
+	return result
 }
 
 func routeSourceBlock(route routes.Route) uint64 {
