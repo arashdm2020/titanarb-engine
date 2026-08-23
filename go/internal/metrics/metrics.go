@@ -21,8 +21,12 @@ type Metrics struct {
 	blocksCoalesced                                                        atomic.Uint64
 	maxLagBlocks                                                           atomic.Uint64
 	latencyMu                                                              sync.Mutex
-	cycleSamples, quoteSamples, rpsMilliSamples                            []uint64
+	cycleSamples, quoteSamples                                             []uint64
 	lastCycle                                                              CycleSample
+	rpcRateMu                                                              sync.Mutex
+	rpcRateSecond                                                          int64
+	rpcRateCount                                                           uint64
+	rpcRateSamples                                                         []uint64
 }
 
 type CycleSample struct {
@@ -77,17 +81,31 @@ type Snapshot struct {
 	P95RPS                float64     `json:"p95_rpc_requests_per_second"`
 }
 
-func New() *Metrics                                { return &Metrics{started: time.Now()} }
-func (m *Metrics) IncBlocks()                      { m.blocksReceived.Add(1) }
-func (m *Metrics) IncRPCErrors()                   { m.rpcErrors.Add(1) }
-func (m *Metrics) IncWSSDisconnects()              { m.wssDisconnects.Add(1) }
-func (m *Metrics) IncWSSReconnects()               { m.wssReconnects.Add(1) }
-func (m *Metrics) IncPoolsDiscovered()             { m.poolsDiscovered.Add(1) }
-func (m *Metrics) IncQuotes()                      { m.quotes.Add(1) }
-func (m *Metrics) IncQuoteFailures()               { m.quoteFailures.Add(1) }
-func (m *Metrics) IncRoutesEvaluated()             { m.routesEvaluated.Add(1) }
-func (m *Metrics) IncOpportunities()               { m.opportunities.Add(1) }
-func (m *Metrics) IncRPCCalls()                    { m.rpcCalls.Add(1) }
+func New() *Metrics                    { return &Metrics{started: time.Now()} }
+func (m *Metrics) IncBlocks()          { m.blocksReceived.Add(1) }
+func (m *Metrics) IncRPCErrors()       { m.rpcErrors.Add(1) }
+func (m *Metrics) IncWSSDisconnects()  { m.wssDisconnects.Add(1) }
+func (m *Metrics) IncWSSReconnects()   { m.wssReconnects.Add(1) }
+func (m *Metrics) IncPoolsDiscovered() { m.poolsDiscovered.Add(1) }
+func (m *Metrics) IncQuotes()          { m.quotes.Add(1) }
+func (m *Metrics) IncQuoteFailures()   { m.quoteFailures.Add(1) }
+func (m *Metrics) IncRoutesEvaluated() { m.routesEvaluated.Add(1) }
+func (m *Metrics) IncOpportunities()   { m.opportunities.Add(1) }
+func (m *Metrics) IncRPCCalls() {
+	m.rpcCalls.Add(1)
+	now := time.Now().Unix()
+	m.rpcRateMu.Lock()
+	if m.rpcRateSecond == 0 {
+		m.rpcRateSecond = now
+	}
+	if now != m.rpcRateSecond {
+		m.rpcRateSamples = appendBounded(m.rpcRateSamples, m.rpcRateCount, 2048)
+		m.rpcRateSecond = now
+		m.rpcRateCount = 0
+	}
+	m.rpcRateCount++
+	m.rpcRateMu.Unlock()
+}
 func (m *Metrics) IncCacheHits()                   { m.cacheHits.Add(1) }
 func (m *Metrics) IncCacheMisses()                 { m.cacheMisses.Add(1) }
 func (m *Metrics) IncUniswapPools()                { m.uniswapPools.Add(1) }
@@ -114,17 +132,16 @@ func (m *Metrics) ObserveMarketCycle(sample CycleSample) {
 	m.lastCycle = sample
 	m.cycleSamples = appendBounded(m.cycleSamples, sample.DurationMS, 2048)
 	m.quoteSamples = appendBounded(m.quoteSamples, sample.QuoteDurationMS, 2048)
-	if sample.DurationMS > 0 {
-		m.rpsMilliSamples = appendBounded(m.rpsMilliSamples, sample.RPCCalls*1_000_000/sample.DurationMS, 2048)
-	}
 }
 func (m *Metrics) Snapshot() Snapshot {
 	m.latencyMu.Lock()
 	last := m.lastCycle
 	cycles := append([]uint64(nil), m.cycleSamples...)
 	quotes := append([]uint64(nil), m.quoteSamples...)
-	rps := append([]uint64(nil), m.rpsMilliSamples...)
 	m.latencyMu.Unlock()
+	m.rpcRateMu.Lock()
+	rps := append([]uint64(nil), m.rpcRateSamples...)
+	m.rpcRateMu.Unlock()
 	uptime := uint64(time.Since(m.started).Seconds())
 	if uptime == 0 {
 		uptime = 1
@@ -145,7 +162,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		MedianQuoteMS: percentile(quotes, 50), P95QuoteMS: percentile(quotes, 95),
 		MaxLagBlocks: m.maxLagBlocks.Load(), RoutesPerSecond: float64(m.routesEvaluated.Load()) / float64(uptime),
 		QuotesPerSecond: float64(m.quotes.Load()) / float64(uptime),
-		AverageRPS:      float64(m.rpcCalls.Load()) / float64(uptime), P95RPS: float64(percentile(rps, 95)) / 1_000,
+		AverageRPS:      float64(m.rpcCalls.Load()) / float64(uptime), P95RPS: float64(percentile(rps, 95)),
 	}
 }
 func (m *Metrics) WriteJSON(w io.Writer) error { return json.NewEncoder(w).Encode(m.Snapshot()) }

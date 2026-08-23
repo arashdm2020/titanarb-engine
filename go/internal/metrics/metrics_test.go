@@ -19,6 +19,9 @@ func TestCountersAndJSON(t *testing.T) {
 	m.IncUniswapQuotes()
 	m.IncCamelotQuotes()
 	m.AddBlocksCoalesced(3)
+	m.rpcRateMu.Lock()
+	m.rpcRateSamples = []uint64{8, 10}
+	m.rpcRateMu.Unlock()
 	m.ObserveMarketCycle(CycleSample{DurationMS: 200, QuoteDurationMS: 150, LagBlocks: 2, RoutesRecomputed: 10, RoutesReused: 90, RPCCalls: 2})
 	m.ObserveMarketCycle(CycleSample{DurationMS: 100, QuoteDurationMS: 50, LagBlocks: 0, RoutesRecomputed: 5, RoutesReused: 95, RPCCalls: 1})
 	s := m.Snapshot()
