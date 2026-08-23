@@ -61,6 +61,18 @@ func TestIdleCycleDoesNotAdvanceFullReconcileCounter(t *testing.T) {
 	}
 }
 
+func TestIncrementalRefreshBatchesSmallBlockDeltas(t *testing.T) {
+	if !shouldDeferIncrementalRefresh(100, 103, 4) {
+		t.Fatal("small block delta should be batched")
+	}
+	if shouldDeferIncrementalRefresh(100, 104, 4) {
+		t.Fatal("batch boundary should refresh")
+	}
+	if shouldDeferIncrementalRefresh(0, 1, 4) {
+		t.Fatal("first observed block must not be deferred")
+	}
+}
+
 func TestRefreshRoutesDropsInactivePool(t *testing.T) {
 	p := pools.Pool{Address: "0x0000000000000000000000000000000000000001", Liquidity: big.NewInt(10)}
 	route := routes.Route{Symbols: []string{"A", "B", "A"}, Hops: []pools.Pool{p, p}}

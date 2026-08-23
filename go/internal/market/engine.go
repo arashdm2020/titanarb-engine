@@ -95,6 +95,7 @@ type CycleReport struct {
 }
 
 const fullReconcileEvery = 240
+const incrementalRefreshBatchBlocks = 4
 const maxOptimizerRoutesPerAsset = 2
 const maxEvaluationRoutesPerAsset = 12
 const optimizerSamplesPerRoute = 8
@@ -280,6 +281,20 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		return report, nil
 	}
 	full := len(e.routeCache) == 0 || e.cyclesSinceFull >= fullReconcileEvery || maxHops != e.lastMaxHops || maxRoutes != e.lastMaxRoutes
+	if !full && shouldDeferIncrementalRefresh(e.lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
+		routesFound := refreshRoutes(e.routeCache, liquidPools(e.cache.Snapshot()))
+		report.RoutesReused = uint64(len(routesFound))
+		report.Duration = time.Since(started)
+		report.Routes = routesFound
+		report.RouteCountAfter = len(routesFound)
+		report.RoutesByHop = routesByHop(routesFound)
+		report.DEXRoutes = routeDEXDiversity(routesFound)
+		e.statsMu.Lock()
+		e.activePools = uint64(len(e.cache.Snapshot()))
+		e.cycles = uint64(len(routesFound))
+		e.statsMu.Unlock()
+		return report, nil
+	}
 	var dirty map[string]struct{}
 	var err error
 	rpcAtStart := e.rpcCalls()
@@ -379,6 +394,13 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 
 func shouldAdvanceFullReconcileCounter(dirty map[string]struct{}) bool {
 	return len(dirty) > 0
+}
+
+func shouldDeferIncrementalRefresh(lastStateBlock, stateBlock uint64, batchBlocks uint64) bool {
+	if batchBlocks < 2 || lastStateBlock == 0 || stateBlock <= lastStateBlock {
+		return false
+	}
+	return stateBlock-lastStateBlock < batchBlocks
 }
 
 func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int) ([]routes.Route, error) {
