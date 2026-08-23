@@ -142,7 +142,9 @@ func TestManagedClientDeprioritizesLaggingProvider(t *testing.T) {
 	}, time.Second, 0, nil)
 	client.mu.Lock()
 	client.providers[0].latestBlock = 100
+	client.providers[0].latestBlockAt = time.Now()
 	client.providers[1].latestBlock = 90
+	client.providers[1].latestBlockAt = time.Now()
 	client.mu.Unlock()
 	for i := 0; i < 5; i++ {
 		var out string
@@ -154,6 +156,35 @@ func TestManagedClientDeprioritizesLaggingProvider(t *testing.T) {
 		t.Fatalf("lagging provider received read traffic: chainstack=%d", chainstackCalls.Load())
 	}
 	if quicknodeCalls.Load() == 0 {
+		t.Fatal("fresh provider did not receive reads")
+	}
+}
+
+func TestManagedClientStaleBlockObservationDoesNotStarveProvider(t *testing.T) {
+	var quicknodeCalls atomic.Int32
+	var chainstackCalls atomic.Int32
+	quicknode := countingRPCServer(t, &quicknodeCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	chainstack := countingRPCServer(t, &chainstackCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManaged([]ProviderConfig{
+		{Name: "quicknode", HTTP: quicknode.URL, TargetRPS: 100, MaxBlockLag: 2},
+		{Name: "chainstack", HTTP: chainstack.URL, TargetRPS: 300, MaxBlockLag: 2},
+	}, time.Second, 0, nil)
+	client.mu.Lock()
+	client.providers[0].latestBlock = 90
+	client.providers[0].latestBlockAt = time.Now().Add(-time.Minute)
+	client.providers[1].latestBlock = 100
+	client.providers[1].latestBlockAt = time.Now()
+	client.mu.Unlock()
+	for i := 0; i < 12; i++ {
+		var out string
+		if err := client.Call(context.Background(), "eth_call", []any{}, &out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if quicknodeCalls.Load() == 0 {
+		t.Fatal("provider with stale block observation was permanently starved")
+	}
+	if chainstackCalls.Load() == 0 {
 		t.Fatal("fresh provider did not receive reads")
 	}
 }

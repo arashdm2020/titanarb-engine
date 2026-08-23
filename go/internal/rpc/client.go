@@ -95,6 +95,7 @@ type providerState struct {
 	lastFailure        time.Time
 	cooldownUntil      time.Time
 	latestBlock        uint64
+	latestBlockAt      time.Time
 }
 
 func NewManaged(configs []ProviderConfig, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -304,7 +305,7 @@ func (c *Client) chooseReadProvider() (*providerState, int) {
 		if now.Before(provider.cooldownUntil) {
 			continue
 		}
-		if providerLagged(provider, bestBlock) {
+		if providerLagged(provider, bestBlock, now) {
 			continue
 		}
 		score := provider.limiter.Delay()
@@ -347,8 +348,11 @@ func (c *Client) bestKnownBlockLocked() uint64 {
 	return best
 }
 
-func providerLagged(provider *providerState, best uint64) bool {
+func providerLagged(provider *providerState, best uint64, now time.Time) bool {
 	if best == 0 || provider.latestBlock == 0 || provider.cfg.MaxBlockLag <= 0 {
+		return false
+	}
+	if provider.latestBlockAt.IsZero() || now.Sub(provider.latestBlockAt) > 30*time.Second {
 		return false
 	}
 	if provider.latestBlock >= best {
@@ -375,6 +379,7 @@ func (c *Client) recordSuccess(provider *providerState, method string, out any) 
 		if raw, ok := out.(*string); ok {
 			if block, err := strconv.ParseUint(strings.TrimPrefix(*raw, "0x"), 16, 64); err == nil {
 				provider.latestBlock = block
+				provider.latestBlockAt = time.Now()
 			}
 		}
 	}
