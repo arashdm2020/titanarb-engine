@@ -38,6 +38,18 @@ func TestPoolChangedUsesMutableState(t *testing.T) {
 	}
 }
 
+func TestIdleCycleDoesNotAdvanceFullReconcileCounter(t *testing.T) {
+	if shouldAdvanceFullReconcileCounter(nil) {
+		t.Fatal("nil dirty set advanced full reconcile counter")
+	}
+	if shouldAdvanceFullReconcileCounter(map[string]struct{}{}) {
+		t.Fatal("empty dirty set advanced full reconcile counter")
+	}
+	if !shouldAdvanceFullReconcileCounter(map[string]struct{}{"0x1": {}}) {
+		t.Fatal("dirty set did not advance full reconcile counter")
+	}
+}
+
 func TestRefreshRoutesDropsInactivePool(t *testing.T) {
 	p := pools.Pool{Address: "0x0000000000000000000000000000000000000001", Liquidity: big.NewInt(10)}
 	route := routes.Route{Symbols: []string{"A", "B", "A"}, Hops: []pools.Pool{p, p}}

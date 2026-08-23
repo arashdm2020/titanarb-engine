@@ -304,7 +304,9 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		if err != nil {
 			return report, err
 		}
-		e.cyclesSinceFull++
+		if shouldAdvanceFullReconcileCounter(dirty) {
+			e.cyclesSinceFull++
+		}
 	}
 	rpcAfterRefresh := e.rpcCalls()
 	report.DirtyPools = uint64(len(dirty))
@@ -373,6 +375,10 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		e.lastStateBlock = stateBlock
 	}
 	return report, nil
+}
+
+func shouldAdvanceFullReconcileCounter(dirty map[string]struct{}) bool {
+	return len(dirty) > 0
 }
 
 func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int) ([]routes.Route, error) {
