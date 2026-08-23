@@ -83,6 +83,81 @@ func TestManagedClientFailoverOn5xx(t *testing.T) {
 	}
 }
 
+func TestManagedClientDistributesHealthyReadTraffic(t *testing.T) {
+	var quicknodeCalls atomic.Int32
+	var chainstackCalls atomic.Int32
+	quicknode := countingRPCServer(t, &quicknodeCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	chainstack := countingRPCServer(t, &chainstackCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManaged([]ProviderConfig{
+		{Name: "quicknode", HTTP: quicknode.URL, TargetRPS: 100},
+		{Name: "chainstack", HTTP: chainstack.URL, TargetRPS: 300},
+	}, time.Second, 0, nil)
+	for i := 0; i < 20; i++ {
+		if _, err := client.BlockNumber(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if quicknodeCalls.Load() == 0 || chainstackCalls.Load() == 0 {
+		t.Fatalf("expected both providers to receive reads, quicknode=%d chainstack=%d", quicknodeCalls.Load(), chainstackCalls.Load())
+	}
+	if chainstackCalls.Load() <= quicknodeCalls.Load() {
+		t.Fatalf("higher capacity provider was not favored, quicknode=%d chainstack=%d", quicknodeCalls.Load(), chainstackCalls.Load())
+	}
+}
+
+func TestManagedClientReadTrafficSkipsUnhealthyProvider(t *testing.T) {
+	var quicknodeCalls atomic.Int32
+	var chainstackCalls atomic.Int32
+	quicknode := rpcServer(t, http.StatusTooManyRequests, `rate limited`)
+	chainstack := countingRPCServer(t, &chainstackCalls, `{"jsonrpc":"2.0","id":1,"result":"0x2"}`)
+	client := NewManaged([]ProviderConfig{
+		{Name: "quicknode", HTTP: quicknode.URL, TargetRPS: 100},
+		{Name: "chainstack", HTTP: chainstack.URL, TargetRPS: 100},
+	}, time.Second, 1, nil)
+	if _, err := client.BlockNumber(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	quicknodeCalls.Store(int32(client.Snapshots()[0].Requests))
+	for i := 0; i < 3; i++ {
+		if _, err := client.BlockNumber(context.Background()); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if got := client.Snapshots()[0].Requests; got != uint64(quicknodeCalls.Load()) {
+		t.Fatalf("cooldown provider received normal reads before recovery: before=%d after=%d", quicknodeCalls.Load(), got)
+	}
+	if chainstackCalls.Load() < 4 {
+		t.Fatalf("fallback provider did not continue reads, chainstack=%d", chainstackCalls.Load())
+	}
+}
+
+func TestManagedClientDeprioritizesLaggingProvider(t *testing.T) {
+	var quicknodeCalls atomic.Int32
+	var chainstackCalls atomic.Int32
+	quicknode := countingRPCServer(t, &quicknodeCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	chainstack := countingRPCServer(t, &chainstackCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManaged([]ProviderConfig{
+		{Name: "quicknode", HTTP: quicknode.URL, TargetRPS: 100, MaxBlockLag: 2},
+		{Name: "chainstack", HTTP: chainstack.URL, TargetRPS: 300, MaxBlockLag: 2},
+	}, time.Second, 0, nil)
+	client.mu.Lock()
+	client.providers[0].latestBlock = 100
+	client.providers[1].latestBlock = 90
+	client.mu.Unlock()
+	for i := 0; i < 5; i++ {
+		var out string
+		if err := client.Call(context.Background(), "eth_call", []any{}, &out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if chainstackCalls.Load() != 0 {
+		t.Fatalf("lagging provider received read traffic: chainstack=%d", chainstackCalls.Load())
+	}
+	if quicknodeCalls.Load() == 0 {
+		t.Fatal("fresh provider did not receive reads")
+	}
+}
+
 func TestManagedClientRPCRevertDoesNotMarkProviderUnhealthy(t *testing.T) {
 	primary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"error":{"message":"execution reverted"}}`)
 	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
@@ -253,6 +328,19 @@ func rpcServer(t *testing.T, status int, body string) *httptest.Server {
 			t.Fatalf("missing JSON content type")
 		}
 		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(s.Close)
+	return s
+}
+
+func countingRPCServer(t *testing.T, calls *atomic.Int32, body string) *httptest.Server {
+	t.Helper()
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		if !strings.Contains(r.Header.Get("Content-Type"), "application/json") {
+			t.Fatalf("missing JSON content type")
+		}
 		_, _ = w.Write([]byte(body))
 	}))
 	t.Cleanup(s.Close)

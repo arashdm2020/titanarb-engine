@@ -41,10 +41,12 @@ type Config struct {
 }
 
 type RPCProviderConfig struct {
-	Name   string
-	HTTP   string
-	WSS    string
-	MaxRPS int
+	Name        string
+	HTTP        string
+	WSS         string
+	MaxRPS      int
+	TargetRPS   int
+	MaxBlockLag int
 }
 
 // Token is a configured Arbitrum asset. Addresses are deliberately sourced
@@ -239,16 +241,20 @@ func FromLookup(get func(string) string) (Config, error) {
 
 func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 	primary := RPCProviderConfig{
-		Name:   firstNonEmpty(get("RPC_PRIMARY_NAME"), "primary"),
-		HTTP:   strings.TrimSpace(get("RPC_PRIMARY_HTTP")),
-		WSS:    strings.TrimSpace(get("RPC_PRIMARY_WSS")),
-		MaxRPS: int(parseUintDefault(get("RPC_PRIMARY_MAX_RPS"), 0)),
+		Name:        firstNonEmpty(get("RPC_PRIMARY_NAME"), "primary"),
+		HTTP:        strings.TrimSpace(get("RPC_PRIMARY_HTTP")),
+		WSS:         strings.TrimSpace(get("RPC_PRIMARY_WSS")),
+		MaxRPS:      int(parseUintDefault(get("RPC_PRIMARY_MAX_RPS"), 0)),
+		TargetRPS:   int(parseUintDefault(firstNonEmpty(get("RPC_PRIMARY_TARGET_RPS"), get("RPC_QUICKNODE_TARGET_RPS")), 0)),
+		MaxBlockLag: int(parseUintDefault(get("RPC_PRIMARY_MAX_BLOCK_LAG"), parseUintDefault(get("RPC_PROVIDER_MAX_BLOCK_LAG"), 5))),
 	}
 	secondary := RPCProviderConfig{
-		Name:   firstNonEmpty(get("RPC_SECONDARY_NAME"), "secondary"),
-		HTTP:   strings.TrimSpace(get("RPC_SECONDARY_HTTP")),
-		WSS:    strings.TrimSpace(get("RPC_SECONDARY_WSS")),
-		MaxRPS: int(parseUintDefault(get("RPC_SECONDARY_MAX_RPS"), 0)),
+		Name:        firstNonEmpty(get("RPC_SECONDARY_NAME"), "secondary"),
+		HTTP:        strings.TrimSpace(get("RPC_SECONDARY_HTTP")),
+		WSS:         strings.TrimSpace(get("RPC_SECONDARY_WSS")),
+		MaxRPS:      int(parseUintDefault(get("RPC_SECONDARY_MAX_RPS"), 0)),
+		TargetRPS:   int(parseUintDefault(firstNonEmpty(get("RPC_SECONDARY_TARGET_RPS"), get("RPC_CHAINSTACK_TARGET_RPS")), 0)),
+		MaxBlockLag: int(parseUintDefault(get("RPC_SECONDARY_MAX_BLOCK_LAG"), parseUintDefault(get("RPC_PROVIDER_MAX_BLOCK_LAG"), 5))),
 	}
 	if primary.HTTP == "" {
 		primary.HTTP = firstNonEmpty(get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL"))

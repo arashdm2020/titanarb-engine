@@ -52,9 +52,11 @@ func New(endpoint string, timeout time.Duration, retries int, m *metrics.Metrics
 }
 
 type ProviderConfig struct {
-	Name   string
-	HTTP   string
-	MaxRPS int
+	Name        string
+	HTTP        string
+	MaxRPS      int
+	TargetRPS   int
+	MaxBlockLag int
 }
 
 type ProviderSnapshot struct {
@@ -68,6 +70,9 @@ type ProviderSnapshot struct {
 	LatestBlock       uint64
 	CooldownUntil     time.Time
 	ConsecutiveFailed uint64
+	MaxRPS            int
+	TargetRPS         int
+	SharePct          float64
 }
 
 type Event struct {
@@ -103,7 +108,7 @@ func NewManaged(configs []ProviderConfig, timeout time.Duration, retries int, m 
 		if cfg.Name == "" {
 			cfg.Name = "provider"
 		}
-		client.providers = append(client.providers, &providerState{cfg: cfg, limiter: newRateLimiter(cfg.MaxRPS)})
+		client.providers = append(client.providers, &providerState{cfg: cfg, limiter: newRateLimiter(effectiveRPS(cfg))})
 	}
 	if len(client.providers) > 0 {
 		client.endpoint = client.providers[0].cfg.HTTP
@@ -157,7 +162,7 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 	}
 	var last error
 	for attempt := 0; attempt <= c.retries; attempt++ {
-		provider, providerIndex := c.chooseProvider()
+		provider, providerIndex := c.chooseReadProvider()
 		if provider == nil {
 			return &Error{Network, errors.New("no RPC provider configured")}
 		}
@@ -285,6 +290,73 @@ func (c *Client) chooseProvider() (*providerState, int) {
 	return c.providers[c.active], c.active
 }
 
+func (c *Client) chooseReadProvider() (*providerState, int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.providers) == 0 {
+		return nil, -1
+	}
+	now := time.Now()
+	bestBlock := c.bestKnownBlockLocked()
+	bestIndex := -1
+	var bestScore time.Duration
+	for index, provider := range c.providers {
+		if now.Before(provider.cooldownUntil) {
+			continue
+		}
+		if providerLagged(provider, bestBlock) {
+			continue
+		}
+		score := provider.limiter.Delay()
+		if provider.latencyEMA > 0 {
+			score += provider.latencyEMA / 20
+		}
+		if rps := effectiveRPS(provider.cfg); rps > 0 {
+			score -= time.Second / time.Duration(rps*4)
+		}
+		if bestIndex == -1 || score < bestScore || (score == bestScore && index < bestIndex) {
+			bestIndex = index
+			bestScore = score
+		}
+	}
+	if bestIndex == -1 {
+		for index, provider := range c.providers {
+			if now.Before(provider.cooldownUntil) {
+				continue
+			}
+			if bestIndex == -1 || provider.limiter.Delay() < bestScore {
+				bestIndex = index
+				bestScore = provider.limiter.Delay()
+			}
+		}
+	}
+	if bestIndex == -1 {
+		bestIndex = c.active
+	}
+	c.active = bestIndex
+	return c.providers[bestIndex], bestIndex
+}
+
+func (c *Client) bestKnownBlockLocked() uint64 {
+	var best uint64
+	for _, provider := range c.providers {
+		if provider.latestBlock > best {
+			best = provider.latestBlock
+		}
+	}
+	return best
+}
+
+func providerLagged(provider *providerState, best uint64) bool {
+	if best == 0 || provider.latestBlock == 0 || provider.cfg.MaxBlockLag <= 0 {
+		return false
+	}
+	if provider.latestBlock >= best {
+		return false
+	}
+	return best-provider.latestBlock > uint64(provider.cfg.MaxBlockLag)
+}
+
 func (c *Client) recordRequest(provider *providerState) {
 	if c.metrics != nil {
 		c.metrics.IncRPCCalls()
@@ -410,8 +482,16 @@ func (c *Client) ActiveProvider() string {
 func (c *Client) Snapshots() []ProviderSnapshot {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	var total uint64
+	for _, provider := range c.providers {
+		total += provider.requests
+	}
 	out := make([]ProviderSnapshot, 0, len(c.providers))
 	for i, provider := range c.providers {
+		share := 0.0
+		if total > 0 {
+			share = float64(provider.requests) * 100 / float64(total)
+		}
 		out = append(out, ProviderSnapshot{
 			Name:              provider.cfg.Name,
 			Healthy:           time.Now().After(provider.cooldownUntil),
@@ -423,9 +503,19 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 			LatestBlock:       provider.latestBlock,
 			CooldownUntil:     provider.cooldownUntil,
 			ConsecutiveFailed: provider.consecutiveFailure,
+			MaxRPS:            provider.cfg.MaxRPS,
+			TargetRPS:         effectiveRPS(provider.cfg),
+			SharePct:          share,
 		})
 	}
 	return out
+}
+
+func effectiveRPS(cfg ProviderConfig) int {
+	if cfg.TargetRPS > 0 {
+		return cfg.TargetRPS
+	}
+	return cfg.MaxRPS
 }
 
 type rateLimiter struct {
@@ -464,6 +554,18 @@ func (l *rateLimiter) Wait(ctx context.Context) error {
 	case <-time.After(wait):
 		return nil
 	}
+}
+
+func (l *rateLimiter) Delay() time.Duration {
+	if l == nil || l.interval <= 0 {
+		return 0
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if wait := time.Until(l.next); wait > 0 {
+		return wait
+	}
+	return 0
 }
 func (c *Client) ChainID(ctx context.Context) (int64, error) {
 	var raw string
