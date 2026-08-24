@@ -128,6 +128,13 @@ func (s *Service) scanOnce(ctx context.Context) {
 		return
 	}
 	defer s.scanning.Store(false)
+	// The head lookup is pair-intelligence work too. Pace it and wait for the
+	// hot path just like factory logs and validation reads; otherwise the first
+	// call can collide with a dirty-cycle burst and abort every scan before a
+	// persistent checkpoint is written.
+	if err := s.limiter.Wait(ctx, s.HotBusy); err != nil {
+		return
+	}
 	head, err := s.Caller.BlockNumber(ctx)
 	if err != nil {
 		return
