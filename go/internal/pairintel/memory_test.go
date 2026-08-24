@@ -4,6 +4,7 @@ import (
 	"math"
 	"math/big"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -112,6 +113,60 @@ func TestDepthFailureCooldown(t *testing.T) {
 	p := m.Pairs()[0]
 	if p.State != Cooled || p.Components.FailurePenalty < .8 || p.Components.IlliquidityPenalty < .8 {
 		t.Fatalf("not cooled: %+v", p)
+	}
+}
+
+func TestLiveAdmissionEjectionAndPersistence(t *testing.T) {
+	m, now := testMemory(t)
+	m.cfg.Mode = "live"
+	m.cfg.MinDepthScore = .1
+	m.cfg.MinQuoteSuccess = .8
+	m.cfg.MaxLivePairs = 2
+	m.cfg.MaxLiveDynamicAssets = 2
+	q := new(big.Int).Lsh(big.NewInt(1), 96)
+	m.ObservePool(pools.Pool{Address: poolA, Token0: tokenA, Token1: tokenB, DEX: pools.UniswapV3, SqrtPriceX96: q})
+	m.ObservePool(pools.Pool{Address: poolB, Token0: tokenA, Token1: tokenB, DEX: pools.CamelotV3, SqrtPriceX96: q})
+	for _, pool := range []string{poolA, poolB} {
+		for _, dir := range []string{"0to1", "1to0"} {
+			m.RecordDepth(pool, Depth{Direction: dir, Bucket: "small", Successful: true, Score: .9})
+		}
+	}
+	*now = now.Add(61 * time.Minute)
+	m.ObservePool(pools.Pool{Address: poolA, Token0: tokenA, Token1: tokenB, DEX: pools.UniswapV3, SqrtPriceX96: scaledQ96(1.01)})
+	var live AdmissionSnapshot
+	for i := 0; i < 3; i++ {
+		live = m.SelectLive()
+	}
+	if len(live.Pairs) != 1 || live.Pairs[0].State != Admitted {
+		t.Fatalf("live=%+v", live)
+	}
+	path := filepath.Join(t.TempDir(), "live.json")
+	if err := m.Save(path); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(path, m.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Pairs()[0].State != Admitted {
+		t.Fatal("admission did not survive restart")
+	}
+	m.cfg.MinScore = 101
+	for window := 1; window < m.cfg.EjectWindows; window++ {
+		if got := m.SelectLive(); len(got.Pairs) != 1 || m.Pairs()[0].State != Admitted {
+			t.Fatalf("pair ejected before consecutive-window limit at %d: %+v", window, got)
+		}
+	}
+	if got := m.SelectLive(); len(got.Pairs) != 0 || m.Pairs()[0].State != Cooled {
+		t.Fatalf("ejection=%+v pair=%+v", got, m.Pairs()[0])
+	}
+}
+
+func TestDynamicSymbolIsDeterministicAddressIdentity(t *testing.T) {
+	a := "0xabcdef1200000000000000000000000000000000"
+	want := "DYN_ABCDEF1200000000000000000000000000000000"
+	if DynamicSymbol(a) != want || DynamicSymbol(strings.ToUpper(a)) != want {
+		t.Fatal("unstable dynamic symbol")
 	}
 }
 

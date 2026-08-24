@@ -194,7 +194,7 @@ func main() {
 						found++
 						log.Event(logger.Info, string(outcome.Type), "market", "profitable candidate detected", fields)
 						alert(operationSink, observability.Opportunities, string(outcome.Type), telegram.Info, "profitable candidate detected", fields)
-						if outcome.Opportunity != nil && !routeUsesOnlyAssets(outcome.Opportunity.Route.Symbols, executionAssets) {
+						if outcome.Opportunity != nil && !routeStartsAndEndsWithExecutionAsset(outcome.Opportunity.Route.Symbols, executionAssets) {
 							fields["execution_eligible"] = false
 							fields["decision"] = "market_only_dynamic_universe"
 							log.Event(logger.Info, "dynamic_candidate_found", "market", "profitable dynamic-universe candidate is not in execution allow-list", fields)
@@ -522,10 +522,6 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics, operationsD
 		universeManager.ApplyFeedback(universe.Feedback{Asset: asset, Evaluations: evaluations, Useful: useful})
 	})
 	pairCfg := pairintel.FromEnv()
-	// Phase 3 live admission is intentionally not implemented in this release.
-	if pairCfg.Mode == "live" {
-		pairCfg.Mode = "shadow"
-	}
 	pairPath := filepath.Join(operationsDir, "pair_intelligence.json")
 	pairMemory, loadErr := pairintel.Load(pairPath, pairCfg)
 	if loadErr != nil {
@@ -534,7 +530,7 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics, operationsD
 	coreSet := assetSet(coreMarketConfig.ExecutionAssets())
 	for _, token := range marketConfig.Tokens {
 		_, core := coreSet[token.Symbol]
-		_ = pairMemory.RegisterToken(pairintel.TokenMeta{Address: token.Address, Decimals: token.Decimals, HasCode: true, Core: core})
+		_ = pairMemory.RegisterToken(pairintel.TokenMeta{Address: token.Address, Decimals: token.Decimals, HasCode: true, Core: core, Symbol: token.Symbol})
 	}
 	pairService := pairintel.NewService(pairMemory, client, discoverer, []pairintel.Factory{
 		{Name: "uniswap_v3", Address: marketConfig.UniswapFactory, DEX: pools.UniswapV3},
@@ -548,6 +544,34 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics, operationsD
 		}
 		return nil
 	}, pairPath, func() bool { return busy != nil && busy.Load() })
+	pairService.OnAdmission = func(snapshot pairintel.AdmissionSnapshot) {
+		next := cloneMarketConfig(marketConfig)
+		pairKeys := make([]string, 0, len(snapshot.Pairs))
+		for _, pair := range snapshot.Pairs {
+			pairKeys = append(pairKeys, pair.Key.String())
+		}
+		dynamicSymbols := make([]string, 0, len(snapshot.Tokens))
+		for _, meta := range snapshot.Tokens {
+			symbol := meta.Symbol
+			if symbol == "" {
+				symbol = pairintel.DynamicSymbol(meta.Address)
+			}
+			if symbol == "" {
+				continue
+			}
+			next.Tokens[symbol] = config.Token{Symbol: symbol, Address: meta.Address, Decimals: meta.Decimals}
+			next.MarketAssetNames = append(next.MarketAssetNames, symbol)
+			dynamicSymbols = append(dynamicSymbols, symbol)
+		}
+		engine.QueueLiveMarket(next, pairKeys, dynamicSymbols)
+	}
+	crossShare := 5000
+	if raw := strings.TrimSpace(os.Getenv("PAIR_2HOP_CROSS_VENUE_SHARE_BPS")); raw != "" {
+		if v, err := strconv.Atoi(raw); err == nil {
+			crossShare = v
+		}
+	}
+	engine.SetPairRouting(pairMemory.PairScore, crossShare)
 	for symbol, amount := range coreAmounts {
 		if token, ok := marketConfig.Tokens[symbol]; ok {
 			pairService.SetRepresentativeAmount(token.Address, amount)
@@ -706,6 +730,27 @@ func routeUsesOnlyAssets(route []string, allowed map[string]struct{}) bool {
 		}
 	}
 	return true
+}
+
+func routeStartsAndEndsWithExecutionAsset(route []string, allowed map[string]struct{}) bool {
+	if len(route) < 2 || route[0] != route[len(route)-1] {
+		return false
+	}
+	_, ok := allowed[route[0]]
+	return ok
+}
+
+func cloneMarketConfig(in config.MarketConfig) config.MarketConfig {
+	out := in
+	out.ExecutionAssetNames = append([]string(nil), in.ExecutionAssetNames...)
+	out.MarketAssetNames = append([]string(nil), in.MarketAssetNames...)
+	out.IntermediateTokens = append([]string(nil), in.IntermediateTokens...)
+	out.UniswapFeeTiers = append([]uint32(nil), in.UniswapFeeTiers...)
+	out.Tokens = make(map[string]config.Token, len(in.Tokens))
+	for k, v := range in.Tokens {
+		out.Tokens[k] = v
+	}
+	return out
 }
 
 func opportunityTelemetry(opp *opportunity.Opportunity) map[string]any {

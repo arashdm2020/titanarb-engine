@@ -2,6 +2,7 @@ package market
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/titanarb/titanarb-go/internal/config"
@@ -20,6 +21,78 @@ func TestUniverseFeedbackUsesDynamicMarketAssetsOnly(t *testing.T) {
 	if asset != "DYN" || evaluations != 1 || useful != 1 {
 		t.Fatalf("feedback=%s %d %d", asset, evaluations, useful)
 	}
+}
+
+func TestQueuedMarketConfigAppliesAtomicallyWithoutExecutionExpansion(t *testing.T) {
+	base := config.MarketConfig{ExecutionAssetNames: []string{"USDC"}, Tokens: map[string]config.Token{"USDC": {Symbol: "USDC"}}}
+	e := &Engine{market: base, executionAssets: []string{"USDC"}}
+	next := base
+	next.Tokens = map[string]config.Token{"USDC": {Symbol: "USDC"}, "DYN": {Symbol: "DYN"}}
+	next.MarketAssetNames = []string{"USDC", "DYN"}
+	e.QueueMarketConfig(next)
+	if e.market.Tokens["DYN"].Symbol != "" {
+		t.Fatal("pending config leaked before cycle boundary")
+	}
+	if !e.applyPendingMarket() {
+		t.Fatal("pending config not applied")
+	}
+	if got := strings.Join(e.market.ExecutionAssets(), ","); got != "USDC" {
+		t.Fatalf("execution assets changed: %s", got)
+	}
+	if got := strings.Join(e.market.MarketAssets(), ","); got != "DYN,USDC" {
+		t.Fatalf("market assets=%s", got)
+	}
+}
+
+func TestLiveMarketAllowsOnlyAdmittedDynamicPairEdges(t *testing.T) {
+	base := config.MarketConfig{
+		ExecutionAssetNames: []string{"USDC"},
+		Tokens: map[string]config.Token{
+			"USDC": {Symbol: "USDC", Address: "0x0000000000000000000000000000000000000001"},
+		},
+	}
+	e := &Engine{market: base, executionAssets: []string{"USDC"}}
+	next := cloneTestMarket(base)
+	next.Tokens["DYN_A"] = config.Token{Symbol: "DYN_A", Address: "0x0000000000000000000000000000000000000002"}
+	next.Tokens["DYN_B"] = config.Token{Symbol: "DYN_B", Address: "0x0000000000000000000000000000000000000003"}
+	next.MarketAssetNames = []string{"USDC", "DYN_A", "DYN_B"}
+	e.QueueLiveMarket(next, []string{"0x0000000000000000000000000000000000000001:0x0000000000000000000000000000000000000002"}, []string{"DYN_A", "DYN_B"})
+	if !e.applyPendingMarket() {
+		t.Fatal("pending live graph not applied")
+	}
+	if !e.marketPairAllowed("USDC", "DYN_A") {
+		t.Fatal("admitted edge rejected")
+	}
+	if e.marketPairAllowed("USDC", "DYN_B") || e.marketPairAllowed("DYN_A", "DYN_B") {
+		t.Fatal("unadmitted dynamic edge accepted")
+	}
+}
+
+func TestRoutePairQualityPenalizesWeakestEdge(t *testing.T) {
+	e := &Engine{market: config.MarketConfig{Tokens: map[string]config.Token{
+		"A": {Address: "a"}, "B": {Address: "b"}, "C": {Address: "c"},
+	}}}
+	e.pairScore = func(a, b string) (float64, bool) {
+		key := a + b
+		if key == "ca" || key == "ac" {
+			return 10, true
+		}
+		return 90, true
+	}
+	weak := e.routePairQuality(routes.Route{Symbols: []string{"A", "B", "C", "A"}})
+	strong := e.routePairQuality(routes.Route{Symbols: []string{"A", "B", "A"}})
+	if weak >= strong || weak >= 50 {
+		t.Fatalf("weak edge was hidden: weak=%f strong=%f", weak, strong)
+	}
+}
+
+func cloneTestMarket(in config.MarketConfig) config.MarketConfig {
+	out := in
+	out.Tokens = make(map[string]config.Token, len(in.Tokens))
+	for key, token := range in.Tokens {
+		out.Tokens[key] = token
+	}
+	return out
 }
 
 func TestRoutesAffectedByDirtyPool(t *testing.T) {

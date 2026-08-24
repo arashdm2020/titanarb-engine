@@ -151,6 +151,10 @@ func New(c Caller, market config.MarketConfig, uni, camelot quotes.Quoter, cost 
 	return &Engine{caller: c, market: market, uni: uni, camelot: camelot, cost: cost, minProfit: new(big.Int).Set(minProfit), workers: workers, metrics: m, Events: make(chan Event, 4096), quoteCache: make(map[string]*quoteCacheEntry)}
 }
 
+// SetMarketConfig updates read-only token metadata between market cycles. It
+// does not alter execution assets, profitability, or any safety gate.
+func (e *Engine) SetMarketConfig(market config.MarketConfig) { e.market = market }
+
 func (e *Engine) ResetQuoteCache(block uint64) {
 	e.quoteMu.Lock()
 	e.quoteBlock = block

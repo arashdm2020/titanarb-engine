@@ -32,6 +32,10 @@ func BuildAll(assets []string, byPair map[Pair][]pools.Pool, maxRoutes int) []Ro
 // tokens improve path discovery without consuming route budget as non-executable
 // flash-loan starts.
 func BuildForStarts(starts, assets []string, byPair map[Pair][]pools.Pool, maxRoutes int) []Route {
+	return BuildForStartsWithCrossVenueShare(starts, assets, byPair, maxRoutes, 0)
+}
+
+func BuildForStartsWithCrossVenueShare(starts, assets []string, byPair map[Pair][]pools.Pool, maxRoutes, crossVenueShareBPS int) []Route {
 	if maxRoutes < 1 {
 		return nil
 	}
@@ -57,7 +61,7 @@ func BuildForStarts(starts, assets []string, byPair map[Pair][]pools.Pool, maxRo
 		if limit > remaining {
 			limit = remaining
 		}
-		output = append(output, buildFrom(start, intermediates, byPair, limit)...)
+		output = append(output, buildFromWithShare(start, intermediates, byPair, limit, crossVenueShareBPS)...)
 		if len(output) >= maxRoutes {
 			return output
 		}
@@ -66,6 +70,9 @@ func BuildForStarts(starts, assets []string, byPair map[Pair][]pools.Pool, maxRo
 }
 
 func buildFrom(start string, intermediates []string, byPair map[Pair][]pools.Pool, maximum int) []Route {
+	return buildFromWithShare(start, intermediates, byPair, maximum, 0)
+}
+func buildFromWithShare(start string, intermediates []string, byPair map[Pair][]pools.Pool, maximum, crossVenueShareBPS int) []Route {
 	if maximum < 1 {
 		return nil
 	}
@@ -96,10 +103,20 @@ func buildFrom(start string, intermediates []string, byPair map[Pair][]pools.Poo
 			if !valid {
 				continue
 			}
-			appendCombinations(symbols, choices, 0, nil, &hopRoutes, hopLimit)
+			combinationLimit := hopLimit
+			if hops == 2 && crossVenueShareBPS > 0 {
+				combinationLimit = hopLimit * 16
+			}
+			appendCombinations(symbols, choices, 0, nil, &hopRoutes, combinationLimit)
 			if len(hopRoutes) >= hopLimit {
 				break
 			}
+		}
+		if hops == 2 && crossVenueShareBPS > 0 {
+			hopRoutes = prioritizeTwoHopCrossVenue(hopRoutes, hopLimit, crossVenueShareBPS)
+		}
+		if len(hopRoutes) > hopLimit {
+			hopRoutes = hopRoutes[:hopLimit]
 		}
 		output = append(output, hopRoutes...)
 		if len(output) >= maximum {
@@ -107,6 +124,30 @@ func buildFrom(start string, intermediates []string, byPair map[Pair][]pools.Poo
 		}
 	}
 	return output
+}
+
+func prioritizeTwoHopCrossVenue(in []Route, limit, shareBPS int) []Route {
+	cross, same := make([]Route, 0), make([]Route, 0)
+	for _, r := range in {
+		if len(r.Hops) == 2 && r.Hops[0].DEX != r.Hops[1].DEX {
+			cross = append(cross, r)
+		} else {
+			same = append(same, r)
+		}
+	}
+	reserve := limit * shareBPS / 10000
+	if reserve > len(cross) {
+		reserve = len(cross)
+	}
+	out := append([]Route(nil), cross[:reserve]...)
+	remaining := append(cross[reserve:], same...)
+	for _, r := range remaining {
+		if len(out) >= limit {
+			break
+		}
+		out = append(out, r)
+	}
+	return out
 }
 
 func splitLimit(total, buckets int) []int {

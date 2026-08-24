@@ -38,6 +38,7 @@ type Service struct {
 	Quoter         QuoterFor
 	StatePath      string
 	HotBusy        func() bool
+	OnAdmission    func(AdmissionSnapshot)
 	poolEvents     chan pools.Pool
 	swapEvents     chan pools.Swap
 	probeEvents    chan pools.Pool
@@ -123,7 +124,14 @@ func (s *Service) Run(ctx context.Context) {
 			// market cycle is almost always active at the one-minute tick boundary.
 			go s.scanOnce(ctx)
 		case <-saveTick.C:
-			s.Memory.SelectShadow()
+			if s.Memory.cfg.Mode == "live" {
+				snapshot := s.Memory.SelectLive()
+				if s.OnAdmission != nil {
+					s.OnAdmission(snapshot)
+				}
+			} else {
+				s.Memory.SelectShadow()
+			}
 			_ = s.Memory.Save(s.StatePath)
 		}
 	}
@@ -156,8 +164,12 @@ func (s *Service) scanOnce(ctx context.Context) {
 	for _, factory := range s.Factories {
 		from := s.Memory.Checkpoint(factory.Name) + 1
 		if from == 1 || from > head {
-			if head > 1200 {
-				from = head - 1200
+			// Keep initial warm-up within non-archive provider plans. Persistent
+			// checkpoints make every subsequent scan incremental, so no pool event
+			// after activation is lost and no unbounded historical backfill occurs.
+			const initialWarmupBlocks = uint64(128)
+			if head > initialWarmupBlocks {
+				from = head - initialWarmupBlocks
 			} else {
 				from = 1
 			}
@@ -284,7 +296,15 @@ func (s *Service) validateToken(ctx context.Context, address string) bool {
 	if !d.IsUint64() || d.Uint64() > 36 {
 		return false
 	}
-	return s.Memory.RegisterToken(TokenMeta{Address: address, Decimals: uint8(d.Uint64()), HasCode: true}) == nil
+	return s.Memory.RegisterToken(TokenMeta{Address: address, Decimals: uint8(d.Uint64()), HasCode: true, Symbol: DynamicSymbol(address)}) == nil
+}
+
+func DynamicSymbol(address string) string {
+	a := strings.TrimPrefix(strings.ToLower(strings.TrimSpace(address)), "0x")
+	if len(a) != 40 {
+		return ""
+	}
+	return "DYN_" + strings.ToUpper(a)
 }
 
 func (s *Service) probeDepth(ctx context.Context, pool pools.Pool) {
@@ -484,9 +504,13 @@ func ConfigFromLookup(get func(string) string) Config {
 	cfg.MaxTrackedPairs = parseInt(get("PAIR_MAX_TRACKED_PAIRS"), 16)
 	cfg.MaxShadowPairs = parseInt(get("PAIR_MAX_SHADOW_PAIRS"), 8)
 	cfg.MaxDynamicAssets = parseInt(get("PAIR_MAX_DYNAMIC_ASSETS"), 4)
+	cfg.MaxLivePairs = parseInt(get("PAIR_MAX_LIVE_PAIRS"), 2)
+	cfg.MaxLiveDynamicAssets = parseInt(get("PAIR_MAX_LIVE_DYNAMIC_ASSETS"), 2)
 	cfg.MinObservation = time.Duration(parseInt(get("PAIR_MIN_OBSERVATION_MINUTES"), 60)) * time.Minute
 	cfg.MaxRPS = parseFloat(get("PAIR_INTELLIGENCE_MAX_RPS"), .5)
 	cfg.Burst = parseInt(get("PAIR_INTELLIGENCE_BURST"), 1)
+	cfg.MinScore = parseFloat(get("PAIR_MIN_SCORE"), 65)
+	cfg.MinConfidence = parseFloat(get("PAIR_MIN_CONFIDENCE"), .70)
 	return cfg
 }
 func parseInt(raw string, fallback int) int {

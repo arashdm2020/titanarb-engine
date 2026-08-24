@@ -33,6 +33,8 @@ type Config struct {
 	MaxTrackedPairs         int
 	MaxShadowPairs          int
 	MaxDynamicAssets        int
+	MaxLivePairs            int
+	MaxLiveDynamicAssets    int
 	MinObservation          time.Duration
 	MaxRPS                  float64
 	Burst                   int
@@ -40,12 +42,21 @@ type Config struct {
 	MinConfidence           float64
 	Cooldown                time.Duration
 	DislocationThresholdBPS float64
+	MinVenueDEXes           int
+	MinQuoteSuccess         float64
+	MinDepthScore           float64
+	MaxFailurePenalty       float64
+	MaxIlliquidityPenalty   float64
+	MaxScoreDrift           float64
+	EjectWindows            int
 }
 
 func DefaultConfig() Config {
 	return Config{Enabled: true, Mode: "shadow", MaxTrackedPairs: 16, MaxShadowPairs: 8, MaxDynamicAssets: 4,
 		MinObservation: time.Hour, MaxRPS: .5, Burst: 1, MinScore: 65, MinConfidence: .70,
-		Cooldown: time.Hour, DislocationThresholdBPS: 10}
+		Cooldown: time.Hour, DislocationThresholdBPS: 10, MaxLivePairs: 2, MaxLiveDynamicAssets: 2,
+		MinVenueDEXes: 2, MinQuoteSuccess: .80, MinDepthScore: .50, MaxFailurePenalty: .50,
+		MaxIlliquidityPenalty: .50, MaxScoreDrift: 15, EjectWindows: 3}
 }
 
 type TokenMeta struct {
@@ -53,6 +64,7 @@ type TokenMeta struct {
 	Decimals uint8  `json:"decimals"`
 	HasCode  bool   `json:"has_code"`
 	Core     bool   `json:"core"`
+	Symbol   string `json:"symbol,omitempty"`
 }
 
 type PairKey struct {
@@ -138,6 +150,8 @@ type Pair struct {
 	Score          float64          `json:"score"`
 	Confidence     float64          `json:"confidence"`
 	Components     Components       `json:"components"`
+	RecentScores   []float64        `json:"recent_scores,omitempty"`
+	BelowWindows   int              `json:"below_windows,omitempty"`
 }
 
 type Snapshot struct {
@@ -168,6 +182,33 @@ func NewMemory(cfg Config) *Memory {
 	}
 	if cfg.MaxDynamicAssets < 1 {
 		cfg.MaxDynamicAssets = 4
+	}
+	if cfg.MaxLivePairs < 1 {
+		cfg.MaxLivePairs = 2
+	}
+	if cfg.MaxLiveDynamicAssets < 1 {
+		cfg.MaxLiveDynamicAssets = 2
+	}
+	if cfg.MinVenueDEXes < 2 {
+		cfg.MinVenueDEXes = 2
+	}
+	if cfg.MinQuoteSuccess <= 0 {
+		cfg.MinQuoteSuccess = .80
+	}
+	if cfg.MinDepthScore <= 0 {
+		cfg.MinDepthScore = .50
+	}
+	if cfg.MaxFailurePenalty <= 0 {
+		cfg.MaxFailurePenalty = .50
+	}
+	if cfg.MaxIlliquidityPenalty <= 0 {
+		cfg.MaxIlliquidityPenalty = .50
+	}
+	if cfg.MaxScoreDrift <= 0 {
+		cfg.MaxScoreDrift = 15
+	}
+	if cfg.EjectWindows < 1 {
+		cfg.EjectWindows = 3
 	}
 	if cfg.MinObservation <= 0 {
 		cfg.MinObservation = time.Hour
@@ -359,6 +400,162 @@ func (m *Memory) SelectShadow() []Pair {
 		out = append(out, clonePair(p))
 	}
 	return out
+}
+
+// AdmissionSnapshot is an immutable market-only graph proposal. Tokens in
+// this snapshot never become flash-loan/start assets; that boundary remains
+// owned by MarketConfig.ExecutionAssets and the execution preflight.
+type AdmissionSnapshot struct {
+	Pairs  []Pair
+	Tokens []TokenMeta
+}
+
+func (m *Memory) SelectLive() AdmissionSnapshot {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	now := m.now().UTC()
+	candidates := make([]*Pair, 0)
+	preserved := make([]*Pair, 0)
+	for _, p := range m.pairs {
+		m.scoreLocked(p, now)
+		p.RecentScores = append(p.RecentScores, p.Score)
+		if len(p.RecentScores) > 4 {
+			p.RecentScores = append([]float64(nil), p.RecentScores[len(p.RecentScores)-4:]...)
+		}
+		qualified := m.liveQualifiedLocked(p, now)
+		if p.State == Admitted && !qualified {
+			p.BelowWindows++
+			if p.BelowWindows >= m.cfg.EjectWindows {
+				p.State, p.CooldownUntil = Cooled, now.Add(m.cfg.Cooldown)
+			} else {
+				// Keep the current graph stable during the configured consecutive
+				// below-threshold grace windows. Ejection occurs atomically only
+				// after the threshold is reached.
+				preserved = append(preserved, p)
+			}
+		} else if qualified {
+			p.BelowWindows = 0
+			candidates = append(candidates, p)
+		}
+	}
+	sort.SliceStable(candidates, func(i, j int) bool {
+		if candidates[i].Score != candidates[j].Score {
+			return candidates[i].Score > candidates[j].Score
+		}
+		return candidates[i].Key.String() < candidates[j].Key.String()
+	})
+	selected := make(map[string]struct{})
+	dynamic := make(map[string]struct{})
+	for _, p := range preserved {
+		selected[p.Key.String()] = struct{}{}
+		for _, a := range []string{p.Key.Token0, p.Key.Token1} {
+			if !m.tokens[a].Core {
+				dynamic[a] = struct{}{}
+			}
+		}
+	}
+	for _, p := range candidates {
+		if len(selected) >= m.cfg.MaxLivePairs {
+			break
+		}
+		if _, exists := selected[p.Key.String()]; exists {
+			continue
+		}
+		added := make([]string, 0, 2)
+		for _, a := range []string{p.Key.Token0, p.Key.Token1} {
+			if !m.tokens[a].Core {
+				if _, ok := dynamic[a]; !ok {
+					added = append(added, a)
+				}
+			}
+		}
+		if len(dynamic)+len(added) > m.cfg.MaxLiveDynamicAssets {
+			continue
+		}
+		for _, a := range added {
+			dynamic[a] = struct{}{}
+		}
+		selected[p.Key.String()] = struct{}{}
+		p.State = Admitted
+	}
+	for _, p := range m.pairs {
+		if p.State == Admitted {
+			if _, ok := selected[p.Key.String()]; !ok {
+				p.State = Observed
+			}
+		}
+	}
+	out := AdmissionSnapshot{}
+	for key := range selected {
+		out.Pairs = append(out.Pairs, clonePair(m.pairs[key]))
+	}
+	for a := range dynamic {
+		out.Tokens = append(out.Tokens, m.tokens[a])
+	}
+	sort.Slice(out.Pairs, func(i, j int) bool { return out.Pairs[i].Key.String() < out.Pairs[j].Key.String() })
+	sort.Slice(out.Tokens, func(i, j int) bool { return out.Tokens[i].Address < out.Tokens[j].Address })
+	return out
+}
+
+func (m *Memory) liveQualifiedLocked(p *Pair, now time.Time) bool {
+	if p.State == Cooled && now.Before(p.CooldownUntil) {
+		return false
+	}
+	if now.Sub(p.FirstObserved) < m.cfg.MinObservation || p.Score < m.cfg.MinScore || p.Confidence < m.cfg.MinConfidence {
+		return false
+	}
+	dexes := map[pools.DEX]struct{}{}
+	coreConnected := false
+	for _, v := range p.Venues {
+		dexes[v.DEX] = struct{}{}
+	}
+	for _, a := range []string{p.Key.Token0, p.Key.Token1} {
+		coreConnected = coreConnected || m.tokens[a].Core
+	}
+	if len(dexes) < m.cfg.MinVenueDEXes || !coreConnected {
+		return false
+	}
+	c := p.Components
+	if c.QuoteSuccess < m.cfg.MinQuoteSuccess || c.Depth < m.cfg.MinDepthScore || c.FailurePenalty > m.cfg.MaxFailurePenalty || c.IlliquidityPenalty > m.cfg.MaxIlliquidityPenalty {
+		return false
+	}
+	if len(p.RecentScores) < 3 {
+		return false
+	}
+	lo, hi := p.RecentScores[0], p.RecentScores[0]
+	for _, s := range p.RecentScores[1:] {
+		if s < lo {
+			lo = s
+		}
+		if s > hi {
+			hi = s
+		}
+	}
+	return hi-lo <= m.cfg.MaxScoreDrift
+}
+
+func (m *Memory) Tokens() []TokenMeta {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]TokenMeta, 0, len(m.tokens))
+	for _, t := range m.tokens {
+		out = append(out, t)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Address < out[j].Address })
+	return out
+}
+func (m *Memory) PairScore(a, b string) (float64, bool) {
+	k, err := CanonicalPair(a, b)
+	if err != nil {
+		return 0, false
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	p, ok := m.pairs[k.String()]
+	if !ok {
+		return 0, false
+	}
+	return p.Score, true
 }
 
 func (m *Memory) Pairs() []Pair {

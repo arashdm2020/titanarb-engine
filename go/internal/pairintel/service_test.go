@@ -90,7 +90,7 @@ func TestPairRPCPacing(t *testing.T) {
 
 func TestPairConfigDefaultsToBoundedShadow(t *testing.T) {
 	cfg := ConfigFromLookup(func(string) string { return "" })
-	if !cfg.Enabled || cfg.Mode != "shadow" || cfg.MaxTrackedPairs != 16 || cfg.MaxShadowPairs != 8 || cfg.MaxDynamicAssets != 4 || cfg.MinObservation != time.Hour || cfg.MaxRPS != .5 || cfg.Burst != 1 {
+	if !cfg.Enabled || cfg.Mode != "shadow" || cfg.MaxTrackedPairs != 16 || cfg.MaxShadowPairs != 8 || cfg.MaxDynamicAssets != 4 || cfg.MaxLivePairs != 2 || cfg.MaxLiveDynamicAssets != 2 || cfg.MinScore != 65 || cfg.MinConfidence != .70 || cfg.MinObservation != time.Hour || cfg.MaxRPS != .5 || cfg.Burst != 1 {
 		t.Fatalf("defaults=%+v", cfg)
 	}
 }

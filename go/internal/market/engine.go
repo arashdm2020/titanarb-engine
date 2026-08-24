@@ -23,31 +23,41 @@ import (
 )
 
 type Engine struct {
-	market            config.MarketConfig
-	discoverer        *pools.Discoverer
-	cache             *cache.PoolCache
-	evaluator         *opportunity.Engine
-	Events            <-chan opportunity.Event
-	metrics           *metrics.Metrics
-	discoveryWorkers  int
-	amounts           map[string]*big.Int
-	statsMu           sync.RWMutex
-	activePools       uint64
-	cycles            uint64
-	volatility        *volatility.Tracker
-	optimizer         optimizer.Optimizer
-	liquidity         func(context.Context, string) (*big.Int, error)
-	routeCache        []routes.Route
-	universeAssets    []string
-	dynamicAssets     []string
-	universeDecisions []string
-	cyclesSinceFull   uint64
-	lastMaxHops       int
-	lastMaxRoutes     int
-	lastStateBlock    uint64
-	routeFailures     map[string]uint64
-	routeMemory       *nearmiss.RouteMemory
-	universeFeedback  func(string, uint64, uint64)
+	market             config.MarketConfig
+	discoverer         *pools.Discoverer
+	cache              *cache.PoolCache
+	evaluator          *opportunity.Engine
+	Events             <-chan opportunity.Event
+	metrics            *metrics.Metrics
+	discoveryWorkers   int
+	amounts            map[string]*big.Int
+	statsMu            sync.RWMutex
+	activePools        uint64
+	cycles             uint64
+	volatility         *volatility.Tracker
+	optimizer          optimizer.Optimizer
+	liquidity          func(context.Context, string) (*big.Int, error)
+	routeCache         []routes.Route
+	universeAssets     []string
+	dynamicAssets      []string
+	universeDecisions  []string
+	cyclesSinceFull    uint64
+	lastMaxHops        int
+	lastMaxRoutes      int
+	lastStateBlock     uint64
+	routeFailures      map[string]uint64
+	routeMemory        *nearmiss.RouteMemory
+	universeFeedback   func(string, uint64, uint64)
+	pendingMu          sync.Mutex
+	pendingMarket      *config.MarketConfig
+	pendingPairKeys    map[string]struct{}
+	pendingDynamic     map[string]struct{}
+	livePairKeys       map[string]struct{}
+	liveDynamic        map[string]struct{}
+	executionAssets    []string
+	forceFull          bool
+	pairScore          func(string, string) (float64, bool)
+	crossVenueShareBPS int
 }
 
 type Snapshot struct {
@@ -197,7 +207,11 @@ func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, ca
 			validAmounts[symbol] = new(big.Int).Set(amount)
 		}
 	}
-	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.MarketAssets(), routeFailures: make(map[string]uint64), routeMemory: nearmiss.NewRouteMemory(8192)}
+	var events <-chan opportunity.Event
+	if evaluator != nil {
+		events = evaluator.Events
+	}
+	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.MarketAssets(), routeFailures: make(map[string]uint64), routeMemory: nearmiss.NewRouteMemory(8192), executionAssets: append([]string(nil), market.ExecutionAssetNames...)}
 }
 
 func (e *Engine) SetUniverseTelemetry(active, dynamic, decisions []string) {
@@ -212,6 +226,68 @@ func (e *Engine) SetUniverseTelemetry(active, dynamic, decisions []string) {
 // universe manager. It cannot mutate the current graph or execution boundary.
 func (e *Engine) SetUniverseFeedback(feedback func(string, uint64, uint64)) {
 	e.universeFeedback = feedback
+}
+
+// QueueMarketConfig atomically stages a market-only universe for the next
+// cycle. ExecutionAssets and loan amounts are deliberately retained from the
+// original engine configuration.
+func (e *Engine) QueueMarketConfig(next config.MarketConfig) {
+	e.QueueLiveMarket(next, nil, nil)
+}
+
+// QueueLiveMarket stages one immutable market snapshot. Only explicitly
+// admitted dynamic pair edges are discoverable; execution assets remain the
+// immutable startup allow-list.
+func (e *Engine) QueueLiveMarket(next config.MarketConfig, pairKeys, dynamicSymbols []string) {
+	next.ExecutionAssetNames = append([]string(nil), e.executionAssets...)
+	allowed := make(map[string]struct{}, len(pairKeys))
+	for _, key := range pairKeys {
+		allowed[strings.ToLower(strings.TrimSpace(key))] = struct{}{}
+	}
+	dynamic := make(map[string]struct{}, len(dynamicSymbols))
+	for _, symbol := range dynamicSymbols {
+		dynamic[symbol] = struct{}{}
+	}
+	e.pendingMu.Lock()
+	e.pendingMarket = &next
+	e.pendingPairKeys = allowed
+	e.pendingDynamic = dynamic
+	e.pendingMu.Unlock()
+}
+func (e *Engine) SetPairRouting(score func(string, string) (float64, bool), crossVenueShareBPS int) {
+	e.pairScore = score
+	if crossVenueShareBPS < 0 {
+		crossVenueShareBPS = 0
+	}
+	if crossVenueShareBPS > 10000 {
+		crossVenueShareBPS = 10000
+	}
+	e.crossVenueShareBPS = crossVenueShareBPS
+}
+
+func (e *Engine) applyPendingMarket() bool {
+	e.pendingMu.Lock()
+	next := e.pendingMarket
+	pairKeys := e.pendingPairKeys
+	dynamic := e.pendingDynamic
+	e.pendingMarket = nil
+	e.pendingPairKeys = nil
+	e.pendingDynamic = nil
+	e.pendingMu.Unlock()
+	if next == nil {
+		return false
+	}
+	e.market = *next
+	e.livePairKeys = pairKeys
+	e.liveDynamic = dynamic
+	if e.evaluator != nil {
+		e.evaluator.SetMarketConfig(*next)
+	}
+	e.statsMu.Lock()
+	e.universeAssets = append([]string(nil), next.MarketAssets()...)
+	e.statsMu.Unlock()
+	e.forceFull = true
+	return true
 }
 
 // Cycle refreshes the deployed executor's complete allow-listed universe,
@@ -304,6 +380,7 @@ func (e *Engine) CycleAt(ctx context.Context, stateBlock uint64, maxHops, maxRou
 // CycleAtWithSearchOptions lets runtime risk profiles widen or narrow the
 // read-only market search envelope without touching execution safety gates.
 func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int, volatilityWeight float64, options SearchOptions) (CycleReport, error) {
+	marketChanged := e.applyPendingMarket()
 	options = options.Normalized()
 	started := time.Now()
 	report := CycleReport{StateBlock: stateBlock}
@@ -323,7 +400,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		return report, nil
 	}
 	hadRoutes := len(e.routeCache) > 0
-	searchEnvelopeChanged := maxHops != e.lastMaxHops || maxRoutes != e.lastMaxRoutes
+	searchEnvelopeChanged := maxHops != e.lastMaxHops || maxRoutes != e.lastMaxRoutes || marketChanged || e.forceFull
 	full := !hadRoutes || e.cyclesSinceFull >= fullReconcileEvery || searchEnvelopeChanged
 	if !full && shouldDeferIncrementalRefresh(e.lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
 		routesFound := refreshRoutes(e.routeCache, liquidPools(e.cache.Snapshot()))
@@ -344,6 +421,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	rpcAtStart := e.rpcCalls()
 	forceAllEvaluation := !hadRoutes || searchEnvelopeChanged
 	if full {
+		e.forceFull = false
 		beforePools := e.cache.Snapshot()
 		e.routeCache, err = e.fullReconcile(ctx, stateBlock, maxHops, maxRoutes)
 		if err != nil {
@@ -505,6 +583,9 @@ func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, 
 	go func() {
 		for i, from := range symbols {
 			for _, to := range symbols[i+1:] {
+				if !e.marketPairAllowed(from, to) {
+					continue
+				}
 				select {
 				case jobs <- job{from, to}:
 				case <-ctx.Done():
@@ -554,7 +635,7 @@ func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, 
 	}
 	e.cache.Replace(discovered)
 
-	routesFound := routes.BuildForStarts(e.loanAssets(), symbols, byPair, maxRoutes)
+	routesFound := routes.BuildForStartsWithCrossVenueShare(e.loanAssets(), symbols, byPair, maxRoutes, e.crossVenueShareBPS)
 
 	filtered := routesFound[:0]
 	for _, route := range routesFound {
@@ -564,6 +645,30 @@ func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, 
 	}
 	routesFound = filtered
 	return routesFound, nil
+}
+
+func (e *Engine) marketPairAllowed(from, to string) bool {
+	_, fromDynamic := e.liveDynamic[from]
+	_, toDynamic := e.liveDynamic[to]
+	if !fromDynamic && !toDynamic {
+		return true
+	}
+	a, aOK := e.market.Tokens[from]
+	b, bOK := e.market.Tokens[to]
+	if !aOK || !bOK {
+		return false
+	}
+	_, ok := e.livePairKeys[canonicalAddressPair(a.Address, b.Address)]
+	return ok
+}
+
+func canonicalAddressPair(a, b string) string {
+	a = strings.ToLower(strings.TrimSpace(a))
+	b = strings.ToLower(strings.TrimSpace(b))
+	if b < a {
+		a, b = b, a
+	}
+	return a + ":" + b
 }
 
 func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock uint64) (map[string]struct{}, error) {
@@ -968,6 +1073,7 @@ func (e *Engine) selectEvaluationCandidates(candidates []routes.Route, options S
 			Volatility:   routeVolatility(route, signals, volatilityWeight),
 			CurrentBlock: stateBlock,
 		})
+		score += int64(e.routePairQuality(route) * 50)
 		scored = append(scored, scoredRoute{route: route, key: key, score: score, observations: stats.Observations, crossVenue: cross})
 	}
 	if len(scored) == 0 {
@@ -1058,6 +1164,30 @@ func (e *Engine) selectEvaluationCandidates(candidates []routes.Route, options S
 		selection.AvgScore = total / int64(len(selected))
 	}
 	return selected, selection
+}
+
+func (e *Engine) routePairQuality(route routes.Route) float64 {
+	if e.pairScore == nil || len(route.Symbols) < 2 {
+		return 0
+	}
+	weak, denom := 100.0, 0.0
+	for i := 0; i < len(route.Symbols)-1; i++ {
+		a, oka := e.market.Tokens[route.Symbols[i]]
+		b, okb := e.market.Tokens[route.Symbols[i+1]]
+		if !oka || !okb {
+			return 0
+		}
+		s, ok := e.pairScore(a.Address, b.Address)
+		if !ok || s <= 0 {
+			return 0
+		}
+		if s < weak {
+			weak = s
+		}
+		denom += 1 / s
+	}
+	harm := float64(len(route.Symbols)-1) / denom
+	return .5*weak + .5*harm
 }
 
 func summarizeLegacySelection(selected []routes.Route) evaluationSelection {

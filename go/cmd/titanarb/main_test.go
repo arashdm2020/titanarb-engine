@@ -36,6 +36,19 @@ func TestLegacyRawAmountIsNotCopiedAcrossAssets(t *testing.T) {
 	}
 }
 
+func TestDynamicIntermediateKeepsExecutionAssetBoundary(t *testing.T) {
+	allowed := map[string]struct{}{"USDC": {}}
+	if !routeStartsAndEndsWithExecutionAsset([]string{"USDC", "DYN_ABCDEF12", "USDC"}, allowed) {
+		t.Fatal("market-only intermediate rejected")
+	}
+	if routeStartsAndEndsWithExecutionAsset([]string{"DYN_ABCDEF12", "USDC", "DYN_ABCDEF12"}, allowed) {
+		t.Fatal("dynamic token became loan asset")
+	}
+	if routeStartsAndEndsWithExecutionAsset([]string{"USDC", "DYN_ABCDEF12", "WETH"}, allowed) {
+		t.Fatal("open route accepted")
+	}
+}
+
 func TestExplicitPerAssetRawAmountsAreRespected(t *testing.T) {
 	t.Setenv("TITANARB_MARKET_AMOUNT_WETH_RAW", "1000000000000000000")
 	market := config.MarketConfig{

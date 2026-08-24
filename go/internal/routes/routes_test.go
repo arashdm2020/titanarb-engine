@@ -150,3 +150,37 @@ func TestBuildForStartsBalancesHopDepthWhenTwoHopCanExhaustBudget(t *testing.T) 
 		t.Fatalf("hop-depth budget was monopolized by short cycles: %+v", counts)
 	}
 }
+
+func TestTwoHopCrossVenueReservationPreservesCapAndLongerHops(t *testing.T) {
+	assets := []string{"A", "B", "C", "D"}
+	by := map[Pair][]pools.Pool{}
+	for _, a := range assets {
+		for _, b := range assets {
+			if a == b {
+				continue
+			}
+			by[Pair{a, b}] = []pools.Pool{{Address: a + b + "u", DEX: pools.UniswapV3}, {Address: a + b + "c", DEX: pools.CamelotV3}}
+		}
+	}
+	got := BuildForStartsWithCrossVenueShare([]string{"A"}, assets, by, 60, 5000)
+	if len(got) == 0 || len(got) > 60 {
+		t.Fatalf("route budget violated: %d", len(got))
+	}
+	cross, two, three, four := 0, 0, 0, 0
+	for _, r := range got {
+		switch len(r.Hops) {
+		case 2:
+			two++
+			if r.Hops[0].DEX != r.Hops[1].DEX {
+				cross++
+			}
+		case 3:
+			three++
+		case 4:
+			four++
+		}
+	}
+	if cross < two/2 || three == 0 || four == 0 {
+		t.Fatalf("2hop=%d cross=%d 3=%d 4=%d", two, cross, three, four)
+	}
+}
