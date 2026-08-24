@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/titanarb/titanarb-go/internal/pools"
 )
 
 type fakeCaller struct {
@@ -48,6 +50,16 @@ func TestDuplicateFactoryEventHandling(t *testing.T) {
 	}
 	if !s.duplicate(strings.ToUpper(poolA)) {
 		t.Fatal("duplicate not detected")
+	}
+}
+
+func TestServiceReusesNewestObservedHead(t *testing.T) {
+	s := NewService(NewMemory(DefaultConfig()), nil, nil, nil, nil, "", nil)
+	s.ObservePool(pools.Pool{LastUpdatedBlock: 101})
+	s.ObserveSwap(pools.Swap{Block: 103})
+	s.ObservePool(pools.Pool{LastUpdatedBlock: 102})
+	if got := s.observedHead.Load(); got != 103 {
+		t.Fatalf("observed head=%d want 103", got)
 	}
 }
 

@@ -47,6 +47,7 @@ type Service struct {
 	duplicates     atomic.Uint64
 	rejections     atomic.Uint64
 	depthProbes    atomic.Uint64
+	observedHead   atomic.Uint64
 	mu             sync.Mutex
 	seenPools      map[string]struct{}
 	lastProbe      map[string]time.Time
@@ -73,15 +74,25 @@ func (s *Service) SetRepresentativeAmount(address string, amount *big.Int) {
 }
 
 func (s *Service) ObservePool(pool pools.Pool) {
+	s.advanceHead(pool.LastUpdatedBlock)
 	select {
 	case s.poolEvents <- pool:
 	default:
 	}
 }
 func (s *Service) ObserveSwap(swap pools.Swap) {
+	s.advanceHead(swap.Block)
 	select {
 	case s.swapEvents <- swap:
 	default:
+	}
+}
+
+func (s *Service) advanceHead(block uint64) {
+	for current := s.observedHead.Load(); block > current; current = s.observedHead.Load() {
+		if s.observedHead.CompareAndSwap(current, block) {
+			return
+		}
 	}
 }
 
@@ -128,16 +139,19 @@ func (s *Service) scanOnce(ctx context.Context) {
 		return
 	}
 	defer s.scanning.Store(false)
-	// The head lookup is pair-intelligence work too. Pace it and wait for the
-	// hot path just like factory logs and validation reads; otherwise the first
-	// call can collide with a dirty-cycle burst and abort every scan before a
-	// persistent checkpoint is written.
-	if err := s.limiter.Wait(ctx, s.HotBusy); err != nil {
-		return
-	}
-	head, err := s.Caller.BlockNumber(ctx)
-	if err != nil {
-		return
+	// Reuse the newest block already observed by the pool/swap hot path. This
+	// avoids a duplicate head RPC and prevents factory discovery from aborting
+	// when a provider is rate-limited at the one-minute tick boundary.
+	head := s.observedHead.Load()
+	if head == 0 {
+		if err := s.limiter.Wait(ctx, s.HotBusy); err != nil {
+			return
+		}
+		var err error
+		head, err = s.Caller.BlockNumber(ctx)
+		if err != nil {
+			return
+		}
 	}
 	for _, factory := range s.Factories {
 		from := s.Memory.Checkpoint(factory.Name) + 1
