@@ -106,9 +106,11 @@ func (s *Service) Run(ctx context.Context) {
 		case sw := <-s.swapEvents:
 			s.Memory.ObserveSwap(sw)
 		case <-factoryTick.C:
-			if !s.busy() {
-				go s.scanOnce(ctx)
-			}
+			// Always schedule the bounded scanner. The dedicated limiter waits for
+			// hot-path work to yield before each RPC. Gating the entire scan on the
+			// instantaneous busy bit can starve discovery on fast chains where a
+			// market cycle is almost always active at the one-minute tick boundary.
+			go s.scanOnce(ctx)
 		case <-saveTick.C:
 			s.Memory.SelectShadow()
 			_ = s.Memory.Save(s.StatePath)
@@ -131,9 +133,6 @@ func (s *Service) scanOnce(ctx context.Context) {
 		return
 	}
 	for _, factory := range s.Factories {
-		if s.busy() {
-			return
-		}
 		from := s.Memory.Checkpoint(factory.Name) + 1
 		if from == 1 || from > head {
 			if head > 1200 {
@@ -169,9 +168,6 @@ func (s *Service) scanOnce(ctx context.Context) {
 			if !s.validateToken(ctx, candidate.Token0) || !s.validateToken(ctx, candidate.Token1) {
 				s.rejections.Add(1)
 				continue
-			}
-			if s.busy() {
-				return
 			}
 			if err := s.limiter.Wait(ctx, s.HotBusy); err != nil {
 				return

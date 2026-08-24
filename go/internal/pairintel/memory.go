@@ -384,13 +384,17 @@ func (m *Memory) Telemetry(limit int) []map[string]any {
 	}
 	out := make([]map[string]any, 0, len(pairs))
 	for _, p := range pairs {
-		venues := make([]string, 0)
+		venueSet := make(map[string]struct{})
 		depth := make(map[string]Depth)
 		for _, v := range p.Venues {
-			venues = append(venues, string(v.DEX))
+			venueSet[string(v.DEX)] = struct{}{}
 			for k, d := range v.Depth {
 				depth[v.Pool+":"+k] = d
 			}
+		}
+		venues := make([]string, 0, len(venueSet))
+		for venue := range venueSet {
+			venues = append(venues, venue)
 		}
 		sort.Strings(venues)
 		c := p.Components

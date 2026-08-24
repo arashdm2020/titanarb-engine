@@ -78,6 +78,30 @@ func TestRollingWindowsVolumeScoreConfidenceAndVenueDedupe(t *testing.T) {
 	}
 }
 
+func TestTelemetryDeduplicatesDEXVenuesAcrossFeeTiers(t *testing.T) {
+	m := NewMemory(DefaultConfig())
+	a := TokenMeta{Address: "0x0000000000000000000000000000000000000001", Decimals: 18, HasCode: true}
+	b := TokenMeta{Address: "0x0000000000000000000000000000000000000002", Decimals: 6, HasCode: true}
+	if err := m.RegisterToken(a); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.RegisterToken(b); err != nil {
+		t.Fatal(err)
+	}
+	q := new(big.Int).Lsh(big.NewInt(1), 96)
+	m.ObservePool(pools.Pool{Address: "0x0000000000000000000000000000000000000011", Token0: a.Address, Token1: b.Address, DEX: pools.UniswapV3, Fee: 500, SqrtPriceX96: q})
+	m.ObservePool(pools.Pool{Address: "0x0000000000000000000000000000000000000012", Token0: a.Address, Token1: b.Address, DEX: pools.UniswapV3, Fee: 3000, SqrtPriceX96: q})
+	m.ObservePool(pools.Pool{Address: "0x0000000000000000000000000000000000000013", Token0: a.Address, Token1: b.Address, DEX: pools.CamelotV3, SqrtPriceX96: q})
+	rows := m.Telemetry(1)
+	if len(rows) != 1 {
+		t.Fatalf("telemetry rows=%d", len(rows))
+	}
+	venues, ok := rows[0]["venues"].([]string)
+	if !ok || len(venues) != 2 || venues[0] != "camelot_v3" || venues[1] != "uniswap_v3" {
+		t.Fatalf("venues must be independent DEXes: %#v", rows[0]["venues"])
+	}
+}
+
 func TestDepthFailureCooldown(t *testing.T) {
 	m, _ := testMemory(t)
 	q := new(big.Int).Lsh(big.NewInt(1), 96)
