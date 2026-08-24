@@ -274,6 +274,7 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
 		Error  *struct {
+			Code    int    `json:"code"`
 			Message string `json:"message"`
 		} `json:"error"`
 	}
@@ -281,6 +282,9 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 		return err
 	}
 	if envelope.Error != nil {
+		if rpcRateLimited(envelope.Error.Code, envelope.Error.Message) {
+			return &Error{HTTP, errors.New("rpc HTTP status 429")}
+		}
 		return &Error{RPC, errors.New(envelope.Error.Message)}
 	}
 	if err = json.Unmarshal(envelope.Result, out); err != nil {
@@ -288,6 +292,17 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 	}
 	c.updateLatency(provider, time.Since(started))
 	return nil
+}
+
+func rpcRateLimited(code int, message string) bool {
+	m := strings.ToLower(message)
+	if code == 429 || code == -32005 {
+		return true
+	}
+	return strings.Contains(m, "rate limit") ||
+		strings.Contains(m, "too many requests") ||
+		strings.Contains(m, "daily request limit") ||
+		strings.Contains(m, "usage limit")
 }
 
 func (c *Client) chooseProvider() (*providerState, int) {

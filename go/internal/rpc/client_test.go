@@ -73,6 +73,19 @@ func TestManagedClientFailoverOn429(t *testing.T) {
 	}
 }
 
+func TestManagedClientFailoverOnJSONRPCRateLimit(t *testing.T) {
+	primary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"You've reached the usage limit for your current plan"}}`)
+	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x456"}`)
+	client := NewManaged([]ProviderConfig{{Name: "one_rpc", HTTP: primary.URL}, {Name: "arbitrum_official", HTTP: secondary.URL}}, time.Second, 1, nil)
+	block, err := client.BlockNumber(context.Background())
+	if err != nil || block != 0x456 {
+		t.Fatalf("block=%d err=%v", block, err)
+	}
+	if client.ActiveProvider() != "arbitrum_official" {
+		t.Fatalf("JSON-RPC rate limit did not fail over: %s", client.ActiveProvider())
+	}
+}
+
 func TestManagedClientFailoverOn5xx(t *testing.T) {
 	primary := rpcServer(t, http.StatusBadGateway, `bad gateway`)
 	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x789"}`)
