@@ -21,24 +21,25 @@ var addressPattern = regexp.MustCompile(`^0x[0-9a-fA-F]{40}$`)
 // Config contains only the fields required by the Go foundation. PrivateKey is
 // loaded for parity with the production environment but is never used in Phase 1.
 type Config struct {
-	ChainID                  int64
-	HTTPRPCURL               string
-	WSRPCURL                 string
-	RPCProviders             []RPCProviderConfig
-	RPCReadTargetRPS         int
-	FlashExecutorAddress     string
-	UniswapV3Adapter         string
-	CamelotV3Adapter         string
-	ProfitRecipient          string
-	PrivateKey               string
-	DryRun                   bool
-	ExecutionMode            string
-	BroadcastEnabled         bool
-	SlippageBPS              uint64
-	DeadlineSeconds          uint64
-	GasLimitMultiplierBPS    uint64
-	PriceMaxStalenessSeconds uint64
-	SequencerGraceSeconds    uint64
+	ChainID                     int64
+	HTTPRPCURL                  string
+	WSRPCURL                    string
+	RPCProviders                []RPCProviderConfig
+	RPCReadTargetRPS            int
+	MaxCandidateStalenessBlocks uint64
+	FlashExecutorAddress        string
+	UniswapV3Adapter            string
+	CamelotV3Adapter            string
+	ProfitRecipient             string
+	PrivateKey                  string
+	DryRun                      bool
+	ExecutionMode               string
+	BroadcastEnabled            bool
+	SlippageBPS                 uint64
+	DeadlineSeconds             uint64
+	GasLimitMultiplierBPS       uint64
+	PriceMaxStalenessSeconds    uint64
+	SequencerGraceSeconds       uint64
 }
 
 type RPCProviderConfig struct {
@@ -219,16 +220,17 @@ func FromLookup(get func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("DRY_RUN must be true or false")
 	}
 	cfg := Config{
-		ChainID:              chainID,
-		HTTPRPCURL:           firstNonEmpty(get("RPC_PRIMARY_HTTP"), get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL")),
-		WSRPCURL:             firstNonEmpty(get("RPC_PRIMARY_WSS"), get("WS_RPC_URL"), get("ARBITRUM_WSS_RPC_URL")),
-		RPCProviders:         rpcProvidersFromLookup(get),
-		RPCReadTargetRPS:     int(parseUintDefault(get("RPC_READ_TARGET_RPS"), 0)),
-		FlashExecutorAddress: strings.TrimSpace(get("FLASH_EXECUTOR_ADDRESS")),
-		UniswapV3Adapter:     strings.TrimSpace(get("UNISWAP_V3_ADAPTER")),
-		CamelotV3Adapter:     strings.TrimSpace(get("CAMELOT_V3_ADAPTER")),
-		ProfitRecipient:      strings.TrimSpace(get("PROFIT_RECIPIENT")),
-		PrivateKey:           strings.TrimSpace(get("PRIVATE_KEY")), DryRun: dryRun,
+		ChainID:                     chainID,
+		HTTPRPCURL:                  firstNonEmpty(get("RPC_PRIMARY_HTTP"), get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL")),
+		WSRPCURL:                    firstNonEmpty(get("RPC_PRIMARY_WSS"), get("WS_RPC_URL"), get("ARBITRUM_WSS_RPC_URL")),
+		RPCProviders:                rpcProvidersFromLookup(get),
+		RPCReadTargetRPS:            int(parseUintDefault(get("RPC_READ_TARGET_RPS"), 0)),
+		MaxCandidateStalenessBlocks: parseUintDefault(get("MAX_CANDIDATE_STALENESS_BLOCKS"), 2),
+		FlashExecutorAddress:        strings.TrimSpace(get("FLASH_EXECUTOR_ADDRESS")),
+		UniswapV3Adapter:            strings.TrimSpace(get("UNISWAP_V3_ADAPTER")),
+		CamelotV3Adapter:            strings.TrimSpace(get("CAMELOT_V3_ADAPTER")),
+		ProfitRecipient:             strings.TrimSpace(get("PROFIT_RECIPIENT")),
+		PrivateKey:                  strings.TrimSpace(get("PRIVATE_KEY")), DryRun: dryRun,
 		ExecutionMode: strings.TrimSpace(strings.ToLower(get("EXECUTION_MODE"))),
 		// Mainnet broadcasting is opt-in independently from the shared runtime
 		// flags. Local-fork validation sets this only in its child process.

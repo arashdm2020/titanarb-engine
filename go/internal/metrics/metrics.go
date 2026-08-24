@@ -17,6 +17,7 @@ type Metrics struct {
 	rpcCalls, cacheHits, cacheMisses                                       atomic.Uint64
 	uniswapPools, camelotPools, uniswapQuotes, camelotQuotes               atomic.Uint64
 	simulationAttempts, simulationFailures, postGasRejections              atomic.Uint64
+	candidateLag1Admitted, candidateLag2Admitted, candidateStaleRejected   atomic.Uint64
 	transactionsBroadcast, transactionsSucceeded, transactionsFailed       atomic.Uint64
 	blocksCoalesced                                                        atomic.Uint64
 	maxLagBlocks                                                           atomic.Uint64
@@ -44,41 +45,44 @@ type CycleSample struct {
 	RPCCalls         uint64 `json:"rpc_calls_cycle"`
 }
 type Snapshot struct {
-	BlocksReceived        uint64      `json:"blocks_received"`
-	RPCErrors             uint64      `json:"rpc_errors"`
-	WSSDisconnects        uint64      `json:"wss_disconnects"`
-	WSSReconnects         uint64      `json:"wss_reconnects"`
-	UptimeSeconds         uint64      `json:"uptime_seconds"`
-	PoolsDiscovered       uint64      `json:"pools_discovered"`
-	Quotes                uint64      `json:"quotes"`
-	QuoteFailures         uint64      `json:"quote_failures"`
-	RoutesEvaluated       uint64      `json:"routes_evaluated"`
-	Opportunities         uint64      `json:"opportunities"`
-	RPCCalls              uint64      `json:"rpc_calls"`
-	CacheHits             uint64      `json:"cache_hits"`
-	CacheMisses           uint64      `json:"cache_misses"`
-	UniswapPools          uint64      `json:"uniswap_pools"`
-	CamelotPools          uint64      `json:"camelot_pools"`
-	UniswapQuotes         uint64      `json:"uniswap_quotes"`
-	CamelotQuotes         uint64      `json:"camelot_quotes"`
-	SimulationAttempts    uint64      `json:"simulation_attempts"`
-	SimulationFailures    uint64      `json:"simulation_failures"`
-	PostGasRejections     uint64      `json:"post_gas_rejections"`
-	TransactionsBroadcast uint64      `json:"transactions_broadcast"`
-	TransactionsSucceeded uint64      `json:"transactions_succeeded"`
-	TransactionsFailed    uint64      `json:"transactions_failed"`
-	BlocksCoalesced       uint64      `json:"blocks_coalesced"`
-	CycleLatency          CycleSample `json:"cycle_latency"`
-	MedianCycleMS         uint64      `json:"median_cycle_duration_ms"`
-	P95CycleMS            uint64      `json:"p95_cycle_duration_ms"`
-	MaxCycleMS            uint64      `json:"max_cycle_duration_ms"`
-	MedianQuoteMS         uint64      `json:"median_quote_duration_ms"`
-	P95QuoteMS            uint64      `json:"p95_quote_duration_ms"`
-	MaxLagBlocks          uint64      `json:"max_cycle_lag_blocks"`
-	RoutesPerSecond       float64     `json:"routes_per_second"`
-	QuotesPerSecond       float64     `json:"quotes_per_second"`
-	AverageRPS            float64     `json:"average_rpc_requests_per_second"`
-	P95RPS                float64     `json:"p95_rpc_requests_per_second"`
+	BlocksReceived         uint64      `json:"blocks_received"`
+	RPCErrors              uint64      `json:"rpc_errors"`
+	WSSDisconnects         uint64      `json:"wss_disconnects"`
+	WSSReconnects          uint64      `json:"wss_reconnects"`
+	UptimeSeconds          uint64      `json:"uptime_seconds"`
+	PoolsDiscovered        uint64      `json:"pools_discovered"`
+	Quotes                 uint64      `json:"quotes"`
+	QuoteFailures          uint64      `json:"quote_failures"`
+	RoutesEvaluated        uint64      `json:"routes_evaluated"`
+	Opportunities          uint64      `json:"opportunities"`
+	RPCCalls               uint64      `json:"rpc_calls"`
+	CacheHits              uint64      `json:"cache_hits"`
+	CacheMisses            uint64      `json:"cache_misses"`
+	UniswapPools           uint64      `json:"uniswap_pools"`
+	CamelotPools           uint64      `json:"camelot_pools"`
+	UniswapQuotes          uint64      `json:"uniswap_quotes"`
+	CamelotQuotes          uint64      `json:"camelot_quotes"`
+	SimulationAttempts     uint64      `json:"simulation_attempts"`
+	SimulationFailures     uint64      `json:"simulation_failures"`
+	PostGasRejections      uint64      `json:"post_gas_rejections"`
+	CandidateLag1Admitted  uint64      `json:"candidate_lag_1_admitted"`
+	CandidateLag2Admitted  uint64      `json:"candidate_lag_2_admitted"`
+	CandidateStaleRejected uint64      `json:"candidate_stale_rejected"`
+	TransactionsBroadcast  uint64      `json:"transactions_broadcast"`
+	TransactionsSucceeded  uint64      `json:"transactions_succeeded"`
+	TransactionsFailed     uint64      `json:"transactions_failed"`
+	BlocksCoalesced        uint64      `json:"blocks_coalesced"`
+	CycleLatency           CycleSample `json:"cycle_latency"`
+	MedianCycleMS          uint64      `json:"median_cycle_duration_ms"`
+	P95CycleMS             uint64      `json:"p95_cycle_duration_ms"`
+	MaxCycleMS             uint64      `json:"max_cycle_duration_ms"`
+	MedianQuoteMS          uint64      `json:"median_quote_duration_ms"`
+	P95QuoteMS             uint64      `json:"p95_quote_duration_ms"`
+	MaxLagBlocks           uint64      `json:"max_cycle_lag_blocks"`
+	RoutesPerSecond        float64     `json:"routes_per_second"`
+	QuotesPerSecond        float64     `json:"quotes_per_second"`
+	AverageRPS             float64     `json:"average_rpc_requests_per_second"`
+	P95RPS                 float64     `json:"p95_rpc_requests_per_second"`
 }
 
 func New() *Metrics                    { return &Metrics{started: time.Now()} }
@@ -115,6 +119,9 @@ func (m *Metrics) IncCamelotQuotes()               { m.camelotQuotes.Add(1) }
 func (m *Metrics) IncSimulationAttempts()          { m.simulationAttempts.Add(1) }
 func (m *Metrics) IncSimulationFailures()          { m.simulationFailures.Add(1) }
 func (m *Metrics) IncPostGasRejections()           { m.postGasRejections.Add(1) }
+func (m *Metrics) IncCandidateLag1Admitted()       { m.candidateLag1Admitted.Add(1) }
+func (m *Metrics) IncCandidateLag2Admitted()       { m.candidateLag2Admitted.Add(1) }
+func (m *Metrics) IncCandidateStaleRejected()      { m.candidateStaleRejected.Add(1) }
 func (m *Metrics) IncTransactionsBroadcast()       { m.transactionsBroadcast.Add(1) }
 func (m *Metrics) IncTransactionsSucceeded()       { m.transactionsSucceeded.Add(1) }
 func (m *Metrics) IncTransactionsFailed()          { m.transactionsFailed.Add(1) }
@@ -156,6 +163,7 @@ func (m *Metrics) Snapshot() Snapshot {
 		UniswapPools: m.uniswapPools.Load(), CamelotPools: m.camelotPools.Load(),
 		UniswapQuotes: m.uniswapQuotes.Load(), CamelotQuotes: m.camelotQuotes.Load(),
 		SimulationAttempts: m.simulationAttempts.Load(), SimulationFailures: m.simulationFailures.Load(), PostGasRejections: m.postGasRejections.Load(),
+		CandidateLag1Admitted: m.candidateLag1Admitted.Load(), CandidateLag2Admitted: m.candidateLag2Admitted.Load(), CandidateStaleRejected: m.candidateStaleRejected.Load(),
 		TransactionsBroadcast: m.transactionsBroadcast.Load(), TransactionsSucceeded: m.transactionsSucceeded.Load(), TransactionsFailed: m.transactionsFailed.Load(),
 		BlocksCoalesced: m.blocksCoalesced.Load(), CycleLatency: last,
 		MedianCycleMS: percentile(cycles, 50), P95CycleMS: percentile(cycles, 95), MaxCycleMS: percentile(cycles, 100),

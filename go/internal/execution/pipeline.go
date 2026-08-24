@@ -33,16 +33,17 @@ type Chain interface {
 }
 
 type Pipeline struct {
-	config              config.Config
-	market              config.MarketConfig
-	chain               Chain
-	fees                *fees.Service
-	wallet              *wallet.Wallet
-	tracker             *profit.Tracker
-	gate                *safety.Gate
-	metrics             *metrics.Metrics
-	minProfit           *big.Int
-	latestObservedBlock func() uint64
+	config                      config.Config
+	market                      config.MarketConfig
+	chain                       Chain
+	fees                        *fees.Service
+	wallet                      *wallet.Wallet
+	tracker                     *profit.Tracker
+	gate                        *safety.Gate
+	metrics                     *metrics.Metrics
+	minProfit                   *big.Int
+	latestObservedBlock         func() uint64
+	maxCandidateStalenessBlocks uint64
 }
 
 type Outcome struct {
@@ -77,7 +78,7 @@ func NewPipeline(cfg config.Config, market config.MarketConfig, chain Chain, fee
 	if err != nil {
 		return nil, err
 	}
-	return &Pipeline{config: cfg, market: market, chain: chain, fees: feeService, wallet: w, tracker: tracker, gate: gate, metrics: metricStore, minProfit: new(big.Int).Set(minProfit)}, nil
+	return &Pipeline{config: cfg, market: market, chain: chain, fees: feeService, wallet: w, tracker: tracker, gate: gate, metrics: metricStore, minProfit: new(big.Int).Set(minProfit), maxCandidateStalenessBlocks: cfg.MaxCandidateStalenessBlocks}, nil
 }
 
 // BuildRequest converts a quoted opportunity into precisely the Solidity
@@ -135,8 +136,23 @@ func (p *Pipeline) Process(ctx context.Context, opp *opportunity.Opportunity) Ou
 }
 
 func (p *Pipeline) ProcessWithObserver(ctx context.Context, opp *opportunity.Opportunity, observer Observer) Outcome {
-	if opp != nil && p.latestObservedBlock != nil && !candidateIsFresh(opp.SourceBlock, p.latestObservedBlock()) {
-		return Outcome{Decision: "reject", Reason: "stale candidate: newer chain state observed"}
+	if opp != nil && p.latestObservedBlock != nil {
+		latestObservedBlock := p.latestObservedBlock()
+		lag := candidateBlockLag(opp.SourceBlock, latestObservedBlock)
+		if !candidateIsFresh(opp.SourceBlock, latestObservedBlock, p.maxCandidateStalenessBlocks) {
+			if p.metrics != nil {
+				p.metrics.IncCandidateStaleRejected()
+			}
+			return Outcome{Decision: "reject", Reason: "stale candidate: newer chain state observed"}
+		}
+		if p.metrics != nil {
+			switch lag {
+			case 1:
+				p.metrics.IncCandidateLag1Admitted()
+			case 2:
+				p.metrics.IncCandidateLag2Admitted()
+			}
+		}
 	}
 	if err := p.gate.Check(ctx, time.Now().UTC()); err != nil {
 		return Outcome{Decision: "reject", Reason: "safety gate: " + err.Error()}
@@ -239,11 +255,18 @@ func (p *Pipeline) ProcessWithObserver(ctx context.Context, opp *opportunity.Opp
 	return Outcome{Decision: "confirmed", Request: req, Simulation: &sim, FinalProfit: economics.ExpectedProfit, TxHash: hash, Receipt: receiptResult.Receipt}
 }
 
-func candidateIsFresh(sourceBlock, latestObservedBlock uint64) bool {
+func candidateIsFresh(sourceBlock, latestObservedBlock, maxStalenessBlocks uint64) bool {
 	// SourceBlock zero is retained for deterministic fixtures and callers that
 	// do not yet provide block-aware pool state. Production market cycles always
 	// attach the pinned pool-state block.
-	return sourceBlock == 0 || latestObservedBlock <= sourceBlock
+	return sourceBlock == 0 || candidateBlockLag(sourceBlock, latestObservedBlock) <= maxStalenessBlocks
+}
+
+func candidateBlockLag(sourceBlock, latestObservedBlock uint64) uint64 {
+	if sourceBlock == 0 || latestObservedBlock <= sourceBlock {
+		return 0
+	}
+	return latestObservedBlock - sourceBlock
 }
 
 func (p *Pipeline) aavePremium(ctx context.Context, amount *big.Int) (*big.Int, error) {

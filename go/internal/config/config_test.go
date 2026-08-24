@@ -14,8 +14,24 @@ func lookup(values map[string]string) func(string) string {
 	return func(key string) string { return values[key] }
 }
 func TestValidConfig(t *testing.T) {
-	if _, err := FromLookup(lookup(validEnv())); err != nil {
+	cfg, err := FromLookup(lookup(validEnv()))
+	if err != nil {
 		t.Fatal(err)
+	}
+	if cfg.MaxCandidateStalenessBlocks != 2 {
+		t.Fatalf("default max candidate staleness=%d want 2", cfg.MaxCandidateStalenessBlocks)
+	}
+}
+
+func TestCandidateStalenessExactBlockOverride(t *testing.T) {
+	v := validEnv()
+	v["MAX_CANDIDATE_STALENESS_BLOCKS"] = "0"
+	cfg, err := FromLookup(lookup(v))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.MaxCandidateStalenessBlocks != 0 {
+		t.Fatalf("exact-block override=%d want 0", cfg.MaxCandidateStalenessBlocks)
 	}
 }
 func TestInvalidChain(t *testing.T) {

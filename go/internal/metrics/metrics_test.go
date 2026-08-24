@@ -18,6 +18,9 @@ func TestCountersAndJSON(t *testing.T) {
 	m.IncCamelotPools()
 	m.IncUniswapQuotes()
 	m.IncCamelotQuotes()
+	m.IncCandidateLag1Admitted()
+	m.IncCandidateLag2Admitted()
+	m.IncCandidateStaleRejected()
 	m.AddBlocksCoalesced(3)
 	m.rpcRateMu.Lock()
 	m.rpcRateSamples = []uint64{8, 10}
@@ -33,6 +36,9 @@ func TestCountersAndJSON(t *testing.T) {
 	}
 	if s.UniswapPools != 1 || s.CamelotPools != 1 || s.UniswapQuotes != 1 || s.CamelotQuotes != 1 {
 		t.Fatalf("missing DEX counters: %+v", s)
+	}
+	if s.CandidateLag1Admitted != 1 || s.CandidateLag2Admitted != 1 || s.CandidateStaleRejected != 1 {
+		t.Fatalf("missing candidate freshness counters: %+v", s)
 	}
 	if s.BlocksCoalesced != 3 || s.MedianCycleMS != 100 || s.P95CycleMS != 200 || s.MaxCycleMS != 200 || s.CycleLatency.LagBlocks != 0 || s.MaxLagBlocks != 2 {
 		t.Fatalf("missing latency/coalescing metrics: %+v", s)
