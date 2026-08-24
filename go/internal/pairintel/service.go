@@ -298,6 +298,16 @@ func (s *Service) probeDepth(ctx context.Context, pool pools.Pool) {
 			name string
 			mul  int64
 		}{{"small", 1}, {"medium", 10}, {"large", 100}} {
+			// Factory checkpoint progress has priority within the same bounded
+			// pair-intelligence budget. Without this pause, a restart can enqueue
+			// enough depth warm-up work to starve factory discovery indefinitely.
+			for s.scanning.Load() {
+				select {
+				case <-ctx.Done():
+					return
+				case <-time.After(100 * time.Millisecond):
+				}
+			}
 			if s.busy() {
 				return
 			}
@@ -421,7 +431,7 @@ func (l *pacedLimiter) Wait(ctx context.Context, busy func() bool) error {
 			select {
 			case <-ctx.Done():
 				return ctx.Err()
-			case <-time.After(100 * time.Millisecond):
+			case <-time.After(10 * time.Millisecond):
 				continue
 			}
 		}
