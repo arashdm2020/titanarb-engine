@@ -3,10 +3,12 @@ package pools
 
 import (
 	"context"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"math/big"
 	"strings"
+	"sync"
 
 	"github.com/titanarb/titanarb-go/internal/dex"
 )
@@ -27,6 +29,24 @@ type Pool struct {
 	Liquidity        *big.Int
 	SqrtPriceX96     *big.Int
 	LastUpdatedBlock uint64
+}
+
+// Swap is the canonical subset of a supported V3/Algebra Swap event needed by
+// pair intelligence. Amounts retain their signed int256 semantics.
+type Swap struct {
+	Pool         string
+	Amount0      *big.Int
+	Amount1      *big.Int
+	SqrtPriceX96 *big.Int
+	Liquidity    *big.Int
+	Block        uint64
+}
+
+// Observer receives already-fetched pool and Swap state. Implementations must
+// be non-blocking because this hook is on the market hot path.
+type Observer interface {
+	ObservePool(Pool)
+	ObserveSwap(Swap)
 }
 
 func (p Pool) Supports(tokenIn, tokenOut string) bool {
@@ -54,10 +74,36 @@ type Discoverer struct {
 	uniswapFactory string
 	camelotFactory string
 	fees           []uint32
+	observerMu     sync.RWMutex
+	observer       Observer
 }
 
 func NewDiscoverer(caller Caller, uniswapFactory, camelotFactory string, fees []uint32) *Discoverer {
 	return &Discoverer{caller: caller, uniswapFactory: uniswapFactory, camelotFactory: camelotFactory, fees: append([]uint32(nil), fees...)}
+}
+
+func (d *Discoverer) SetObserver(observer Observer) {
+	d.observerMu.Lock()
+	d.observer = observer
+	d.observerMu.Unlock()
+}
+
+func (d *Discoverer) notifyPool(pool Pool) {
+	d.observerMu.RLock()
+	observer := d.observer
+	d.observerMu.RUnlock()
+	if observer != nil {
+		observer.ObservePool(pool)
+	}
+}
+
+func (d *Discoverer) notifySwap(swap Swap) {
+	d.observerMu.RLock()
+	observer := d.observer
+	d.observerMu.RUnlock()
+	if observer != nil {
+		observer.ObserveSwap(swap)
+	}
 }
 
 // DiscoverPair returns every liquid real Uniswap pool at the configured fee
@@ -122,6 +168,7 @@ func (d *Discoverer) RefreshPoolAt(ctx context.Context, pool Pool, block uint64)
 	updated.Liquidity = dex.WordUint(liquidityWords[0])
 	updated.SqrtPriceX96 = dex.WordUint(stateWords[0])
 	updated.LastUpdatedBlock = block
+	d.notifyPool(updated)
 	return updated, nil
 }
 
@@ -142,7 +189,10 @@ func (d *Discoverer) ChangedPoolAddressesAt(ctx context.Context, poolAddresses [
 		fromBlock = toBlock
 	}
 	var logs []struct {
-		Address string `json:"address"`
+		Address     string   `json:"address"`
+		Data        string   `json:"data"`
+		Topics      []string `json:"topics"`
+		BlockNumber string   `json:"blockNumber"`
 	}
 	filter := map[string]any{
 		"fromBlock": fmt.Sprintf("0x%x", fromBlock),
@@ -155,6 +205,9 @@ func (d *Discoverer) ChangedPoolAddressesAt(ctx context.Context, poolAddresses [
 	for _, entry := range logs {
 		if entry.Address != "" {
 			changed[strings.ToLower(entry.Address)] = struct{}{}
+		}
+		if swap, ok := decodeSwapLog(entry.Address, entry.Data, entry.Topics, entry.BlockNumber); ok {
+			d.notifySwap(swap)
 		}
 	}
 	return changed, nil
@@ -201,7 +254,9 @@ func (d *Discoverer) uniswapPool(ctx context.Context, a, b string, fee uint32, b
 	if err != nil {
 		return nil, err
 	}
-	return &Pool{Address: address, Token0: token0, Token1: token1, DEX: UniswapV3, Fee: uint32(dex.WordUint(feeWords[0]).Uint64()), Liquidity: liquidity, SqrtPriceX96: dex.WordUint(slotWords[0]), LastUpdatedBlock: block}, nil
+	pool := &Pool{Address: address, Token0: token0, Token1: token1, DEX: UniswapV3, Fee: uint32(dex.WordUint(feeWords[0]).Uint64()), Liquidity: liquidity, SqrtPriceX96: dex.WordUint(slotWords[0]), LastUpdatedBlock: block}
+	d.notifyPool(*pool)
+	return pool, nil
 }
 
 func (d *Discoverer) camelotPool(ctx context.Context, a, b string, block uint64) (*Pool, error) {
@@ -239,7 +294,9 @@ func (d *Discoverer) camelotPool(ctx context.Context, a, b string, block uint64)
 	if err != nil {
 		return nil, err
 	}
-	return &Pool{Address: address, Token0: token0, Token1: token1, DEX: CamelotV3, Liquidity: liquidity, SqrtPriceX96: dex.WordUint(stateWords[0]), LastUpdatedBlock: block}, nil
+	pool := &Pool{Address: address, Token0: token0, Token1: token1, DEX: CamelotV3, Liquidity: liquidity, SqrtPriceX96: dex.WordUint(stateWords[0]), LastUpdatedBlock: block}
+	d.notifyPool(*pool)
+	return pool, nil
 }
 
 func (d *Discoverer) corePoolState(ctx context.Context, address string, block uint64) (string, string, *big.Int, error) {
@@ -282,4 +339,32 @@ func (d *Discoverer) call(ctx context.Context, to, data string, block uint64) (s
 
 func isZeroAddress(address string) bool {
 	return strings.EqualFold(address, "0x0000000000000000000000000000000000000000")
+}
+
+var swapTopic = strings.ToLower(dex.EventTopic("Swap(address,address,int256,int256,uint160,uint128,int24)"))
+
+func decodeSwapLog(address, data string, topics []string, blockHex string) (Swap, bool) {
+	if len(topics) == 0 || !strings.EqualFold(topics[0], swapTopic) {
+		return Swap{}, false
+	}
+	raw, err := hex.DecodeString(strings.TrimPrefix(data, "0x"))
+	if err != nil || len(raw) < 32*4 {
+		return Swap{}, false
+	}
+	block := uint64(0)
+	if strings.HasPrefix(blockHex, "0x") {
+		_, _ = fmt.Sscanf(blockHex, "0x%x", &block)
+	}
+	return Swap{
+		Pool: address, Amount0: signedWord(raw[0:32]), Amount1: signedWord(raw[32:64]),
+		SqrtPriceX96: new(big.Int).SetBytes(raw[64:96]), Liquidity: new(big.Int).SetBytes(raw[96:128]), Block: block,
+	}, true
+}
+
+func signedWord(raw []byte) *big.Int {
+	value := new(big.Int).SetBytes(raw)
+	if len(raw) == 32 && raw[0]&0x80 != 0 {
+		value.Sub(value, new(big.Int).Lsh(big.NewInt(1), 256))
+	}
+	return value
 }

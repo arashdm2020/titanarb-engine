@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -32,6 +33,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/observability"
 	"github.com/titanarb/titanarb-go/internal/operations"
 	"github.com/titanarb/titanarb-go/internal/opportunity"
+	"github.com/titanarb/titanarb-go/internal/pairintel"
 	"github.com/titanarb/titanarb-go/internal/pools"
 	"github.com/titanarb/titanarb-go/internal/profit"
 	"github.com/titanarb/titanarb-go/internal/quotes"
@@ -105,9 +107,13 @@ func main() {
 	monitor := health.New(rpcClient, w.Connected)
 	systemMonitor := monitor2.New(operationsDir)
 	events := w.Start(ctx)
-	marketEngine, marketCfg, marketErr := buildMarketEngine(rpcClient, m)
+	var marketBusy atomic.Bool
+	marketEngine, marketCfg, pairService, marketErr := buildMarketEngine(rpcClient, m, operationsDir, &marketBusy)
 	if marketErr != nil && os.Getenv("TITANARB_MARKET_ENGINE") == "true" {
 		log.Event(logger.Warn, "health_check_failed", "market", "market engine disabled: "+marketErr.Error(), nil)
+	}
+	if pairService != nil {
+		go pairService.Run(ctx)
 	}
 	if telegramConfig.Enabled() && runtimeRisk != nil {
 		go control.Run(ctx, notifier, control.Handler{
@@ -152,6 +158,8 @@ func main() {
 		var recordedCoalesced uint64
 		executionAssets := assetSet(marketCfg.ExecutionAssets())
 		marketScheduler = scheduler.New(func(runCtx context.Context, trigger scheduler.Trigger) {
+			marketBusy.Store(true)
+			defer marketBusy.Store(false)
 			cycleStarted := time.Now()
 			before := m.Snapshot()
 			cycleCtx, stop := context.WithTimeout(runCtx, 45*time.Second)
@@ -318,6 +326,18 @@ func main() {
 				"active_wss_provider":              w.ActiveProvider(),
 				"rpc_provider_health":              rpcProviderHealthString(rpcClient.Snapshots()),
 			}
+			if pairService != nil {
+				pairStats := pairService.Snapshot()
+				mode, tracked, shadow, topScore := pairService.Memory.Summary()
+				fields["pair_intelligence_mode"] = mode
+				fields["pair_candidates_tracked"] = tracked
+				fields["pair_shadow_count"] = shadow
+				fields["pair_top_score"] = topScore
+				fields["pair_factory_pools"] = pairStats.FactoryPools
+				fields["pair_duplicate_events"] = pairStats.DuplicateEvents
+				fields["pair_rejections"] = pairStats.Rejections
+				fields["pair_depth_probes"] = pairStats.DepthProbes
+			}
 			log.Event(logger.Info, "market_cycle", "market", "market cycle complete", fields)
 			publish(operationSink, observability.Performance, "market_cycle", telegram.Info, "market cycle complete", fields)
 		})
@@ -423,31 +443,35 @@ func main() {
 			}
 			message := dashboard.FormatMarket(dashboard.MarketSnapshot{Status: "ONLINE", RiskProfile: profile, WSS: wssStatus, ActivePools: marketSnapshot.ActivePools, Cycles: marketSnapshot.Cycles, Metrics: snapshot})
 			alert(operationSink, observability.Performance, "operational_summary", telegram.Info, message, map[string]any{"blocks": snapshot.BlocksReceived, "routes": snapshot.RoutesEvaluated, "quotes": snapshot.Quotes, "opportunities": snapshot.Opportunities, "rpc_errors": snapshot.RPCErrors, "wss_disconnects": snapshot.WSSDisconnects, "transactions": snapshot.TransactionsBroadcast})
+			if pairService != nil {
+				mode, tracked, shadow, topScore := pairService.Memory.Summary()
+				publish(operationSink, observability.Performance, "pair_intelligence_snapshot", telegram.Info, "shadow pair intelligence snapshot", map[string]any{"mode": mode, "tracked_pairs": tracked, "shadow_pairs": shadow, "top_score": topScore, "pairs": pairService.Memory.Telemetry(16)})
+			}
 		}
 	}
 }
 
-func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.Engine, config.MarketConfig, error) {
+func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics, operationsDir string, busy *atomic.Bool) (*market.Engine, config.MarketConfig, *pairintel.Service, error) {
 	if os.Getenv("TITANARB_MARKET_ENGINE") != "true" {
-		return nil, config.MarketConfig{}, nil
+		return nil, config.MarketConfig{}, nil, nil
 	}
 	coreMarketConfig, err := loadMarketConfig()
 	if err != nil {
-		return nil, config.MarketConfig{}, err
+		return nil, config.MarketConfig{}, nil, err
 	}
 	amount, err := rawEnv("TITANARB_MARKET_AMOUNT_RAW")
 	if err != nil {
-		return nil, config.MarketConfig{}, err
+		return nil, config.MarketConfig{}, nil, err
 	}
 	minimum, err := rawEnv("TITANARB_MARKET_MIN_PROFIT_RAW")
 	if err != nil {
-		return nil, config.MarketConfig{}, err
+		return nil, config.MarketConfig{}, nil, err
 	}
 	coreDiscoverer := pools.NewDiscoverer(client, coreMarketConfig.UniswapFactory, coreMarketConfig.CamelotFactory, coreMarketConfig.UniswapFeeTiers)
 	coreUni := quotes.NewUniswapV3(client, coreMarketConfig.UniswapQuoterV2, metrics)
 	coreCamelot := quotes.NewCamelot(client, coreMarketConfig.CamelotQuoter, metrics)
 	coreAmounts := marketAmounts(coreMarketConfig, amount)
-	marketConfig, dynamicAssets, universeDecisions := marketConfigWithApprovedDynamicAssets(coreMarketConfig, coreDiscoverer, client, coreUni, coreCamelot, coreAmounts)
+	marketConfig, dynamicAssets, universeDecisions, universeManager := marketConfigWithApprovedDynamicAssets(coreMarketConfig, coreDiscoverer, client, coreUni, coreCamelot, coreAmounts)
 	discoverer := pools.NewDiscoverer(client, marketConfig.UniswapFactory, marketConfig.CamelotFactory, marketConfig.UniswapFeeTiers)
 	uni := quotes.NewUniswapV3(client, marketConfig.UniswapQuoterV2, metrics)
 	camelot := quotes.NewCamelot(client, marketConfig.CamelotQuoter, metrics)
@@ -494,7 +518,43 @@ func buildMarketEngine(client *rpc.Client, metrics *metrics.Metrics) (*market.En
 
 	engine := market.NewWithAmounts(marketConfig, discoverer, cache.NewPoolCache(metrics), evaluator, coreAmounts, 4, metrics, liquidityProvider)
 	engine.SetUniverseTelemetry(assetSymbols(marketConfig, marketConfig.ExecutionAssets()), assetSymbols(marketConfig, dynamicAssets), universeDecisions)
-	return engine, coreMarketConfig, nil
+	engine.SetUniverseFeedback(func(asset string, evaluations, useful uint64) {
+		universeManager.ApplyFeedback(universe.Feedback{Asset: asset, Evaluations: evaluations, Useful: useful})
+	})
+	pairCfg := pairintel.FromEnv()
+	// Phase 3 live admission is intentionally not implemented in this release.
+	if pairCfg.Mode == "live" {
+		pairCfg.Mode = "shadow"
+	}
+	pairPath := filepath.Join(operationsDir, "pair_intelligence.json")
+	pairMemory, loadErr := pairintel.Load(pairPath, pairCfg)
+	if loadErr != nil {
+		pairMemory = pairintel.NewMemory(pairCfg)
+	}
+	coreSet := assetSet(coreMarketConfig.ExecutionAssets())
+	for _, token := range marketConfig.Tokens {
+		_, core := coreSet[token.Symbol]
+		_ = pairMemory.RegisterToken(pairintel.TokenMeta{Address: token.Address, Decimals: token.Decimals, HasCode: true, Core: core})
+	}
+	pairService := pairintel.NewService(pairMemory, client, discoverer, []pairintel.Factory{
+		{Name: "uniswap_v3", Address: marketConfig.UniswapFactory, DEX: pools.UniswapV3},
+		{Name: "camelot_v3", Address: marketConfig.CamelotFactory, DEX: pools.CamelotV3},
+	}, func(pool pools.Pool) quotes.Quoter {
+		if pool.DEX == pools.UniswapV3 {
+			return uni
+		}
+		if pool.DEX == pools.CamelotV3 {
+			return camelot
+		}
+		return nil
+	}, pairPath, func() bool { return busy != nil && busy.Load() })
+	for symbol, amount := range coreAmounts {
+		if token, ok := marketConfig.Tokens[symbol]; ok {
+			pairService.SetRepresentativeAmount(token.Address, amount)
+		}
+	}
+	discoverer.SetObserver(pairService)
+	return engine, coreMarketConfig, pairService, nil
 }
 
 func boundedWorkerCount(name string, fallback int) int {
@@ -530,7 +590,7 @@ func marketAmounts(marketConfig config.MarketConfig, legacyAmount *big.Int) map[
 	return amounts
 }
 
-func marketConfigWithApprovedDynamicAssets(core config.MarketConfig, discoverer universe.PairDiscoverer, caller universe.ChainCaller, uni, camelot quotes.Quoter, amounts map[string]*big.Int) (config.MarketConfig, []string, []string) {
+func marketConfigWithApprovedDynamicAssets(core config.MarketConfig, discoverer universe.PairDiscoverer, caller universe.ChainCaller, uni, camelot quotes.Quoter, amounts map[string]*big.Int) (config.MarketConfig, []string, []string, *universe.Manager) {
 	managerTokens := make(map[string]config.Token)
 	for _, symbol := range core.ExecutionAssets() {
 		if token, ok := core.Tokens[symbol]; ok {
@@ -575,8 +635,8 @@ func marketConfigWithApprovedDynamicAssets(core config.MarketConfig, discoverer 
 		added = append(added, symbol)
 	}
 	expanded := core
-	expanded.ExecutionAssetNames = registry.TokenNames()
-	return expanded, added, universeDecisionStrings(decision, err)
+	expanded.MarketAssetNames = registry.TokenNames()
+	return expanded, added, universeDecisionStrings(decision, err), manager
 }
 
 func approvedDynamicUniverseCandidates(marketConfig config.MarketConfig) []string {

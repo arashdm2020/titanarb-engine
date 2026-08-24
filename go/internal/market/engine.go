@@ -47,6 +47,7 @@ type Engine struct {
 	lastStateBlock    uint64
 	routeFailures     map[string]uint64
 	routeMemory       *nearmiss.RouteMemory
+	universeFeedback  func(string, uint64, uint64)
 }
 
 type Snapshot struct {
@@ -196,7 +197,7 @@ func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, ca
 			validAmounts[symbol] = new(big.Int).Set(amount)
 		}
 	}
-	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.ExecutionAssets(), routeFailures: make(map[string]uint64), routeMemory: nearmiss.NewRouteMemory(8192)}
+	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: evaluator.Events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.MarketAssets(), routeFailures: make(map[string]uint64), routeMemory: nearmiss.NewRouteMemory(8192)}
 }
 
 func (e *Engine) SetUniverseTelemetry(active, dynamic, decisions []string) {
@@ -205,6 +206,12 @@ func (e *Engine) SetUniverseTelemetry(active, dynamic, decisions []string) {
 	e.universeAssets = append([]string(nil), active...)
 	e.dynamicAssets = append([]string(nil), dynamic...)
 	e.universeDecisions = append([]string(nil), decisions...)
+}
+
+// SetUniverseFeedback connects read-only market usefulness observations to the
+// universe manager. It cannot mutate the current graph or execution boundary.
+func (e *Engine) SetUniverseFeedback(feedback func(string, uint64, uint64)) {
+	e.universeFeedback = feedback
 }
 
 // Cycle refreshes the deployed executor's complete allow-listed universe,
@@ -464,7 +471,7 @@ func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, 
 	for _, pool := range e.cache.Snapshot() {
 		previous[strings.ToLower(pool.Address)] = pool
 	}
-	symbols := e.market.ExecutionAssets()
+	symbols := e.market.MarketAssets()
 	type job struct{ from, to string }
 	jobs := make(chan job)
 	results := make(chan struct {
@@ -817,7 +824,41 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		report.QuoteCacheMisses = stats.Misses
 		report.QuoteCacheInvalidations = stats.Invalidations
 	}
+	e.publishUniverseFeedback(allEvaluated)
 	return report
+}
+
+func (e *Engine) publishUniverseFeedback(evaluated []evaluatedRoute) {
+	if e.universeFeedback == nil || len(evaluated) == 0 {
+		return
+	}
+	execution := make(map[string]struct{})
+	for _, a := range e.market.ExecutionAssets() {
+		execution[a] = struct{}{}
+	}
+	type counts struct{ evaluations, useful uint64 }
+	byAsset := make(map[string]counts)
+	for _, item := range evaluated {
+		seen := make(map[string]struct{})
+		for _, asset := range item.route.Symbols {
+			if _, core := execution[asset]; core {
+				continue
+			}
+			if _, ok := seen[asset]; ok {
+				continue
+			}
+			seen[asset] = struct{}{}
+			c := byAsset[asset]
+			c.evaluations++
+			if item.quoteSuccessful && item.nearMiss != nil && item.nearMiss.Score >= 2000 {
+				c.useful++
+			}
+			byAsset[asset] = c
+		}
+	}
+	for asset, c := range byAsset {
+		e.universeFeedback(asset, c.evaluations, c.useful)
+	}
 }
 
 type evaluatedRoute struct {

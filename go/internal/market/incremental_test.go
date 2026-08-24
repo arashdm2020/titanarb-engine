@@ -4,11 +4,23 @@ import (
 	"math/big"
 	"testing"
 
+	"github.com/titanarb/titanarb-go/internal/config"
 	"github.com/titanarb/titanarb-go/internal/nearmiss"
 	"github.com/titanarb/titanarb-go/internal/optimizer"
 	"github.com/titanarb/titanarb-go/internal/pools"
 	"github.com/titanarb/titanarb-go/internal/routes"
 )
+
+func TestUniverseFeedbackUsesDynamicMarketAssetsOnly(t *testing.T) {
+	engine := &Engine{market: config.MarketConfig{ExecutionAssetNames: []string{"USDC"}, Tokens: map[string]config.Token{"USDC": {Symbol: "USDC"}, "DYN": {Symbol: "DYN"}}}}
+	var asset string
+	var evaluations, useful uint64
+	engine.SetUniverseFeedback(func(a string, e, u uint64) { asset, evaluations, useful = a, e, u })
+	engine.publishUniverseFeedback([]evaluatedRoute{{route: routes.Route{Symbols: []string{"USDC", "DYN", "USDC"}}, quoteSuccessful: true, nearMiss: &nearmiss.Record{Score: 3000}}})
+	if asset != "DYN" || evaluations != 1 || useful != 1 {
+		t.Fatalf("feedback=%s %d %d", asset, evaluations, useful)
+	}
+}
 
 func TestRoutesAffectedByDirtyPool(t *testing.T) {
 	p1 := pools.Pool{Address: "0x0000000000000000000000000000000000000001"}

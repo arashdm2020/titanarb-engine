@@ -16,6 +16,13 @@ func selector(signature string) []byte {
 	return h.Sum(nil)[:4]
 }
 
+// EventTopic returns the canonical Keccak-256 topic for an ABI event signature.
+func EventTopic(signature string) string {
+	h := sha3.NewLegacyKeccak256()
+	_, _ = h.Write([]byte(signature))
+	return "0x" + hex.EncodeToString(h.Sum(nil))
+}
+
 // StaticCall encodes calls whose arguments are entirely 32-byte ABI words.
 func StaticCall(signature string, words ...[]byte) string {
 	data := append([]byte{}, selector(signature)...)

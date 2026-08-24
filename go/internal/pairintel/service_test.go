@@ -1,0 +1,86 @@
+package pairintel
+
+import (
+	"context"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+)
+
+type fakeCaller struct {
+	code     string
+	decimals string
+}
+
+func (f fakeCaller) Call(_ context.Context, method string, _ any, out any) error {
+	if method == "eth_getCode" {
+		*(out.(*string)) = f.code
+	}
+	return nil
+}
+func (f fakeCaller) EthCall(context.Context, map[string]string) (string, error) {
+	if f.decimals == "error" {
+		return "", fmt.Errorf("bad")
+	}
+	return f.decimals, nil
+}
+func (fakeCaller) BlockNumber(context.Context) (uint64, error) { return 100, nil }
+
+func TestValidateTokenRejectsNoCodeAndInvalidDecimals(t *testing.T) {
+	cfg := DefaultConfig()
+	cfg.MaxRPS = 1000
+	m := NewMemory(cfg)
+	s := NewService(m, fakeCaller{code: "0x", decimals: wordHex(6)}, nil, nil, nil, "", nil)
+	if s.validateToken(context.Background(), tokenA) {
+		t.Fatal("no-code token accepted")
+	}
+	s = NewService(m, fakeCaller{code: "0x1234", decimals: wordHex(37)}, nil, nil, nil, "", nil)
+	if s.validateToken(context.Background(), tokenA) {
+		t.Fatal("invalid decimals accepted")
+	}
+}
+
+func TestDuplicateFactoryEventHandling(t *testing.T) {
+	s := NewService(NewMemory(DefaultConfig()), nil, nil, nil, nil, "", nil)
+	if s.duplicate(poolA) {
+		t.Fatal("first event duplicate")
+	}
+	if !s.duplicate(strings.ToUpper(poolA)) {
+		t.Fatal("duplicate not detected")
+	}
+}
+
+func TestFactoryEventDecoding(t *testing.T) {
+	topicAddress := func(a string) string { return "0x" + strings.Repeat("0", 24) + strings.TrimPrefix(a, "0x") }
+	data := "0x" + strings.Repeat("0", 64) + strings.Repeat("0", 24) + strings.TrimPrefix(poolA, "0x")
+	entry := factoryLog{Topics: []string{uniPoolCreated, topicAddress(tokenA), topicAddress(tokenB), "0x1f4"}, Data: data, BlockNumber: "0x64"}
+	got, ok := decodeFactoryLog(Factory{DEX: "uniswap_v3"}, entry)
+	if !ok || got.Pool != poolA || got.Fee != 500 || got.Block != 100 {
+		t.Fatalf("decoded=%+v ok=%t", got, ok)
+	}
+}
+
+func TestPairRPCPacing(t *testing.T) {
+	l := newPacedLimiter(100, 1)
+	ctx := context.Background()
+	start := time.Now()
+	if err := l.Wait(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Wait(ctx, nil); err != nil {
+		t.Fatal(err)
+	}
+	if time.Since(start) < 8*time.Millisecond {
+		t.Fatalf("limiter did not pace: %v", time.Since(start))
+	}
+}
+
+func TestPairConfigDefaultsToBoundedShadow(t *testing.T) {
+	cfg := ConfigFromLookup(func(string) string { return "" })
+	if !cfg.Enabled || cfg.Mode != "shadow" || cfg.MaxTrackedPairs != 16 || cfg.MaxShadowPairs != 8 || cfg.MaxDynamicAssets != 4 || cfg.MinObservation != time.Hour || cfg.MaxRPS != .5 || cfg.Burst != 1 {
+		t.Fatalf("defaults=%+v", cfg)
+	}
+}
+
+func wordHex(v uint64) string { return fmt.Sprintf("0x%064x", v) }

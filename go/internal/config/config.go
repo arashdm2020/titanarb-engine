@@ -74,6 +74,7 @@ type MarketConfig struct {
 	SequencerUptimeFeed string
 	ArbGasInfo          string
 	ExecutionAssetNames []string
+	MarketAssetNames    []string
 	BaseAsset           string
 	IntermediateTokens  []string
 	UniswapFeeTiers     []uint32
@@ -101,6 +102,31 @@ func (m MarketConfig) ExecutionAssets() []string {
 	}
 	sort.Strings(assets)
 	return assets
+}
+
+// MarketAssets is the read-only graph membership. It may include observed or
+// operator-approved intermediate assets, but never grants flash-loan/start or
+// execution eligibility. When unset it is exactly ExecutionAssets.
+func (m MarketConfig) MarketAssets() []string {
+	configured := m.MarketAssetNames
+	if len(configured) == 0 {
+		return m.ExecutionAssets()
+	}
+	seen := make(map[string]struct{})
+	for _, symbol := range configured {
+		if _, ok := m.Tokens[symbol]; ok && symbol != "" {
+			seen[symbol] = struct{}{}
+		}
+	}
+	for _, symbol := range m.ExecutionAssets() {
+		seen[symbol] = struct{}{}
+	}
+	out := make([]string, 0, len(seen))
+	for symbol := range seen {
+		out = append(out, symbol)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // DiscoveryAssets is the broader, read-only token registry. Tokens outside

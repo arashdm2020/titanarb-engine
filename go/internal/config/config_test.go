@@ -140,6 +140,10 @@ func TestMarketAssetsSeparateExecutionBoundaryFromReadOnlyDiscovery(t *testing.T
 	if got := strings.Join(market.DiscoveryAssets(), ","); got != "ARB,READ,USDC,WETH" {
 		t.Fatalf("unexpected discovery asset universe %q", got)
 	}
+	market.MarketAssetNames = []string{"USDC", "WETH", "READ"}
+	if got := strings.Join(market.MarketAssets(), ","); got != "ARB,READ,USDC,WETH" {
+		t.Fatalf("market assets did not preserve execution boundary: %q", got)
+	}
 }
 
 func TestExecutionAssetsDoNotUseLegacyBaseWhenNeutralMembershipExists(t *testing.T) {

@@ -117,7 +117,7 @@ func TestApprovedDynamicAssetExpandsMarketOnlyUniverse(t *testing.T) {
 		},
 	}
 
-	expanded, added, decisions := marketConfigWithApprovedDynamicAssets(core, nil, nil, nil, nil, nil)
+	expanded, added, decisions, _ := marketConfigWithApprovedDynamicAssets(core, nil, nil, nil, nil, nil)
 	if len(added) != 1 || added[0] != "USDC_E_BRIDGED_ALTERNATIVE" {
 		t.Fatalf("USDC.e dynamic candidate not approved through universe manager: %v", added)
 	}
@@ -127,7 +127,10 @@ func TestApprovedDynamicAssetExpandsMarketOnlyUniverse(t *testing.T) {
 	if got := strings.Join(core.ExecutionAssets(), ","); got != "USDC,WETH" {
 		t.Fatalf("core execution assets changed: %s", got)
 	}
-	if got := strings.Join(expanded.ExecutionAssets(), ","); got != "USDC,USDC_E_BRIDGED_ALTERNATIVE,WETH" {
+	if got := strings.Join(expanded.ExecutionAssets(), ","); got != "USDC,WETH" {
+		t.Fatalf("execution boundary expanded: %s", got)
+	}
+	if got := strings.Join(expanded.MarketAssets(), ","); got != "USDC,USDC_E_BRIDGED_ALTERNATIVE,WETH" {
 		t.Fatalf("market universe not expanded: %s", got)
 	}
 	if routeUsesOnlyAssets([]string{"USDC", "USDC_E_BRIDGED_ALTERNATIVE", "USDC"}, assetSet(core.ExecutionAssets())) {

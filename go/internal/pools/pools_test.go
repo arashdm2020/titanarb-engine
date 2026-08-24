@@ -3,11 +3,22 @@ package pools
 import (
 	"context"
 	"encoding/hex"
+	"fmt"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/titanarb/titanarb-go/internal/dex"
 )
+
+func TestDecodeSwapLogSignedAmounts(t *testing.T) {
+	negOne := strings.Repeat("f", 64)
+	data := "0x" + negOne + fmt.Sprintf("%064x%064x%064x", 2, 3, 4)
+	swap, ok := decodeSwapLog("0x0000000000000000000000000000000000000001", data, []string{swapTopic}, "0xa")
+	if !ok || swap.Amount0.Int64() != -1 || swap.Amount1.Int64() != 2 || swap.Block != 10 {
+		t.Fatalf("swap=%+v ok=%t", swap, ok)
+	}
+}
 
 type fakeCaller struct {
 	responses map[string]string
