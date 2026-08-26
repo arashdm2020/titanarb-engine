@@ -168,15 +168,28 @@ func TestIdleCycleDoesNotAdvanceFullReconcileCounter(t *testing.T) {
 	}
 }
 
-func TestPeriodicFullReconcileIsRareAndConfigurable(t *testing.T) {
+func TestPeriodicFullReconcileNeverDisablesStaleWorkCancellation(t *testing.T) {
 	engine := &Engine{routeCache: []routes.Route{{Symbols: []string{"USDC", "WETH", "USDC"}}}, lastMaxHops: 4, lastMaxRoutes: 256, cyclesSinceFull: 2_399}
 	options := DefaultSearchOptions()
 	if engine.RequiresFullReconcile(4, 256, options) {
-		t.Fatal("periodic reconciliation triggered before configured interval")
+		t.Fatal("checkpointed reconciliation must remain cancellable")
 	}
 	engine.cyclesSinceFull = 2_400
-	if !engine.RequiresFullReconcile(4, 256, options) {
-		t.Fatal("periodic reconciliation did not trigger at configured interval")
+	if engine.RequiresFullReconcile(4, 256, options) {
+		t.Fatal("periodic reconciliation disabled stale-work cancellation")
+	}
+}
+
+func TestReconciliationCheckpointBuildsBoundedCanonicalJobs(t *testing.T) {
+	engine := &Engine{market: config.MarketConfig{Tokens: map[string]config.Token{
+		"A": {Symbol: "A", Address: "0x1"}, "B": {Symbol: "B", Address: "0x2"}, "C": {Symbol: "C", Address: "0x3"},
+	}, MarketAssetNames: []string{"A", "B", "C"}}}
+	engine.startReconciliation(4, 256)
+	if engine.reconciliation == nil || len(engine.reconciliation.jobs) != 3 || engine.reconciliation.next != 0 {
+		t.Fatalf("unexpected reconciliation checkpoint: %+v", engine.reconciliation)
+	}
+	if got := DefaultSearchOptions().Normalized().ReconcileBatchPairs; got != 1 {
+		t.Fatalf("default reconciliation batch=%d want 1", got)
 	}
 }
 

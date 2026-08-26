@@ -595,6 +595,41 @@ func TestManagedClientSnapshotsTrackProviderBlocks(t *testing.T) {
 	}
 }
 
+func TestFailureTelemetryIncludesProviderStageAndRPCDetails(t *testing.T) {
+	server := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"error":{"code":-32000,"message":"execution reverted"}}`)
+	defer server.Close()
+	client := NewManaged([]ProviderConfig{{Name: "secondary-a", HTTP: server.URL, Tier: "secondary"}}, time.Second, 0, nil)
+	var observed FailureEvent
+	client.SetFailureObserver(func(event FailureEvent) { observed = event })
+	ctx := WithRequestMetadata(WithRequestClass(context.Background(), HotPath), "quote", 123)
+	var out string
+	if err := client.Call(ctx, "eth_call", []any{}, &out); err == nil {
+		t.Fatal("expected RPC error")
+	}
+	if observed.Provider != "secondary-a" || observed.Endpoint != "secondary-a" || observed.Tier != "secondary" || observed.Method != "eth_call" || observed.Stage != "quote" || observed.Block != 123 {
+		t.Fatalf("incomplete failure identity: %+v", observed)
+	}
+	if observed.RPCCode != -32000 || observed.RPCMessage != "execution reverted" || observed.Retryable || observed.RateLimited {
+		t.Fatalf("incorrect RPC classification: %+v", observed)
+	}
+	if got := client.Snapshots()[0].RequestsByStage["quote"]; got != 1 {
+		t.Fatalf("quote stage requests = %d, want 1", got)
+	}
+}
+
+func TestFailureTelemetryClassifiesHTTPRateLimit(t *testing.T) {
+	server := rpcServer(t, http.StatusTooManyRequests, `{"error":"too many requests"}`)
+	defer server.Close()
+	client := NewManaged([]ProviderConfig{{Name: "limited", HTTP: server.URL, Tier: "limited"}}, time.Second, 0, nil)
+	var observed FailureEvent
+	client.SetFailureObserver(func(event FailureEvent) { observed = event })
+	var out string
+	_ = client.Call(WithRequestMetadata(context.Background(), "pool_refresh", 456), "eth_blockNumber", []any{}, &out)
+	if observed.HTTPStatus != http.StatusTooManyRequests || !observed.Retryable || !observed.RateLimited || observed.Cooldown <= 0 {
+		t.Fatalf("incorrect rate-limit telemetry: %+v", observed)
+	}
+}
+
 func TestManagedClientDoesNotDuplicateTransactionBroadcast(t *testing.T) {
 	var primaryCalls atomic.Int32
 	var secondaryCalls atomic.Int32

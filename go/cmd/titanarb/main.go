@@ -83,6 +83,22 @@ func main() {
 		log.Event(logger.Warn, event.Name, "rpc", "RPC provider changed", map[string]any{"from": event.From, "to": event.To, "transport": event.Transport, "reason": event.Reason})
 		alert(operationSink, observability.Server, event.Name, telegram.Warning, "RPC provider changed", map[string]any{"from": event.From, "to": event.To, "transport": event.Transport, "reason": event.Reason})
 	})
+	rpcClient.SetFailureObserver(func(event rpc.FailureEvent) {
+		fields := map[string]any{
+			"provider": event.Provider, "endpoint": event.Endpoint, "tier": event.Tier,
+			"method": event.Method, "http_status": event.HTTPStatus, "json_rpc_code": event.RPCCode,
+			"json_rpc_message": safeRPCMessage(event.RPCMessage), "retryable": event.Retryable,
+			"rate_limited": event.RateLimited, "timeout": event.Timeout,
+			"cooldown_ms": event.Cooldown.Milliseconds(), "stage": event.Stage,
+			"request_latency_ms": event.Latency.Milliseconds(), "block": event.Block,
+		}
+		level := logger.Debug
+		if event.Retryable {
+			level = logger.Warn
+		}
+		log.Event(level, "rpc_request_failed", "rpc", "RPC request failed", fields)
+		publish(operationSink, observability.Errors, "rpc_request_failed", telegram.Warning, "RPC request failed", fields)
+	})
 	chain, err := rpcClient.ChainID(ctx)
 	if err != nil || chain != config.ArbitrumOneChainID {
 		log.Event(logger.Error, "health_check_failed", "rpc", "unable to validate Arbitrum One", nil)
@@ -146,7 +162,7 @@ func main() {
 		executionPipeline, executionErr = buildExecutionPipeline(cfg, marketCfg, rpcClient, m)
 		if executionErr != nil {
 			log.Event(logger.Error, "health_check_failed", "execution", "Go execution runtime disabled: "+executionErr.Error(), nil)
-		} else if executionErr = execution.VerifyDeployment(ctx, rpcClient, cfg, marketCfg, executionPipeline.WalletAddress().Hex()); executionErr != nil {
+		} else if executionErr = execution.VerifyDeployment(rpc.WithRequestMetadata(ctx, "execution", block), rpcClient, cfg, marketCfg, executionPipeline.WalletAddress().Hex()); executionErr != nil {
 			log.Event(logger.Error, "health_check_failed", "execution", "on-chain deployment verification failed: "+executionErr.Error(), nil)
 			executionPipeline = nil
 		} else {
@@ -219,7 +235,8 @@ func main() {
 							continue
 						}
 						if executionPipeline != nil {
-							executionCtx, cancelExecution := context.WithTimeout(rpc.WithRequestClass(ctx, rpc.Critical), 45*time.Second)
+							criticalCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.Critical), "execution", trigger.Block)
+							executionCtx, cancelExecution := context.WithTimeout(criticalCtx, 45*time.Second)
 							result := executionPipeline.Process(executionCtx, outcome.Opportunity)
 							cancelExecution()
 							if strings.HasPrefix(result.Reason, "stale candidate:") {
@@ -350,6 +367,15 @@ func main() {
 				"active_wss_provider":              w.ActiveProvider(),
 				"rpc_provider_health":              rpcProviderHealthString(rpcClient.Snapshots()),
 				"rpc_tier_traffic":                 rpcTierTrafficString(rpcClient.Snapshots()),
+				"rpc_provider_stage_usage":         rpcProviderStageString(rpcClient.Snapshots()),
+				"reconciliation_pending":           report.ReconcilePending,
+				"reconciliation_batch_size":        report.ReconcileBatchSize,
+				"reconciliation_pairs_done":        report.ReconcilePairsDone,
+				"reconciliation_pairs_total":       report.ReconcilePairsTotal,
+				"reconciliation_rpc_calls":         report.ReconcileRPC,
+				"reconciliation_duration_ms":       report.ReconcileDuration.Milliseconds(),
+				"reconciliation_completed":         report.ReconcileCompleted,
+				"reconciliation_error":             report.ReconcileError,
 			}
 			if pairService != nil {
 				pairStats := pairService.Snapshot()
@@ -924,6 +950,7 @@ func marketSearchOptions(settings runtimeconfig.Settings) market.SearchOptions {
 		MaxOptimizedRoutes:       envIntBounded("MAX_OPTIMIZED_ROUTES_PER_CYCLE", 8, 1, 32),
 		NormalOptimizerSamples:   envIntBounded("NORMAL_MAX_SAMPLES", 3, 2, 16),
 		FullReconcileEvery:       uint64(envIntBounded("FULL_RECONCILE_EVERY_CYCLES", 2_400, 240, 100_000)),
+		ReconcileBatchPairs:      envIntBounded("RECONCILE_BATCH_PAIRS", 1, 1, 4),
 		DisablePreQuoteRanking:   strings.EqualFold(strings.TrimSpace(os.Getenv("PREQUOTE_RANKING_ENABLED")), "false"),
 		ExploreRatioBPS:          preQuoteExploreBPS(),
 		PersistentQuoteCache:     envEnabled("QUOTE_CACHE_ENABLED", true),
@@ -1061,6 +1088,30 @@ func rpcTierTrafficString(snapshots []rpc.ProviderSnapshot) string {
 		parts = append(parts, fmt.Sprintf("%s:%.1f", tier, float64(counts[tier])*100/float64(total)))
 	}
 	return strings.Join(parts, ",")
+}
+
+func rpcProviderStageString(snapshots []rpc.ProviderSnapshot) string {
+	parts := make([]string, 0, len(snapshots))
+	for _, snapshot := range snapshots {
+		stages := make([]string, 0, len(snapshot.RequestsByStage))
+		for stage, count := range snapshot.RequestsByStage {
+			stages = append(stages, fmt.Sprintf("%s:%d", stage, count))
+		}
+		sort.Strings(stages)
+		parts = append(parts, snapshot.Name+"="+strings.Join(stages, ","))
+	}
+	return strings.Join(parts, ";")
+}
+
+func safeRPCMessage(message string) string {
+	message = strings.TrimSpace(message)
+	if strings.Contains(message, "://") {
+		return "[redacted]"
+	}
+	if len(message) > 240 {
+		return message[:240]
+	}
+	return message
 }
 
 func preQuoteExploreBPS() int {

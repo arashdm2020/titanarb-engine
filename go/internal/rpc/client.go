@@ -29,27 +29,31 @@ const (
 )
 
 type Error struct {
-	Kind ErrorKind
-	Err  error
+	Kind       ErrorKind
+	Err        error
+	HTTPStatus int
+	RPCCode    int
+	RPCMessage string
 }
 
 func (e *Error) Error() string { return e.Err.Error() }
 func (e *Error) Unwrap() error { return e.Err }
 
 type Client struct {
-	endpoint       string
-	http           *http.Client
-	retries        int
-	metrics        *metrics.Metrics
-	providers      []*providerState
-	readLimiter    *rateLimiter
-	premiumLimiter *rateLimiter
-	ethBudget      *minuteBudget
-	hotBudget      *minuteBudget
-	mu             sync.Mutex
-	active         int
-	lastSwitch     time.Time
-	observer       func(Event)
+	endpoint        string
+	http            *http.Client
+	retries         int
+	metrics         *metrics.Metrics
+	providers       []*providerState
+	readLimiter     *rateLimiter
+	premiumLimiter  *rateLimiter
+	ethBudget       *minuteBudget
+	hotBudget       *minuteBudget
+	mu              sync.Mutex
+	active          int
+	lastSwitch      time.Time
+	observer        func(Event)
+	failureObserver func(FailureEvent)
 }
 
 type RequestClass string
@@ -62,6 +66,21 @@ const (
 )
 
 type requestClassKey struct{}
+type requestMetadataKey struct{}
+
+type RequestMetadata struct {
+	Stage string
+	Block uint64
+}
+
+type FailureEvent struct {
+	Provider, Endpoint, Tier, Method, Stage string
+	HTTPStatus, RPCCode                     int
+	RPCMessage                              string
+	Retryable, RateLimited, Timeout         bool
+	Cooldown, Latency                       time.Duration
+	Block                                   uint64
+}
 
 func WithRequestClass(ctx context.Context, class RequestClass) context.Context {
 	return context.WithValue(ctx, requestClassKey{}, class)
@@ -71,6 +90,17 @@ func requestClass(ctx context.Context) RequestClass {
 		return v
 	}
 	return Standard
+}
+
+func WithRequestMetadata(ctx context.Context, stage string, block uint64) context.Context {
+	return context.WithValue(ctx, requestMetadataKey{}, RequestMetadata{Stage: strings.TrimSpace(stage), Block: block})
+}
+
+func requestMetadata(ctx context.Context, class RequestClass) RequestMetadata {
+	if value, ok := ctx.Value(requestMetadataKey{}).(RequestMetadata); ok && value.Stage != "" {
+		return value
+	}
+	return RequestMetadata{Stage: string(class)}
 }
 
 func New(endpoint string, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -127,6 +157,7 @@ type ProviderSnapshot struct {
 	Forbidden          uint64
 	CooldownEvents     uint64
 	LatencyP95         time.Duration
+	RequestsByStage    map[string]uint64
 }
 
 type Event struct {
@@ -161,6 +192,7 @@ type providerState struct {
 	forbidden          uint64
 	cooldownEvents     uint64
 	latencySamples     []time.Duration
+	stageRequests      map[string]uint64
 }
 
 func NewManaged(configs []ProviderConfig, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -179,7 +211,7 @@ func newManaged(configs []ProviderConfig, timeout time.Duration, retries int, m 
 			cfg.Name = "provider"
 		}
 		cfg.Tier = normalizeTier(cfg.Tier)
-		client.providers = append(client.providers, &providerState{cfg: cfg, limiter: newRateLimiterWithBurst(effectiveRPS(cfg), effectiveBurst(cfg))})
+		client.providers = append(client.providers, &providerState{cfg: cfg, limiter: newRateLimiterWithBurst(effectiveRPS(cfg), effectiveBurst(cfg)), stageRequests: make(map[string]uint64)})
 	}
 	if len(client.providers) > 0 {
 		client.endpoint = client.providers[0].cfg.HTTP
@@ -190,6 +222,12 @@ func newManaged(configs []ProviderConfig, timeout time.Duration, retries int, m 
 func (c *Client) SetObserver(observer func(Event)) {
 	c.mu.Lock()
 	c.observer = observer
+	c.mu.Unlock()
+}
+
+func (c *Client) SetFailureObserver(observer func(FailureEvent)) {
+	c.mu.Lock()
+	c.failureObserver = observer
 	c.mu.Unlock()
 }
 
@@ -235,10 +273,10 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 	class := requestClass(ctx)
 	for attempt := 0; attempt <= c.retries; attempt++ {
 		if method == "eth_call" && class == HotPath && c.hotBudget != nil && !c.hotBudget.Allow() {
-			return &Error{Network, errors.New("RPC hot-path minute budget exhausted")}
+			return &Error{Kind: Network, Err: errors.New("RPC hot-path minute budget exhausted")}
 		}
 		if method == "eth_call" && class != Critical && c.ethBudget != nil && !c.ethBudget.Allow() {
-			return &Error{Network, errors.New("RPC eth_call minute budget exhausted")}
+			return &Error{Kind: Network, Err: errors.New("RPC eth_call minute budget exhausted")}
 		}
 		if class != Critical && c.readLimiter != nil {
 			if err := c.readLimiter.Wait(ctx); err != nil {
@@ -247,7 +285,7 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 		}
 		provider, providerIndex, providerDelay := c.chooseReadProvider(class)
 		if provider == nil {
-			return &Error{Network, errors.New("no eligible RPC provider configured")}
+			return &Error{Kind: Network, Err: errors.New("no eligible RPC provider configured")}
 		}
 		if provider.cfg.Tier == "premium" && class != Critical && c.premiumLimiter != nil {
 			if err := c.premiumLimiter.Wait(ctx); err != nil {
@@ -257,20 +295,26 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 		if err := waitDelay(ctx, providerDelay); err != nil {
 			return err
 		}
-		c.recordRequest(provider, method, class)
+		metadata := requestMetadata(ctx, class)
+		c.recordRequest(provider, method, class, metadata.Stage)
+		started := time.Now()
 		err := c.callProvider(ctx, provider, body, out)
 		if err == nil {
 			c.recordSuccess(provider, method, out)
 			return nil
 		}
+		latency := time.Since(started)
 		if ctx.Err() != nil {
+			c.emitFailure(provider, method, metadata, err, latency, 0)
 			return err
 		}
 		if !providerFailure(err) {
+			c.emitFailure(provider, method, metadata, err, latency, 0)
 			return err
 		}
 		last = err
-		c.recordFailure(provider, err)
+		cooldown := c.recordFailure(provider, err)
+		c.emitFailure(provider, method, metadata, err, latency, cooldown)
 		c.failover(providerIndex, failureReason(err))
 		if c.metrics != nil {
 			c.metrics.IncRPCErrors()
@@ -289,26 +333,32 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 func (c *Client) callOnceNoFailover(ctx context.Context, method string, body []byte, out any) error {
 	provider, _ := c.chooseProvider()
 	if provider == nil {
-		return &Error{Network, errors.New("no RPC provider configured")}
+		return &Error{Kind: Network, Err: errors.New("no RPC provider configured")}
 	}
 	if err := provider.limiter.Wait(ctx); err != nil {
 		return err
 	}
-	c.recordRequest(provider, method, Critical)
+	metadata := requestMetadata(ctx, Critical)
+	c.recordRequest(provider, method, Critical, metadata.Stage)
+	started := time.Now()
 	err := c.callProvider(ctx, provider, body, out)
 	if err == nil {
 		c.recordSuccess(provider, method, out)
 		return nil
 	}
+	latency := time.Since(started)
 	if ctx.Err() != nil {
+		c.emitFailure(provider, method, metadata, err, latency, 0)
 		return err
 	}
+	cooldown := time.Duration(0)
 	if providerFailure(err) {
-		c.recordFailure(provider, err)
+		cooldown = c.recordFailure(provider, err)
 		if c.metrics != nil {
 			c.metrics.IncRPCErrors()
 		}
 	}
+	c.emitFailure(provider, method, metadata, err, latency, cooldown)
 	return err
 }
 
@@ -334,15 +384,15 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
 		if quotaLimitMessage(string(data)) {
-			return &Error{HTTP, errors.New("rpc HTTP status 429: quota exhausted")}
+			return &Error{Kind: HTTP, Err: errors.New("rpc HTTP status 429: quota exhausted"), HTTPStatus: resp.StatusCode}
 		}
-		return &Error{HTTP, fmt.Errorf("rpc HTTP status %d", resp.StatusCode)}
+		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode}
 	}
 	if resp.StatusCode >= 500 {
-		return &Error{HTTP, fmt.Errorf("rpc HTTP status %d", resp.StatusCode)}
+		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode}
 	}
 	if resp.StatusCode/100 != 2 {
-		return &Error{HTTP, fmt.Errorf("rpc HTTP status %d", resp.StatusCode)}
+		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode}
 	}
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
@@ -357,11 +407,11 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 	if envelope.Error != nil {
 		if rpcRateLimited(envelope.Error.Code, envelope.Error.Message) {
 			if quotaLimitMessage(envelope.Error.Message) {
-				return &Error{HTTP, errors.New("rpc HTTP status 429: quota exhausted")}
+				return &Error{Kind: HTTP, Err: errors.New("rpc HTTP status 429: quota exhausted"), HTTPStatus: resp.StatusCode, RPCCode: envelope.Error.Code, RPCMessage: envelope.Error.Message}
 			}
-			return &Error{HTTP, errors.New("rpc HTTP status 429")}
+			return &Error{Kind: HTTP, Err: errors.New("rpc HTTP status 429"), HTTPStatus: resp.StatusCode, RPCCode: envelope.Error.Code, RPCMessage: envelope.Error.Message}
 		}
-		return &Error{RPC, errors.New(envelope.Error.Message)}
+		return &Error{Kind: RPC, Err: errors.New(envelope.Error.Message), HTTPStatus: resp.StatusCode, RPCCode: envelope.Error.Code, RPCMessage: envelope.Error.Message}
 	}
 	if err = json.Unmarshal(envelope.Result, out); err != nil {
 		return err
@@ -548,12 +598,13 @@ func providerLagged(provider *providerState, best uint64, now time.Time) bool {
 	return best-provider.latestBlock > uint64(provider.cfg.MaxBlockLag)
 }
 
-func (c *Client) recordRequest(provider *providerState, method string, class RequestClass) {
+func (c *Client) recordRequest(provider *providerState, method string, class RequestClass, stage string) {
 	if c.metrics != nil {
 		c.metrics.IncRPCCalls()
 	}
 	c.mu.Lock()
 	provider.requests++
+	provider.stageRequests[stage]++
 	if method == "eth_call" {
 		provider.ethCallRequests++
 		if class == HotPath {
@@ -583,7 +634,7 @@ func (c *Client) recordSuccess(provider *providerState, method string, out any) 
 	}
 }
 
-func (c *Client) recordFailure(provider *providerState, err error) {
+func (c *Client) recordFailure(provider *providerState, err error) time.Duration {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	provider.failures++
@@ -610,6 +661,25 @@ func (c *Client) recordFailure(provider *providerState, err error) {
 		if provider.cooldownUntil.Before(minimumCooldown) {
 			provider.cooldownUntil = minimumCooldown
 		}
+	}
+	return positiveDuration(provider.cooldownUntil.Sub(time.Now()))
+}
+
+func (c *Client) emitFailure(provider *providerState, method string, metadata RequestMetadata, err error, latency, cooldown time.Duration) {
+	if err == nil || provider == nil {
+		return
+	}
+	var rpcErr *Error
+	event := FailureEvent{Provider: provider.cfg.Name, Endpoint: provider.cfg.Name, Tier: provider.cfg.Tier, Method: method, Stage: metadata.Stage, Retryable: providerFailure(err), RateLimited: failureReason(err) == "rate_limit", Timeout: errors.Is(err, context.DeadlineExceeded), Cooldown: cooldown, Latency: latency, Block: metadata.Block}
+	if errors.As(err, &rpcErr) {
+		event.HTTPStatus, event.RPCCode, event.RPCMessage = rpcErr.HTTPStatus, rpcErr.RPCCode, rpcErr.RPCMessage
+		event.Timeout = event.Timeout || rpcErr.Kind == Timeout
+	}
+	c.mu.Lock()
+	observer := c.failureObserver
+	c.mu.Unlock()
+	if observer != nil {
+		observer(event)
 	}
 }
 
@@ -745,9 +815,18 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 			EthCallRequests:    provider.ethCallRequests, QuoteRequests: provider.quoteRequests,
 			Successes: provider.successes, SuccessRatePct: successRate, Forbidden: provider.forbidden,
 			CooldownEvents: provider.cooldownEvents, LatencyP95: durationP95(provider.latencySamples),
+			RequestsByStage: cloneStageRequests(provider.stageRequests),
 		})
 	}
 	return out
+}
+
+func cloneStageRequests(input map[string]uint64) map[string]uint64 {
+	output := make(map[string]uint64, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
 }
 
 func normalizeTier(tier string) string {
@@ -769,10 +848,10 @@ func tierRank(class RequestClass, tier string) int {
 		if tier == "limited" {
 			return 1
 		}
-		if tier == "emergency" {
+		if tier == "premium" {
 			return 2
 		}
-		return 99
+		return 3
 	case HotPath, Critical:
 		if tier == "premium" {
 			return 0
@@ -1064,7 +1143,7 @@ func hexBig(raw string) (*big.Int, error) {
 }
 func classify(err error) *Error {
 	if errors.Is(err, context.DeadlineExceeded) {
-		return &Error{Timeout, err}
+		return &Error{Kind: Timeout, Err: err}
 	}
-	return &Error{Network, err}
+	return &Error{Kind: Network, Err: err}
 }

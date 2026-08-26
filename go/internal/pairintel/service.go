@@ -99,7 +99,7 @@ func (s *Service) advanceHead(block uint64) {
 }
 
 func (s *Service) Run(ctx context.Context) {
-	ctx = rpc.WithRequestClass(ctx, rpc.Background)
+	ctx = rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.Background), "pairintel", 0)
 	if s == nil || s.Memory == nil || !s.Memory.cfg.Enabled || !s.started.CompareAndSwap(false, true) {
 		return
 	}

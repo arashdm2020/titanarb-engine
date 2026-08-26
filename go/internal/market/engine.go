@@ -60,6 +60,21 @@ type Engine struct {
 	pairScore          func(string, string) (float64, bool)
 	crossVenueShareBPS int
 	recentNearMisses   []nearmiss.Record
+	reconciliation     *reconcileState
+	forceEvaluateNext  bool
+}
+
+type reconcileJob struct{ from, to string }
+
+type reconcileState struct {
+	jobs       []reconcileJob
+	next       int
+	byPair     map[routes.Pair][]pools.Pool
+	discovered map[string]pools.Pool
+	maxHops    int
+	maxRoutes  int
+	batches    uint64
+	started    time.Time
 }
 
 type Snapshot struct {
@@ -123,6 +138,14 @@ type CycleReport struct {
 	RPCPerEvaluatedRoute    float64
 	RPCPerOptimizerRoute    float64
 	ScoreDeciles            map[string]map[string]any
+	ReconcilePending        bool
+	ReconcileBatchSize      int
+	ReconcilePairsDone      int
+	ReconcilePairsTotal     int
+	ReconcileRPC            uint64
+	ReconcileDuration       time.Duration
+	ReconcileCompleted      bool
+	ReconcileError          string
 }
 
 const incrementalRefreshBatchBlocks = 8
@@ -139,6 +162,7 @@ type SearchOptions struct {
 	MaxOptimizedRoutes       int
 	NormalOptimizerSamples   int
 	FullReconcileEvery       uint64
+	ReconcileBatchPairs      int
 	DisablePreQuoteRanking   bool
 	ExploreRatioBPS          int
 	PersistentQuoteCache     bool
@@ -157,6 +181,7 @@ func DefaultSearchOptions() SearchOptions {
 		MaxOptimizedRoutes:       8,
 		NormalOptimizerSamples:   3,
 		FullReconcileEvery:       2_400,
+		ReconcileBatchPairs:      1,
 		DisablePreQuoteRanking:   false,
 		ExploreRatioBPS:          2_000,
 		PersistentQuoteCache:     true,
@@ -203,6 +228,12 @@ func (o SearchOptions) Normalized() SearchOptions {
 	}
 	if o.FullReconcileEvery == 0 {
 		o.FullReconcileEvery = defaults.FullReconcileEvery
+	}
+	if o.ReconcileBatchPairs < 1 {
+		o.ReconcileBatchPairs = defaults.ReconcileBatchPairs
+	}
+	if o.ReconcileBatchPairs > 4 {
+		o.ReconcileBatchPairs = 4
 	}
 	if o.ExploreRatioBPS < 0 {
 		o.ExploreRatioBPS = 0
@@ -406,25 +437,11 @@ func (e *Engine) CycleAt(ctx context.Context, stateBlock uint64, maxHops, maxRou
 	return e.CycleAtWithSearchOptions(ctx, stateBlock, maxHops, maxRoutes, volatilityWeight, DefaultSearchOptions())
 }
 
-// RequiresFullReconcile lets the runtime avoid cancelling the bounded
-// discovery transaction halfway through and immediately restarting it on the
-// next head. It is read-only and is called by the single-owner scheduler.
+// RequiresFullReconcile reports whether a cycle needs an uninterruptible full
+// scan. Reconciliation is checkpointed and interruptible, so it never blocks
+// stale-work cancellation in the scheduler.
 func (e *Engine) RequiresFullReconcile(maxHops, maxRoutes int, options SearchOptions) bool {
-	if e == nil {
-		return false
-	}
-	options = options.Normalized()
-	if maxHops < 2 {
-		maxHops = 2
-	}
-	if maxHops > 4 {
-		maxHops = 4
-	}
-	e.pendingMu.Lock()
-	pending := e.pendingMarket != nil
-	e.pendingMu.Unlock()
-	searchEnvelopeChanged := maxHops != e.lastMaxHops || maxRoutes != e.lastMaxRoutes || pending || e.forceFull
-	return len(e.routeCache) == 0 || e.cyclesSinceFull >= options.FullReconcileEvery || searchEnvelopeChanged
+	return false
 }
 
 // CycleAtWithSearchOptions lets runtime risk profiles widen or narrow the
@@ -451,10 +468,29 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	}
 	hadRoutes := len(e.routeCache) > 0
 	searchEnvelopeChanged := maxHops != e.lastMaxHops || maxRoutes != e.lastMaxRoutes || marketChanged || e.forceFull
-	full := !hadRoutes || e.cyclesSinceFull >= options.FullReconcileEvery || searchEnvelopeChanged
-	if !full && shouldDeferIncrementalRefresh(e.lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
+	needsReconcile := !hadRoutes || e.cyclesSinceFull >= options.FullReconcileEvery || searchEnvelopeChanged
+	if needsReconcile && (e.reconciliation == nil || e.reconciliation.maxHops != maxHops || e.reconciliation.maxRoutes != maxRoutes || marketChanged) {
+		e.startReconciliation(maxHops, maxRoutes)
+	}
+	if !hadRoutes {
+		e.advanceReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
+		report.Duration = time.Since(started)
+		report.Routes = append([]routes.Route(nil), e.routeCache...)
+		report.RouteCountAfter = len(report.Routes)
+		report.RoutesByHop = routesByHop(report.Routes)
+		report.DEXRoutes = routeDEXDiversity(report.Routes)
+		if len(report.Routes) == 0 {
+			report.NoQuoteReason = "reconciliation_in_progress"
+		}
+		if stateBlock > 0 {
+			e.lastStateBlock = stateBlock
+		}
+		return report, nil
+	}
+	if shouldDeferIncrementalRefresh(e.lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
 		routesFound := refreshRoutes(e.routeCache, liquidPools(e.cache.Snapshot()))
 		report.RoutesReused = uint64(len(routesFound))
+		e.advanceReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
 		report.Duration = time.Since(started)
 		report.Routes = routesFound
 		report.RouteCountAfter = len(routesFound)
@@ -470,35 +506,19 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	var dirty map[string]struct{}
 	var err error
 	rpcAtStart := e.rpcCalls()
-	forceAllEvaluation := !hadRoutes || searchEnvelopeChanged
-	if full {
-		e.forceFull = false
-		beforePools := e.cache.Snapshot()
-		e.routeCache, err = e.fullReconcile(rpc.WithRequestClass(ctx, rpc.Background), stateBlock, maxHops, maxRoutes)
-		if err != nil {
-			return report, err
-		}
-		e.cyclesSinceFull = 0
-		e.lastMaxHops, e.lastMaxRoutes = maxHops, maxRoutes
-		report.FullReconcile = true
-		dirty = changedPoolAddresses(beforePools, e.cache.Snapshot())
-		if forceAllEvaluation {
-			for _, pool := range e.cache.Snapshot() {
-				dirty[strings.ToLower(pool.Address)] = struct{}{}
-			}
-		}
-	} else {
-		fromBlock := stateBlock
-		if e.lastStateBlock > 0 && e.lastStateBlock < stateBlock {
-			fromBlock = e.lastStateBlock + 1
-		}
-		dirty, err = e.incrementalRefresh(rpc.WithRequestClass(ctx, rpc.Background), fromBlock, stateBlock)
-		if err != nil {
-			return report, err
-		}
-		if shouldAdvanceFullReconcileCounter(dirty) {
-			e.cyclesSinceFull++
-		}
+	forceAllEvaluation := e.forceEvaluateNext
+	e.forceEvaluateNext = false
+	fromBlock := stateBlock
+	if e.lastStateBlock > 0 && e.lastStateBlock < stateBlock {
+		fromBlock = e.lastStateBlock + 1
+	}
+	refreshCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.Background), "pool_refresh", stateBlock)
+	dirty, err = e.incrementalRefresh(refreshCtx, fromBlock, stateBlock)
+	if err != nil {
+		return report, err
+	}
+	if shouldAdvanceFullReconcileCounter(dirty) {
+		e.cyclesSinceFull++
 	}
 	rpcAfterRefresh := e.rpcCalls()
 	report.DirtyPools = uint64(len(dirty))
@@ -589,6 +609,8 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.QuoteDedupHits = evaluation.QuoteDedupHits
 	report.OptimizerSaved = evaluation.OptimizerSaved
 	report.RoutesSkippedByPreQuote = evaluation.RoutesSkippedByPreQuote
+	e.advanceReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
+	report.RPCCallsByStage["reconcile"] = report.ReconcileRPC
 	report.Duration = time.Since(started)
 	report.Routes = routesFound
 	report.RouteCountAfter = len(routesFound)
@@ -609,6 +631,119 @@ func shouldDeferIncrementalRefresh(lastStateBlock, stateBlock uint64, batchBlock
 		return false
 	}
 	return stateBlock-lastStateBlock < batchBlocks
+}
+
+func (e *Engine) startReconciliation(maxHops, maxRoutes int) {
+	symbols := e.market.MarketAssets()
+	state := &reconcileState{
+		byPair:     make(map[routes.Pair][]pools.Pool),
+		discovered: make(map[string]pools.Pool),
+		maxHops:    maxHops,
+		maxRoutes:  maxRoutes,
+		started:    time.Now(),
+	}
+	for i, from := range symbols {
+		for _, to := range symbols[i+1:] {
+			if e.marketPairAllowed(from, to) {
+				state.jobs = append(state.jobs, reconcileJob{from: from, to: to})
+			}
+		}
+	}
+	e.reconciliation = state
+}
+
+// advanceReconciliationBatch performs a small resumable unit of discovery.
+// Existing routes/cache remain live until the final atomic commit.
+func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint64, batchSize int, report *CycleReport) {
+	state := e.reconciliation
+	if state == nil || report == nil {
+		return
+	}
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	report.ReconcilePending = true
+	report.ReconcileBatchSize = batchSize
+	report.ReconcilePairsDone = state.next
+	report.ReconcilePairsTotal = len(state.jobs)
+	started := time.Now()
+	rpcBefore := e.rpcCalls()
+	reconcileCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.Background), "reconcile", stateBlock)
+	batchCtx, cancel := context.WithTimeout(reconcileCtx, 4*time.Second)
+	defer cancel()
+	processed := 0
+	for state.next < len(state.jobs) && processed < batchSize {
+		job := state.jobs[state.next]
+		a, aOK := e.market.Tokens[job.from]
+		b, bOK := e.market.Tokens[job.to]
+		if !aOK || !bOK {
+			state.next++
+			processed++
+			continue
+		}
+		found, err := e.discoverer.DiscoverPairAt(batchCtx, a.Address, b.Address, stateBlock)
+		if err != nil {
+			report.ReconcileError = fmt.Sprintf("%T", err)
+			break
+		}
+		pair := routes.Pair{From: job.from, To: job.to}
+		state.byPair[pair] = found
+		state.byPair[routes.Pair{From: job.to, To: job.from}] = found
+		for _, pool := range found {
+			state.discovered[strings.ToLower(pool.Address)] = pool
+			if e.metrics != nil {
+				e.metrics.IncPoolsDiscovered()
+				if pool.DEX == pools.UniswapV3 {
+					e.metrics.IncUniswapPools()
+				} else if pool.DEX == pools.CamelotV3 {
+					e.metrics.IncCamelotPools()
+				}
+			}
+		}
+		state.next++
+		processed++
+	}
+	state.batches++
+	report.ReconcileBatchSize = processed
+	report.ReconcilePairsDone = state.next
+	report.ReconcileRPC = safeUint64Delta(e.rpcCalls(), rpcBefore)
+	report.ReconcileDuration = time.Since(started)
+	if state.next < len(state.jobs) {
+		return
+	}
+
+	current := make(map[string]pools.Pool)
+	for _, pool := range e.cache.Snapshot() {
+		current[strings.ToLower(pool.Address)] = pool
+	}
+	discovered := make([]pools.Pool, 0, len(state.discovered))
+	for address, pool := range state.discovered {
+		if newer, ok := current[address]; ok && newer.LastUpdatedBlock > pool.LastUpdatedBlock {
+			pool = newer
+		}
+		discovered = append(discovered, pool)
+	}
+	sort.Slice(discovered, func(i, j int) bool {
+		return strings.ToLower(discovered[i].Address) < strings.ToLower(discovered[j].Address)
+	})
+	symbols := e.market.MarketAssets()
+	routesFound := routes.BuildForStartsWithCrossVenueShare(e.loanAssets(), symbols, state.byPair, state.maxRoutes, e.crossVenueShareBPS)
+	filtered := routesFound[:0]
+	for _, route := range routesFound {
+		if len(route.Hops) <= state.maxHops {
+			filtered = append(filtered, route)
+		}
+	}
+	e.cache.Replace(discovered)
+	e.routeCache = append([]routes.Route(nil), filtered...)
+	e.cyclesSinceFull = 0
+	e.lastMaxHops, e.lastMaxRoutes = state.maxHops, state.maxRoutes
+	e.forceFull = false
+	e.forceEvaluateNext = true
+	e.reconciliation = nil
+	report.ReconcilePending = false
+	report.ReconcileCompleted = true
+	report.FullReconcile = true
 }
 
 func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int) ([]routes.Route, error) {
@@ -1089,7 +1224,8 @@ func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route,
 			defer wg.Done()
 			for route := range jobs {
 				started := time.Now()
-				op, err := e.evaluator.Evaluate(rpc.WithRequestClass(ctx, rpc.HotPath), route, amount)
+				quoteCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "quote", stateBlock)
+				op, err := e.evaluator.Evaluate(quoteCtx, route, amount)
 				if err != nil || op == nil || op.ExpectedProfit == nil {
 					results <- evaluatedRoute{route: route, preQuoteScore: preQuoteScores[routeKey(route)]}
 					continue
@@ -1826,7 +1962,7 @@ func scoreDecileQuality(input []evaluatedRoute) map[string]map[string]any {
 }
 
 func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []optimizerCandidate, current *big.Int, samples, normalSamples, sampleBudget int, adaptive, earlyStop bool) evaluationReport {
-	ctx = rpc.WithRequestClass(ctx, rpc.HotPath)
+	ctx = rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "optimizer", e.lastStateBlock)
 	if !adaptive {
 		return e.optimizeRoutesLegacy(ctx, asset, candidates, current, samples)
 	}
