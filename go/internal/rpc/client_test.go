@@ -510,6 +510,8 @@ func TestSaturatedPremiumHotPathSpillsToHealthySecondary(t *testing.T) {
 	client := NewManaged([]ProviderConfig{
 		{Name: "alchemy_1", HTTP: "http://alchemy.invalid", Tier: "premium", TargetRPS: 1},
 		{Name: "ankr_1", HTTP: "http://ankr.invalid", Tier: "secondary", TargetRPS: 4},
+		{Name: "quicknode", HTTP: "http://quicknode.invalid", Tier: "limited", TargetRPS: 10},
+		{Name: "official", HTTP: "http://official.invalid", Tier: "emergency", TargetRPS: 10},
 	}, time.Second, 0, nil)
 	client.providers[0].requests = 100
 	client.providers[0].latencyEMA = 20 * time.Millisecond

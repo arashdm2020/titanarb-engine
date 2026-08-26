@@ -434,6 +434,9 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 			if rank >= 99 {
 				continue
 			}
+			if flexibleHotPath && rank > 1 {
+				continue
+			}
 			if pass == 0 && now.Before(provider.probationUntil) {
 				continue
 			}
