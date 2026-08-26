@@ -675,6 +675,9 @@ func (c *Client) emitFailure(provider *providerState, method string, metadata Re
 		event.HTTPStatus, event.RPCCode, event.RPCMessage = rpcErr.HTTPStatus, rpcErr.RPCCode, rpcErr.RPCMessage
 		event.Timeout = event.Timeout || rpcErr.Kind == Timeout
 	}
+	if strings.TrimSpace(event.RPCMessage) == "" {
+		event.RPCMessage = err.Error()
+	}
 	c.mu.Lock()
 	observer := c.failureObserver
 	c.mu.Unlock()

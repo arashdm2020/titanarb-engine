@@ -668,7 +668,10 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 	report.ReconcilePairsTotal = len(state.jobs)
 	started := time.Now()
 	rpcBefore := e.rpcCalls()
-	reconcileCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.Background), "reconcile", stateBlock)
+	// A superseded market cycle must not strand the current small checkpoint
+	// forever. Finish at most this one bounded batch, then the scheduler resumes
+	// the remaining jobs against its newest head.
+	reconcileCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(context.WithoutCancel(ctx), rpc.Background), "reconcile", stateBlock)
 	batchCtx, cancel := context.WithTimeout(reconcileCtx, 4*time.Second)
 	defer cancel()
 	processed := 0
@@ -684,7 +687,15 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 		found, err := e.discoverer.DiscoverPairAt(batchCtx, a.Address, b.Address, stateBlock)
 		if err != nil {
 			report.ReconcileError = fmt.Sprintf("%T", err)
-			break
+			if batchCtx.Err() != nil {
+				break
+			}
+			// Preserve the existing cache entry and let the next periodic
+			// reconciliation retry this pair; one unavailable pair/provider must
+			// not permanently block checkpoint progress.
+			state.next++
+			processed++
+			continue
 		}
 		pair := routes.Pair{From: job.from, To: job.to}
 		state.byPair[pair] = found
