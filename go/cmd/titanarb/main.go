@@ -372,6 +372,8 @@ func main() {
 				"reconciliation_batch_size":        report.ReconcileBatchSize,
 				"reconciliation_pairs_done":        report.ReconcilePairsDone,
 				"reconciliation_pairs_total":       report.ReconcilePairsTotal,
+				"reconciliation_units_done":        report.ReconcileUnitsDone,
+				"reconciliation_units_total":       report.ReconcileUnitsTotal,
 				"reconciliation_rpc_calls":         report.ReconcileRPC,
 				"reconciliation_duration_ms":       report.ReconcileDuration.Milliseconds(),
 				"reconciliation_completed":         report.ReconcileCompleted,

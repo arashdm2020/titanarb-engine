@@ -99,6 +99,9 @@ func TestPrimarySecondaryRPCProviderConfig(t *testing.T) {
 	if cfg.RPCProviders[0].MaxBlockLag != 4 || cfg.RPCProviders[1].MaxBlockLag != 4 {
 		t.Fatalf("provider block lag mismatch: %+v", cfg.RPCProviders)
 	}
+	if cfg.RPCProviders[0].Tier != "limited" || cfg.RPCProviders[1].Tier != "secondary" {
+		t.Fatalf("provider tier inference mismatch: %+v", cfg.RPCProviders)
+	}
 	if cfg.RPCReadTargetRPS != 17 {
 		t.Fatalf("read target RPS mismatch: %+v", cfg)
 	}

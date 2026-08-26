@@ -452,22 +452,31 @@ func TestAlchemyPremiumPoolDistributesHotPathAcrossThreeEndpoints(t *testing.T) 
 	}
 }
 
-func TestBackgroundTrafficExcludesHealthyPremiumPool(t *testing.T) {
-	var cheapCalls, premiumCalls atomic.Int32
-	cheap := countingRPCServer(t, &cheapCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+func TestBackgroundTrafficUsesProviderPriorityAndSpillsWhenPremiumSaturated(t *testing.T) {
+	var secondaryCalls, premiumCalls atomic.Int32
+	secondary := countingRPCServer(t, &secondaryCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
 	premium := countingRPCServer(t, &premiumCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
 	client := NewManaged([]ProviderConfig{
-		{Name: "chainstack", HTTP: cheap.URL, Tier: "cheap", TargetRPS: 100},
+		{Name: "ankr_1", HTTP: secondary.URL, Tier: "secondary", TargetRPS: 100},
 		{Name: "alchemy_1", HTTP: premium.URL, Tier: "premium", TargetRPS: 100},
 	}, time.Second, 0, nil)
 	ctx := WithRequestClass(context.Background(), Background)
-	for i := 0; i < 5; i++ {
+	for i := 0; i < 3; i++ {
 		if _, err := client.BlockNumber(ctx); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if cheapCalls.Load() != 5 || premiumCalls.Load() != 0 {
-		t.Fatalf("background tier leak cheap=%d premium=%d", cheapCalls.Load(), premiumCalls.Load())
+	if premiumCalls.Load() == 0 {
+		t.Fatalf("background reads did not prefer premium tier: premium=%d secondary=%d", premiumCalls.Load(), secondaryCalls.Load())
+	}
+	saturateProvider(client.providers[1], time.Second)
+	for i := 0; i < 3; i++ {
+		if _, err := client.BlockNumber(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if secondaryCalls.Load() == 0 {
+		t.Fatalf("saturated premium tier did not spill background reads to secondary: premium=%d secondary=%d", premiumCalls.Load(), secondaryCalls.Load())
 	}
 }
 
@@ -513,8 +522,7 @@ func TestSaturatedPremiumHotPathSpillsToHealthySecondary(t *testing.T) {
 		{Name: "quicknode", HTTP: "http://quicknode.invalid", Tier: "limited", TargetRPS: 10},
 		{Name: "official", HTTP: "http://official.invalid", Tier: "emergency", TargetRPS: 10},
 	}, time.Second, 0, nil)
-	client.providers[0].requests = 100
-	client.providers[0].latencyEMA = 20 * time.Millisecond
+	saturateProvider(client.providers[0], time.Second)
 	client.providers[1].latencyEMA = 25 * time.Millisecond
 	provider, _, _ := client.chooseReadProvider(HotPath)
 	if provider.cfg.Name != "ankr_1" {
@@ -526,8 +534,46 @@ func TestSaturatedPremiumHotPathSpillsToHealthySecondary(t *testing.T) {
 	}
 }
 
+func TestReadProviderTierPriorityOrder(t *testing.T) {
+	client := NewManaged([]ProviderConfig{
+		{Name: "quicknode", HTTP: "http://quicknode.invalid", Tier: "limited", TargetRPS: 100},
+		{Name: "chainstack", HTTP: "http://chainstack.invalid", Tier: "secondary", TargetRPS: 100},
+		{Name: "official", HTTP: "http://official.invalid", Tier: "emergency", TargetRPS: 100},
+		{Name: "alchemy_1", HTTP: "http://alchemy.invalid", Tier: "premium", TargetRPS: 100},
+	}, time.Second, 0, nil)
+	provider, _, _ := client.chooseReadProvider(Background)
+	if provider.cfg.Name != "alchemy_1" {
+		t.Fatalf("premium tier was not first priority for background reads: %s", provider.cfg.Name)
+	}
+	client.providers[3].cooldownUntil = time.Now().Add(time.Minute)
+	provider, _, _ = client.chooseReadProvider(HotPath)
+	if provider.cfg.Name != "chainstack" {
+		t.Fatalf("secondary tier was not second priority after premium cooldown: %s", provider.cfg.Name)
+	}
+	client.providers[1].cooldownUntil = time.Now().Add(time.Minute)
+	provider, _, _ = client.chooseReadProvider(Standard)
+	if provider.cfg.Name != "quicknode" {
+		t.Fatalf("limited tier was not third available priority before emergency: %s", provider.cfg.Name)
+	}
+	client.providers[0].cooldownUntil = time.Now().Add(time.Minute)
+	provider, _, _ = client.chooseReadProvider(Standard)
+	if provider.cfg.Name != "official" {
+		t.Fatalf("emergency tier was not last fallback: %s", provider.cfg.Name)
+	}
+}
+
+func saturateProvider(provider *providerState, delay time.Duration) {
+	provider.limiter.mu.Lock()
+	provider.limiter.next = time.Now().Add(delay)
+	provider.limiter.mu.Unlock()
+}
+
 func TestProviderSnapshotTracksMethodLatencyAndHealthCounters(t *testing.T) {
-	server := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(time.Millisecond)
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x1"}`))
+	}))
+	t.Cleanup(server.Close)
 	client := NewManaged([]ProviderConfig{{Name: "ankr_1", HTTP: server.URL, Tier: "secondary", TargetRPS: 100}}, time.Second, 0, nil)
 	var out string
 	if err := client.Call(WithRequestClass(context.Background(), HotPath), "eth_call", []any{}, &out); err != nil {

@@ -146,6 +146,8 @@ type CycleReport struct {
 	ReconcileBatchSize      int
 	ReconcilePairsDone      int
 	ReconcilePairsTotal     int
+	ReconcileUnitsDone      int
+	ReconcileUnitsTotal     int
 	ReconcileRPC            uint64
 	ReconcileDuration       time.Duration
 	ReconcileCompleted      bool
@@ -677,6 +679,8 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 	report.ReconcileBatchSize = batchSize
 	report.ReconcilePairsDone = state.next
 	report.ReconcilePairsTotal = len(state.jobs)
+	report.ReconcileUnitsDone = state.next
+	report.ReconcileUnitsTotal = len(state.jobs)
 	started := time.Now()
 	rpcBefore := e.rpcCalls()
 	// A superseded market cycle must not strand the current small checkpoint
@@ -735,6 +739,9 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 	state.batches++
 	report.ReconcileBatchSize = processed
 	report.ReconcilePairsDone = state.next
+	report.ReconcilePairsTotal = len(state.jobs)
+	report.ReconcileUnitsDone = state.next
+	report.ReconcileUnitsTotal = len(state.jobs)
 	report.ReconcileRPC = safeUint64Delta(e.rpcCalls(), rpcBefore)
 	report.ReconcileDuration = time.Since(started)
 	if state.next < len(state.jobs) {

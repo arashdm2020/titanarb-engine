@@ -474,8 +474,12 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 	bestIndex := -1
 	var bestScore time.Duration
 	bestTier := 99
-	flexibleHotPath := class == HotPath
+	flexibleRead := class != Critical
 	for pass := 0; pass < 2 && bestIndex == -1; pass++ {
+		preferredTier := 99
+		if flexibleRead {
+			preferredTier = c.preferredReadTierLocked(class, now, bestBlock, pass)
+		}
 		for index, provider := range c.providers {
 			if now.Before(provider.cooldownUntil) {
 				continue
@@ -484,7 +488,7 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 			if rank >= 99 {
 				continue
 			}
-			if flexibleHotPath && rank > 1 {
+			if flexibleRead && rank != preferredTier {
 				continue
 			}
 			if pass == 0 && now.Before(provider.probationUntil) {
@@ -493,7 +497,7 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 			if providerLagged(provider, bestBlock, now) {
 				continue
 			}
-			if !flexibleHotPath {
+			if !flexibleRead {
 				if rank > bestTier {
 					continue
 				}
@@ -503,10 +507,10 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 				}
 			}
 			score := provider.limiter.Delay()
-			if flexibleHotPath {
-				// Premium keeps a small deterministic preference, while a saturated
-				// premium pool can spill bounded quote reads to healthy secondary
-				// providers. Critical execution reads retain strict tier ordering.
+			if flexibleRead {
+				// Higher-priority tiers keep a deterministic preference, while a
+				// saturated pool can spill bounded reads to the next healthy tier.
+				// Critical execution reads retain strict tier ordering.
 				score += time.Duration(rank) * 75 * time.Millisecond
 			}
 			if now.Before(provider.recent429Until) {
@@ -536,7 +540,7 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 			if rank >= 99 {
 				continue
 			}
-			if !flexibleHotPath {
+			if !flexibleRead {
 				if rank > bestTier {
 					continue
 				}
@@ -550,7 +554,7 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 				delay = cooldown
 			}
 			score := delay
-			if flexibleHotPath {
+			if flexibleRead {
 				score += time.Duration(rank) * 75 * time.Millisecond
 			}
 			if bestIndex == -1 || score < bestScore {
@@ -573,6 +577,54 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 		delay = cooldown
 	}
 	return provider, bestIndex, delay
+}
+
+const readTierSpillDelay = 150 * time.Millisecond
+
+func (c *Client) preferredReadTierLocked(class RequestClass, now time.Time, bestBlock uint64, pass int) int {
+	type tierCandidate struct {
+		rank  int
+		delay time.Duration
+	}
+	var candidates []tierCandidate
+	for _, provider := range c.providers {
+		if now.Before(provider.cooldownUntil) {
+			continue
+		}
+		if pass == 0 && now.Before(provider.probationUntil) {
+			continue
+		}
+		if providerLagged(provider, bestBlock, now) {
+			continue
+		}
+		rank := tierRank(class, provider.cfg.Tier)
+		if rank >= 99 {
+			continue
+		}
+		candidates = append(candidates, tierCandidate{rank: rank, delay: provider.limiter.Delay()})
+	}
+	if len(candidates) == 0 {
+		return 99
+	}
+	bestReadyRank := 99
+	bestDelayedRank := 99
+	var bestDelayedDelay time.Duration
+	for _, candidate := range candidates {
+		if candidate.delay <= readTierSpillDelay {
+			if candidate.rank < bestReadyRank {
+				bestReadyRank = candidate.rank
+			}
+			continue
+		}
+		if bestDelayedRank == 99 || candidate.delay < bestDelayedDelay || (candidate.delay == bestDelayedDelay && candidate.rank < bestDelayedRank) {
+			bestDelayedRank = candidate.rank
+			bestDelayedDelay = candidate.delay
+		}
+	}
+	if bestReadyRank != 99 {
+		return bestReadyRank
+	}
+	return bestDelayedRank
 }
 
 func (c *Client) bestKnownBlockLocked() uint64 {
@@ -845,13 +897,13 @@ func normalizeTier(tier string) string {
 func tierRank(class RequestClass, tier string) int {
 	switch class {
 	case Background:
-		if tier == "secondary" {
+		if tier == "premium" {
 			return 0
 		}
-		if tier == "limited" {
+		if tier == "secondary" {
 			return 1
 		}
-		if tier == "premium" {
+		if tier == "limited" {
 			return 2
 		}
 		return 3
@@ -867,13 +919,13 @@ func tierRank(class RequestClass, tier string) int {
 		}
 		return 3
 	default:
-		if tier == "secondary" {
+		if tier == "premium" {
 			return 0
 		}
-		if tier == "limited" {
+		if tier == "secondary" {
 			return 1
 		}
-		if tier == "premium" {
+		if tier == "limited" {
 			return 2
 		}
 		return 3

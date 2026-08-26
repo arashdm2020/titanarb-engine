@@ -286,7 +286,7 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 		TargetRPS:   int(parseUintDefault(firstNonEmpty(get("RPC_PRIMARY_TARGET_RPS"), get("RPC_QUICKNODE_TARGET_RPS")), 0)),
 		Burst:       int(parseUintDefault(get("RPC_PRIMARY_BURST"), 1)),
 		MaxBlockLag: int(parseUintDefault(get("RPC_PRIMARY_MAX_BLOCK_LAG"), parseUintDefault(get("RPC_PROVIDER_MAX_BLOCK_LAG"), 5))),
-		Tier:        firstNonEmpty(get("RPC_PRIMARY_TIER"), "cheap"),
+		Tier:        firstNonEmpty(get("RPC_PRIMARY_TIER"), inferredProviderTier(firstNonEmpty(get("RPC_PRIMARY_NAME"), "primary"))),
 	}
 	secondary := RPCProviderConfig{
 		Name:        firstNonEmpty(get("RPC_SECONDARY_NAME"), "secondary"),
@@ -296,7 +296,7 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 		TargetRPS:   int(parseUintDefault(firstNonEmpty(get("RPC_SECONDARY_TARGET_RPS"), get("RPC_CHAINSTACK_TARGET_RPS")), 0)),
 		Burst:       int(parseUintDefault(get("RPC_SECONDARY_BURST"), 1)),
 		MaxBlockLag: int(parseUintDefault(get("RPC_SECONDARY_MAX_BLOCK_LAG"), parseUintDefault(get("RPC_PROVIDER_MAX_BLOCK_LAG"), 5))),
-		Tier:        firstNonEmpty(get("RPC_SECONDARY_TIER"), "cheap"),
+		Tier:        firstNonEmpty(get("RPC_SECONDARY_TIER"), inferredProviderTier(firstNonEmpty(get("RPC_SECONDARY_NAME"), "secondary"))),
 	}
 	if primary.HTTP == "" {
 		primary.HTTP = firstNonEmpty(get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL"))
@@ -334,6 +334,22 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 		providers = append(providers, RPCProviderConfig{Name: "quicknode", HTTP: url, MaxRPS: quicknodeRPS, TargetRPS: quicknodeRPS, Burst: int(parseUintDefault(get("RPC_QUICKNODE_BURST"), 1)), MaxBlockLag: primary.MaxBlockLag, Tier: "limited"})
 	}
 	return providers
+}
+
+func inferredProviderTier(name string) string {
+	name = strings.ToLower(strings.TrimSpace(name))
+	switch {
+	case strings.Contains(name, "alchemy"):
+		return "premium"
+	case strings.Contains(name, "ankr"), strings.Contains(name, "chainstack"):
+		return "secondary"
+	case strings.Contains(name, "quicknode"):
+		return "limited"
+	case strings.Contains(name, "official"), strings.Contains(name, "public"), strings.Contains(name, "arbitrum"):
+		return "emergency"
+	default:
+		return "secondary"
+	}
 }
 
 func parseUintDefault(raw string, fallback uint64) uint64 {
