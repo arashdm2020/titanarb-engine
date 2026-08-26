@@ -613,7 +613,11 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.QuoteDedupHits = evaluation.QuoteDedupHits
 	report.OptimizerSaved = evaluation.OptimizerSaved
 	report.RoutesSkippedByPreQuote = evaluation.RoutesSkippedByPreQuote
-	e.advanceReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
+	// Dirty/live market work owns the cycle. Background reconciliation advances
+	// only on an otherwise idle head so it cannot add latency to fresh quotes.
+	if len(dirty) == 0 {
+		e.advanceReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
+	}
 	report.RPCCallsByStage["reconcile"] = report.ReconcileRPC
 	report.Duration = time.Since(started)
 	report.Routes = routesFound
