@@ -136,6 +136,7 @@ func (p *Pipeline) Process(ctx context.Context, opp *opportunity.Opportunity) Ou
 }
 
 func (p *Pipeline) ProcessWithObserver(ctx context.Context, opp *opportunity.Opportunity, observer Observer) Outcome {
+	ctx = rpc.WithRequestClass(ctx, rpc.Critical)
 	if opp != nil && p.latestObservedBlock != nil {
 		latestObservedBlock := p.latestObservedBlock()
 		lag := candidateBlockLag(opp.SourceBlock, latestObservedBlock)

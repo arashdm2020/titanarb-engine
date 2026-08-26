@@ -26,6 +26,9 @@ type Config struct {
 	WSRPCURL                    string
 	RPCProviders                []RPCProviderConfig
 	RPCReadTargetRPS            int
+	RPCPremiumAggregateRPS      int
+	RPCMaxEthCallsPerMinute     int
+	RPCMaxHotCallsPerMinute     int
 	MaxCandidateStalenessBlocks uint64
 	FlashExecutorAddress        string
 	UniswapV3Adapter            string
@@ -50,6 +53,7 @@ type RPCProviderConfig struct {
 	TargetRPS   int
 	Burst       int
 	MaxBlockLag int
+	Tier        string
 }
 
 // Token is a configured Arbitrum asset. Addresses are deliberately sourced
@@ -250,7 +254,10 @@ func FromLookup(get func(string) string) (Config, error) {
 		HTTPRPCURL:                  firstNonEmpty(get("RPC_PRIMARY_HTTP"), get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL")),
 		WSRPCURL:                    firstNonEmpty(get("RPC_PRIMARY_WSS"), get("WS_RPC_URL"), get("ARBITRUM_WSS_RPC_URL")),
 		RPCProviders:                rpcProvidersFromLookup(get),
-		RPCReadTargetRPS:            int(parseUintDefault(get("RPC_READ_TARGET_RPS"), 0)),
+		RPCReadTargetRPS:            int(parseUintDefault(get("RPC_READ_TARGET_RPS"), 8)),
+		RPCPremiumAggregateRPS:      int(parseUintDefault(get("RPC_ALCHEMY_AGGREGATE_RPS"), 6)),
+		RPCMaxEthCallsPerMinute:     int(parseUintDefault(get("RPC_MAX_ETH_CALLS_PER_MINUTE"), 480)),
+		RPCMaxHotCallsPerMinute:     int(parseUintDefault(firstNonEmpty(get("RPC_MAX_HOT_CALLS_PER_MINUTE"), get("MAX_QUOTES_PER_MINUTE")), 360)),
 		MaxCandidateStalenessBlocks: parseUintDefault(get("MAX_CANDIDATE_STALENESS_BLOCKS"), 2),
 		FlashExecutorAddress:        strings.TrimSpace(get("FLASH_EXECUTOR_ADDRESS")),
 		UniswapV3Adapter:            strings.TrimSpace(get("UNISWAP_V3_ADAPTER")),
@@ -279,6 +286,7 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 		TargetRPS:   int(parseUintDefault(firstNonEmpty(get("RPC_PRIMARY_TARGET_RPS"), get("RPC_QUICKNODE_TARGET_RPS")), 0)),
 		Burst:       int(parseUintDefault(get("RPC_PRIMARY_BURST"), 1)),
 		MaxBlockLag: int(parseUintDefault(get("RPC_PRIMARY_MAX_BLOCK_LAG"), parseUintDefault(get("RPC_PROVIDER_MAX_BLOCK_LAG"), 5))),
+		Tier:        firstNonEmpty(get("RPC_PRIMARY_TIER"), "cheap"),
 	}
 	secondary := RPCProviderConfig{
 		Name:        firstNonEmpty(get("RPC_SECONDARY_NAME"), "secondary"),
@@ -288,6 +296,7 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 		TargetRPS:   int(parseUintDefault(firstNonEmpty(get("RPC_SECONDARY_TARGET_RPS"), get("RPC_CHAINSTACK_TARGET_RPS")), 0)),
 		Burst:       int(parseUintDefault(get("RPC_SECONDARY_BURST"), 1)),
 		MaxBlockLag: int(parseUintDefault(get("RPC_SECONDARY_MAX_BLOCK_LAG"), parseUintDefault(get("RPC_PROVIDER_MAX_BLOCK_LAG"), 5))),
+		Tier:        firstNonEmpty(get("RPC_SECONDARY_TIER"), "cheap"),
 	}
 	if primary.HTTP == "" {
 		primary.HTTP = firstNonEmpty(get("HTTP_RPC_URL"), get("ARBITRUM_RPC_URL"))
@@ -301,6 +310,15 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 	}
 	if secondary.HTTP != "" || secondary.WSS != "" {
 		providers = append(providers, secondary)
+	}
+	alchemyRPS := int(parseUintDefault(get("RPC_ALCHEMY_ENDPOINT_RPS"), 3))
+	alchemyBurst := int(parseUintDefault(get("RPC_ALCHEMY_ENDPOINT_BURST"), 1))
+	for i := 1; i <= 3; i++ {
+		url := strings.TrimSpace(get(fmt.Sprintf("RPC_ALCHEMY_HTTP_%d", i)))
+		if url == "" {
+			continue
+		}
+		providers = append(providers, RPCProviderConfig{Name: fmt.Sprintf("alchemy_%d", i), HTTP: url, MaxRPS: alchemyRPS, TargetRPS: alchemyRPS, Burst: alchemyBurst, MaxBlockLag: primary.MaxBlockLag, Tier: "premium"})
 	}
 	return providers
 }

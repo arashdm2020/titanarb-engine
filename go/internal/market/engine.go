@@ -19,6 +19,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/optimizer"
 	"github.com/titanarb/titanarb-go/internal/pools"
 	"github.com/titanarb/titanarb-go/internal/routes"
+	"github.com/titanarb/titanarb-go/internal/rpc"
 	"github.com/titanarb/titanarb-go/internal/volatility"
 )
 
@@ -58,6 +59,7 @@ type Engine struct {
 	forceFull          bool
 	pairScore          func(string, string) (float64, bool)
 	crossVenueShareBPS int
+	recentNearMisses   []nearmiss.Record
 }
 
 type Snapshot struct {
@@ -91,6 +93,7 @@ type CycleReport struct {
 	RejectionReasons        map[string]int
 	ExploitSelected         uint64
 	ExploreSelected         uint64
+	NewSelected             uint64
 	MemoryRoutes            int
 	AvgPreQuoteScore        int64
 	CrossVenueQuoted        uint64
@@ -107,6 +110,10 @@ type CycleReport struct {
 	QuoteCacheMisses        uint64
 	QuoteDedupHits          uint64
 	QuoteCacheInvalidations uint64
+	QuoteBudget             int
+	QuoteBudgetUsed         int
+	QuoteBudgetDropped      uint64
+	NoQuoteReason           string
 	OptimizerRequested      uint64
 	OptimizerSaved          uint64
 	RoutesDeepOptimized     uint64
@@ -118,7 +125,6 @@ type CycleReport struct {
 	ScoreDeciles            map[string]map[string]any
 }
 
-const fullReconcileEvery = 240
 const incrementalRefreshBatchBlocks = 8
 const maxOptimizerRoutesPerAsset = 2
 const maxEvaluationRoutesPerAsset = 12
@@ -129,6 +135,10 @@ type SearchOptions struct {
 	OptimizerRoutesPerAsset  int
 	OptimizerSamplesPerRoute int
 	OptimizerSamplesPerCycle int
+	MaxQuotesPerCycle        int
+	MaxOptimizedRoutes       int
+	NormalOptimizerSamples   int
+	FullReconcileEvery       uint64
 	DisablePreQuoteRanking   bool
 	ExploreRatioBPS          int
 	PersistentQuoteCache     bool
@@ -143,6 +153,10 @@ func DefaultSearchOptions() SearchOptions {
 		OptimizerRoutesPerAsset:  maxOptimizerRoutesPerAsset,
 		OptimizerSamplesPerRoute: optimizerSamplesPerRoute,
 		OptimizerSamplesPerCycle: 32,
+		MaxQuotesPerCycle:        40,
+		MaxOptimizedRoutes:       8,
+		NormalOptimizerSamples:   3,
+		FullReconcileEvery:       2_400,
 		DisablePreQuoteRanking:   false,
 		ExploreRatioBPS:          2_000,
 		PersistentQuoteCache:     true,
@@ -174,6 +188,21 @@ func (o SearchOptions) Normalized() SearchOptions {
 	}
 	if o.OptimizerSamplesPerCycle > 512 {
 		o.OptimizerSamplesPerCycle = 512
+	}
+	if o.MaxQuotesPerCycle < 1 {
+		o.MaxQuotesPerCycle = defaults.MaxQuotesPerCycle
+	}
+	if o.MaxOptimizedRoutes < 1 {
+		o.MaxOptimizedRoutes = defaults.MaxOptimizedRoutes
+	}
+	if o.NormalOptimizerSamples < 2 {
+		o.NormalOptimizerSamples = defaults.NormalOptimizerSamples
+	}
+	if o.NormalOptimizerSamples > o.OptimizerSamplesPerRoute {
+		o.NormalOptimizerSamples = o.OptimizerSamplesPerRoute
+	}
+	if o.FullReconcileEvery == 0 {
+		o.FullReconcileEvery = defaults.FullReconcileEvery
 	}
 	if o.ExploreRatioBPS < 0 {
 		o.ExploreRatioBPS = 0
@@ -377,6 +406,27 @@ func (e *Engine) CycleAt(ctx context.Context, stateBlock uint64, maxHops, maxRou
 	return e.CycleAtWithSearchOptions(ctx, stateBlock, maxHops, maxRoutes, volatilityWeight, DefaultSearchOptions())
 }
 
+// RequiresFullReconcile lets the runtime avoid cancelling the bounded
+// discovery transaction halfway through and immediately restarting it on the
+// next head. It is read-only and is called by the single-owner scheduler.
+func (e *Engine) RequiresFullReconcile(maxHops, maxRoutes int, options SearchOptions) bool {
+	if e == nil {
+		return false
+	}
+	options = options.Normalized()
+	if maxHops < 2 {
+		maxHops = 2
+	}
+	if maxHops > 4 {
+		maxHops = 4
+	}
+	e.pendingMu.Lock()
+	pending := e.pendingMarket != nil
+	e.pendingMu.Unlock()
+	searchEnvelopeChanged := maxHops != e.lastMaxHops || maxRoutes != e.lastMaxRoutes || pending || e.forceFull
+	return len(e.routeCache) == 0 || e.cyclesSinceFull >= options.FullReconcileEvery || searchEnvelopeChanged
+}
+
 // CycleAtWithSearchOptions lets runtime risk profiles widen or narrow the
 // read-only market search envelope without touching execution safety gates.
 func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int, volatilityWeight float64, options SearchOptions) (CycleReport, error) {
@@ -401,7 +451,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	}
 	hadRoutes := len(e.routeCache) > 0
 	searchEnvelopeChanged := maxHops != e.lastMaxHops || maxRoutes != e.lastMaxRoutes || marketChanged || e.forceFull
-	full := !hadRoutes || e.cyclesSinceFull >= fullReconcileEvery || searchEnvelopeChanged
+	full := !hadRoutes || e.cyclesSinceFull >= options.FullReconcileEvery || searchEnvelopeChanged
 	if !full && shouldDeferIncrementalRefresh(e.lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
 		routesFound := refreshRoutes(e.routeCache, liquidPools(e.cache.Snapshot()))
 		report.RoutesReused = uint64(len(routesFound))
@@ -410,6 +460,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		report.RouteCountAfter = len(routesFound)
 		report.RoutesByHop = routesByHop(routesFound)
 		report.DEXRoutes = routeDEXDiversity(routesFound)
+		report.NoQuoteReason = "incremental_refresh_deferred"
 		e.statsMu.Lock()
 		e.activePools = uint64(len(e.cache.Snapshot()))
 		e.cycles = uint64(len(routesFound))
@@ -423,7 +474,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	if full {
 		e.forceFull = false
 		beforePools := e.cache.Snapshot()
-		e.routeCache, err = e.fullReconcile(ctx, stateBlock, maxHops, maxRoutes)
+		e.routeCache, err = e.fullReconcile(rpc.WithRequestClass(ctx, rpc.Background), stateBlock, maxHops, maxRoutes)
 		if err != nil {
 			return report, err
 		}
@@ -441,7 +492,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		if e.lastStateBlock > 0 && e.lastStateBlock < stateBlock {
 			fromBlock = e.lastStateBlock + 1
 		}
-		dirty, err = e.incrementalRefresh(ctx, fromBlock, stateBlock)
+		dirty, err = e.incrementalRefresh(rpc.WithRequestClass(ctx, rpc.Background), fromBlock, stateBlock)
 		if err != nil {
 			return report, err
 		}
@@ -478,20 +529,26 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	quoteStarted := time.Now()
 	if e.evaluator != nil {
 		e.evaluator.PrepareQuoteCache(stateBlock, dirty, options.PersistentQuoteCache)
+		e.evaluator.SetQuoteBudget(options.MaxQuotesPerCycle)
 	}
 	evaluation := e.evaluate(ctx, affected, options, signals, volatilityWeight, stateBlock)
+	if err := ctx.Err(); err != nil {
+		return report, err
+	}
 	rpcAfterEvaluation := e.rpcCalls()
 	report.QuoteDuration = time.Since(quoteStarted)
 	report.OptimizerDuration = evaluation.OptimizerDuration
 	report.OptimizerRuns = evaluation.OptimizerRuns
 	report.OptimizerSamples = evaluation.OptimizerSamples
 	report.RoutesEvaluated = evaluation.RoutesEvaluated
-	report.TopNearMisses = nearmiss.Snapshot(evaluation.NearMisses, 10)
+	e.recentNearMisses = mergeNearMisses(e.recentNearMisses, evaluation.NearMisses, 100)
+	report.TopNearMisses = nearmiss.Snapshot(e.recentNearMisses, 10)
 	report.RouteScores = nearmiss.Distribution(evaluation.NearMisses)
 	report.OptimizerBudget = evaluation.OptimizerBudget
 	report.RejectionReasons = nearmiss.RejectionReasons(evaluation.NearMisses)
 	report.ExploitSelected = evaluation.ExploitSelected
 	report.ExploreSelected = evaluation.ExploreSelected
+	report.NewSelected = evaluation.NewSelected
 	report.MemoryRoutes = evaluation.MemoryRoutes
 	report.AvgPreQuoteScore = evaluation.AvgPreQuoteScore
 	report.CrossVenueQuoted = evaluation.CrossVenueQuoted
@@ -511,6 +568,16 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.RPCCallsEconomics = evaluation.RPCCallsEconomics
 	report.QuoteCacheMisses = evaluation.QuoteCacheMisses
 	report.QuoteCacheInvalidations = evaluation.QuoteCacheInvalidations
+	report.QuoteBudget = evaluation.QuoteBudget
+	report.QuoteBudgetUsed = evaluation.QuoteBudgetUsed
+	report.QuoteBudgetDropped = evaluation.QuoteBudgetDropped
+	if len(affected) == 0 {
+		report.NoQuoteReason = "no_dirty_routes"
+	} else if evaluation.RoutesEvaluated == 0 {
+		report.NoQuoteReason = "prequote_or_quote_budget"
+	} else if len(evaluation.NearMisses) == 0 {
+		report.NoQuoteReason = "no_complete_economic_evaluation"
+	}
 	report.OptimizerRequested = evaluation.OptimizerRequested
 	report.RoutesDeepOptimized = evaluation.RoutesDeepOptimized
 	report.RoutesProbeOnly = evaluation.RoutesProbeOnly
@@ -785,6 +852,7 @@ type evaluationReport struct {
 	OptimizerBudget         map[string]int
 	ExploitSelected         uint64
 	ExploreSelected         uint64
+	NewSelected             uint64
 	MemoryRoutes            int
 	AvgPreQuoteScore        int64
 	CrossVenueQuoted        uint64
@@ -795,6 +863,9 @@ type evaluationReport struct {
 	QuoteCacheMisses        uint64
 	QuoteDedupHits          uint64
 	QuoteCacheInvalidations uint64
+	QuoteBudget             int
+	QuoteBudgetUsed         int
+	QuoteBudgetDropped      uint64
 	OptimizerSaved          uint64
 	RoutesDeepOptimized     uint64
 	RoutesProbeOnly         uint64
@@ -825,7 +896,11 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 	pending := make([]pendingOptimization, 0, len(assets))
 	allEvaluated := make([]evaluatedRoute, 0)
 	rpcBeforeInitial := e.rpcCalls()
-	for _, asset := range assets {
+	// Reserve most of the hard quote ceiling for the small set of routes that
+	// prove promising enough for optimizer work. The initial detector probe is
+	// deliberately cheap and entirely local-ranked.
+	remainingQuotes := minInt(options.MaxQuotesPerCycle, maxInt(8, options.MaxQuotesPerCycle*3/10))
+	for assetIndex, asset := range assets {
 		assetCandidates := byAsset[asset]
 		amount, ok := e.amounts[asset]
 		if !ok {
@@ -834,13 +909,26 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 			// raw units or manufacture a USD conversion.
 			continue
 		}
-		evaluationCandidates, selection := e.selectEvaluationCandidates(assetCandidates, options, signals, volatilityWeight, stateBlock)
+		assetOptions := options
+		assetsRemaining := len(assets) - assetIndex
+		assetQuoteBudget := remainingQuotes
+		if assetsRemaining > 0 {
+			assetQuoteBudget = (remainingQuotes + assetsRemaining - 1) / assetsRemaining
+		}
+		evaluationCandidates, selection := e.selectEvaluationCandidates(assetCandidates, assetOptions, signals, volatilityWeight, stateBlock)
+		evaluationCandidates, usedQuotes := boundRoutesByQuoteCost(evaluationCandidates, assetQuoteBudget)
+		selection = summarizeBoundedSelection(evaluationCandidates, selection)
+		if usedQuotes > remainingQuotes {
+			usedQuotes = remainingQuotes
+		}
+		remainingQuotes -= usedQuotes
 		report.RoutesConsidered += uint64(len(assetCandidates))
 		if len(assetCandidates) > len(evaluationCandidates) {
 			report.RoutesSkippedByPreQuote += uint64(len(assetCandidates) - len(evaluationCandidates))
 		}
 		report.ExploitSelected += uint64(selection.Exploit)
 		report.ExploreSelected += uint64(selection.Explore)
+		report.NewSelected += uint64(selection.New)
 		report.CrossVenueQuoted += uint64(selection.CrossVenue)
 		report.SameDEXQuoted += uint64(selection.SameDEX)
 		report.AvgPreQuoteScore = combineAverages(report.AvgPreQuoteScore, report.RoutesEvaluated, selection.AvgScore, uint64(len(evaluationCandidates)))
@@ -858,7 +946,15 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 			}
 		}
 
-		optimizerCandidates := selectOptimizerCandidates(append([]evaluatedRoute(nil), evaluated...), options.OptimizerRoutesPerAsset)
+		optimizerLimit := options.OptimizerRoutesPerAsset
+		alreadyPending := 0
+		for _, p := range pending {
+			alreadyPending += len(p.candidates)
+		}
+		if left := options.MaxOptimizedRoutes - alreadyPending; optimizerLimit > left {
+			optimizerLimit = left
+		}
+		optimizerCandidates := selectOptimizerCandidates(append([]evaluatedRoute(nil), evaluated...), optimizerLimit)
 		if len(optimizerCandidates) > 0 {
 			pending = append(pending, pendingOptimization{asset: asset, amount: amount, candidates: optimizerCandidates})
 		}
@@ -878,7 +974,7 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 			assetsRemaining := len(pending) - index
 			if remainingBudget < 2 || assetsRemaining < 1 {
 				for _, candidate := range item.candidates {
-					report.OptimizerRequested += uint64(samplesForScore(candidate.score, options.OptimizerSamplesPerRoute))
+					report.OptimizerRequested += uint64(samplesForScore(candidate.score, options.OptimizerSamplesPerRoute, options.NormalOptimizerSamples))
 					report.RoutesSkippedDeep++
 				}
 				continue
@@ -889,7 +985,7 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 			}
 		}
 		optimizerStarted := time.Now()
-		optimized := e.optimizeRoutes(ctx, item.asset, item.candidates, item.amount, options.OptimizerSamplesPerRoute, assetBudget, options.AdaptiveOptimizer, options.EarlyStop)
+		optimized := e.optimizeRoutes(ctx, item.asset, item.candidates, item.amount, options.OptimizerSamplesPerRoute, options.NormalOptimizerSamples, assetBudget, options.AdaptiveOptimizer, options.EarlyStop)
 		report.OptimizerDuration += time.Since(optimizerStarted)
 		report.OptimizerRuns += optimized.OptimizerRuns
 		report.OptimizerRequested += optimized.OptimizerRequested
@@ -928,6 +1024,9 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		report.QuoteDedupHits = stats.DedupHits
 		report.QuoteCacheMisses = stats.Misses
 		report.QuoteCacheInvalidations = stats.Invalidations
+		report.QuoteBudget = stats.Budget
+		report.QuoteBudgetUsed = stats.BudgetUsed
+		report.QuoteBudgetDropped = stats.BudgetDropped
 	}
 	e.publishUniverseFeedback(allEvaluated)
 	return report
@@ -990,7 +1089,7 @@ func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route,
 			defer wg.Done()
 			for route := range jobs {
 				started := time.Now()
-				op, err := e.evaluator.Evaluate(ctx, route, amount)
+				op, err := e.evaluator.Evaluate(rpc.WithRequestClass(ctx, rpc.HotPath), route, amount)
 				if err != nil || op == nil || op.ExpectedProfit == nil {
 					results <- evaluatedRoute{route: route, preQuoteScore: preQuoteScores[routeKey(route)]}
 					continue
@@ -1031,10 +1130,12 @@ func collectEvaluated(results <-chan evaluatedRoute) []evaluatedRoute {
 type evaluationSelection struct {
 	Exploit    int
 	Explore    int
+	New        int
 	CrossVenue int
 	SameDEX    int
 	AvgScore   int64
 	Scores     map[string]int64
+	Kinds      map[string]string
 }
 
 type scoredRoute struct {
@@ -1073,6 +1174,9 @@ func (e *Engine) selectEvaluationCandidates(candidates []routes.Route, options S
 			Volatility:   routeVolatility(route, signals, volatilityWeight),
 			CurrentBlock: stateBlock,
 		})
+		if cross && len(route.Hops) == 2 {
+			score += 400
+		}
 		score += int64(e.routePairQuality(route) * 50)
 		scored = append(scored, scoredRoute{route: route, key: key, score: score, observations: stats.Observations, crossVenue: cross})
 	}
@@ -1089,7 +1193,14 @@ func (e *Engine) selectEvaluationCandidates(candidates []routes.Route, options S
 	if exploreSlots > limit {
 		exploreSlots = limit
 	}
-	exploitSlots := limit - exploreSlots
+	newSlots := limit / 10
+	if newSlots == 0 && limit >= 3 {
+		newSlots = 1
+	}
+	if newSlots+exploreSlots > limit {
+		newSlots = 0
+	}
+	exploitSlots := limit - exploreSlots - newSlots
 	sort.SliceStable(scored, func(i, j int) bool {
 		if scored[i].score != scored[j].score {
 			return scored[i].score > scored[j].score
@@ -1098,7 +1209,8 @@ func (e *Engine) selectEvaluationCandidates(candidates []routes.Route, options S
 	})
 	selected := make([]routes.Route, 0, limit)
 	selectedKeys := make(map[string]struct{}, limit)
-	add := func(item scoredRoute) bool {
+	selection := evaluationSelection{Scores: make(map[string]int64, limit), Kinds: make(map[string]string, limit)}
+	add := func(item scoredRoute, kind string) bool {
 		if len(selected) >= limit {
 			return false
 		}
@@ -1107,15 +1219,23 @@ func (e *Engine) selectEvaluationCandidates(candidates []routes.Route, options S
 		}
 		selectedKeys[item.key] = struct{}{}
 		selected = append(selected, item.route)
+		selection.Kinds[item.key] = kind
 		return true
 	}
-	selection := evaluationSelection{Scores: make(map[string]int64, limit)}
 	for _, item := range scored {
 		if selection.Exploit >= exploitSlots {
 			break
 		}
-		if add(item) {
+		if add(item, "exploit") {
 			selection.Exploit++
+		}
+	}
+	for _, item := range scored {
+		if selection.New >= newSlots {
+			break
+		}
+		if item.observations == 0 && add(item, "new") {
+			selection.New++
 		}
 	}
 	explore := append([]scoredRoute(nil), scored...)
@@ -1132,7 +1252,7 @@ func (e *Engine) selectEvaluationCandidates(candidates []routes.Route, options S
 		if selection.Explore >= exploreSlots {
 			break
 		}
-		if add(item) {
+		if add(item, "explore") {
 			selection.Explore++
 		}
 	}
@@ -1140,7 +1260,7 @@ func (e *Engine) selectEvaluationCandidates(candidates []routes.Route, options S
 		if len(selected) >= limit {
 			break
 		}
-		if add(item) {
+		if add(item, "exploit") {
 			selection.Exploit++
 		}
 	}
@@ -1187,7 +1307,87 @@ func (e *Engine) routePairQuality(route routes.Route) float64 {
 		denom += 1 / s
 	}
 	harm := float64(len(route.Symbols)-1) / denom
-	return .5*weak + .5*harm
+	return .6*weak + .4*harm
+}
+
+func boundRoutesByQuoteCost(input []routes.Route, budget int) ([]routes.Route, int) {
+	if budget < 1 {
+		return nil, 0
+	}
+	out := make([]routes.Route, 0, len(input))
+	used := 0
+	for _, route := range input {
+		cost := len(route.Hops)
+		if cost < 1 {
+			cost = 1
+		}
+		if used+cost > budget {
+			continue
+		}
+		out = append(out, route)
+		used += cost
+	}
+	return out, used
+}
+
+func summarizeBoundedSelection(selected []routes.Route, original evaluationSelection) evaluationSelection {
+	result := evaluationSelection{Scores: make(map[string]int64, len(selected)), Kinds: make(map[string]string, len(selected))}
+	var total int64
+	for _, route := range selected {
+		key := routeKey(route)
+		score := original.Scores[key]
+		result.Scores[key] = score
+		result.Kinds[key] = original.Kinds[key]
+		total += score
+		switch original.Kinds[key] {
+		case "new":
+			result.New++
+		case "explore":
+			result.Explore++
+		default:
+			result.Exploit++
+		}
+		if nearmiss.CrossVenue(route) {
+			result.CrossVenue++
+		} else {
+			result.SameDEX++
+		}
+	}
+	if len(selected) > 0 {
+		result.AvgScore = total / int64(len(selected))
+	}
+	return result
+}
+
+func mergeNearMisses(previous, current []nearmiss.Record, limit int) []nearmiss.Record {
+	if limit < 1 {
+		return nil
+	}
+	byKey := make(map[string]nearmiss.Record, len(previous)+len(current))
+	for _, record := range append(append([]nearmiss.Record(nil), previous...), current...) {
+		amount := ""
+		if record.AmountIn != nil {
+			amount = record.AmountIn.String()
+		}
+		key := record.Route + "|" + record.DEXPath + "|" + amount
+		if old, ok := byKey[key]; !ok || record.Timestamp.After(old.Timestamp) {
+			byKey[key] = record
+		}
+	}
+	result := make([]nearmiss.Record, 0, len(byKey))
+	for _, record := range byKey {
+		result = append(result, record)
+	}
+	sort.SliceStable(result, func(i, j int) bool {
+		if !result[i].Timestamp.Equal(result[j].Timestamp) {
+			return result[i].Timestamp.After(result[j].Timestamp)
+		}
+		return result[i].Route < result[j].Route
+	})
+	if len(result) > limit {
+		result = result[:limit]
+	}
+	return result
 }
 
 func summarizeLegacySelection(selected []routes.Route) evaluationSelection {
@@ -1625,7 +1825,8 @@ func scoreDecileQuality(input []evaluatedRoute) map[string]map[string]any {
 	return result
 }
 
-func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []optimizerCandidate, current *big.Int, samples, sampleBudget int, adaptive, earlyStop bool) evaluationReport {
+func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []optimizerCandidate, current *big.Int, samples, normalSamples, sampleBudget int, adaptive, earlyStop bool) evaluationReport {
+	ctx = rpc.WithRequestClass(ctx, rpc.HotPath)
 	if !adaptive {
 		return e.optimizeRoutesLegacy(ctx, asset, candidates, current, samples)
 	}
@@ -1645,7 +1846,7 @@ func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []
 	remaining := sampleBudget
 	for _, candidate := range candidates {
 		route := candidate.route
-		requestedSamples := samplesForScore(candidate.score, samples)
+		requestedSamples := samplesForScore(candidate.score, samples, normalSamples)
 		report.OptimizerRequested += uint64(requestedSamples)
 		if remaining < 2 {
 			report.RoutesSkippedDeep++
@@ -1739,7 +1940,7 @@ func (e *Engine) optimizeRoutesLegacy(ctx context.Context, asset string, candida
 		}
 	}
 	for _, candidate := range candidates {
-		allocated := samplesForScore(candidate.score, samples)
+		allocated := samplesForScore(candidate.score, samples, maxInt(2, samples/2))
 		report.OptimizerBudget[routeKey(candidate.route)] = allocated
 		report.OptimizerRequested += uint64(allocated)
 		graphRoute := graph.Route{Assets: append([]string(nil), candidate.route.Symbols...), Hops: append([]pools.Pool(nil), candidate.route.Hops...)}
@@ -1792,21 +1993,31 @@ func refineOptimizerRange(minimum, maximum, best *big.Int) (*big.Int, *big.Int) 
 	return left, right
 }
 
-func samplesForScore(score int64, base int) int {
-	if base < 2 {
-		base = 2
+func samplesForScore(score int64, high, normal int) int {
+	if high < 2 {
+		high = 2
+	}
+	if normal < 2 {
+		normal = 2
+	}
+	if normal > high {
+		normal = high
 	}
 	switch {
 	case score >= 4_000:
-		return base
+		return high
 	case score < 2_000:
 		return 2
 	default:
-		if base/2 < 2 {
-			return 2
-		}
-		return base / 2
+		return normal
 	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func shouldStopOptimizerAfterProbe(candidate optimizerCandidate, best optimizer.OptimalLoan, current *big.Int) bool {

@@ -8,6 +8,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/titanarb/titanarb-go/internal/config"
+	"github.com/titanarb/titanarb-go/internal/rpc"
 )
 
 // Verifier performs direct on-chain read-back before the Go execution pipeline
@@ -18,6 +19,7 @@ type Verifier interface {
 }
 
 func VerifyDeployment(ctx context.Context, chain Verifier, cfg config.Config, market config.MarketConfig, expectedExecutor string) error {
+	ctx = rpc.WithRequestClass(ctx, rpc.Critical)
 	for _, target := range []string{cfg.FlashExecutorAddress, cfg.UniswapV3Adapter, cfg.CamelotV3Adapter} {
 		code, err := chain.GetCode(ctx, target)
 		if err != nil {

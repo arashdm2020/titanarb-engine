@@ -78,7 +78,7 @@ func main() {
 		log.Event(logger.Warn, "health_check_failed", "risk", "runtime risk controls unavailable: "+riskErr.Error(), nil)
 		runtimeRisk, _ = runtimeconfig.Open("", runtimeconfig.Defaults(runtimeconfig.Balanced))
 	}
-	rpcClient := rpc.NewManagedWithReadBudget(rpcProviderConfigs(cfg), cfg.RPCReadTargetRPS, 15*time.Second, 2, m)
+	rpcClient := rpc.NewManagedWithBudgets(rpcProviderConfigs(cfg), cfg.RPCReadTargetRPS, cfg.RPCPremiumAggregateRPS, cfg.RPCMaxEthCallsPerMinute, cfg.RPCMaxHotCallsPerMinute, 15*time.Second, 2, m)
 	rpcClient.SetObserver(func(event rpc.Event) {
 		log.Event(logger.Warn, event.Name, "rpc", "RPC provider changed", map[string]any{"from": event.From, "to": event.To, "transport": event.Transport, "reason": event.Reason})
 		alert(operationSink, observability.Server, event.Name, telegram.Warning, "RPC provider changed", map[string]any{"from": event.From, "to": event.To, "transport": event.Transport, "reason": event.Reason})
@@ -162,14 +162,26 @@ func main() {
 			defer marketBusy.Store(false)
 			cycleStarted := time.Now()
 			before := m.Snapshot()
-			cycleCtx, stop := context.WithTimeout(runCtx, 45*time.Second)
-			defer stop()
 			settings := runtimeconfig.Defaults(runtimeconfig.Balanced)
 			if runtimeRisk != nil {
 				settings = runtimeRisk.Snapshot()
 			}
-			report, cycleErr := marketEngine.CycleAtWithSearchOptions(cycleCtx, trigger.Block, settings.RouteSearchDepth, routeBudget(settings), settings.VolatilityWeight, marketSearchOptions(settings))
+			searchOptions := marketSearchOptions(settings)
+			timeoutCtx, stopTimeout := context.WithTimeout(runCtx, 45*time.Second)
+			defer stopTimeout()
+			maxWorkLag := uint64(envIntBounded("MAX_DETECTOR_WORK_LAG_BLOCKS", 12, 0, 64))
+			cycleCtx := timeoutCtx
+			stopStale := context.CancelFunc(func() {})
+			if !marketEngine.RequiresFullReconcile(settings.RouteSearchDepth, routeBudget(settings), searchOptions) {
+				cycleCtx, stopStale = cancelWhenSuperseded(timeoutCtx, marketScheduler.LatestBlock, trigger.Block, maxWorkLag)
+			}
+			defer stopStale()
+			report, cycleErr := marketEngine.CycleAtWithSearchOptions(cycleCtx, trigger.Block, settings.RouteSearchDepth, routeBudget(settings), settings.VolatilityWeight, searchOptions)
 			if cycleErr != nil {
+				if cycleCtx.Err() == context.Canceled && blockBeyondTolerance(trigger.Block, marketScheduler.LatestBlock(), maxWorkLag) {
+					publish(operationSink, observability.Performance, "market_cycle_superseded", telegram.Info, "stale market work cancelled", map[string]any{"source_block": trigger.Block, "latest_block": marketScheduler.LatestBlock(), "max_work_lag_blocks": maxWorkLag})
+					return
+				}
 				log.Event(logger.Warn, "health_check_failed", "market", "market cycle failed", map[string]any{"block": trigger.Block, "error_type": fmt.Sprintf("%T", cycleErr)})
 				publish(operationSink, observability.Errors, "market_cycle_failed", telegram.Warning, "market cycle failed", map[string]any{"block": trigger.Block, "error_type": fmt.Sprintf("%T", cycleErr)})
 				return
@@ -202,7 +214,9 @@ func main() {
 							continue
 						}
 						if executionPipeline != nil {
-							result := executionPipeline.Process(cycleCtx, outcome.Opportunity)
+							executionCtx, cancelExecution := context.WithTimeout(rpc.WithRequestClass(ctx, rpc.Critical), 45*time.Second)
+							result := executionPipeline.Process(executionCtx, outcome.Opportunity)
+							cancelExecution()
 							if strings.HasPrefix(result.Reason, "stale candidate:") {
 								stale++
 							}
@@ -315,6 +329,7 @@ func main() {
 				"prequote_ranking_enabled":         report.PreQuoteRanking,
 				"exploit_selected":                 report.ExploitSelected,
 				"explore_selected":                 report.ExploreSelected,
+				"new_selected":                     report.NewSelected,
 				"memory_routes":                    report.MemoryRoutes,
 				"avg_pre_quote_score":              report.AvgPreQuoteScore,
 				"cross_venue_evaluated":            report.CrossVenueQuoted,
@@ -322,6 +337,10 @@ func main() {
 				"routes_considered":                report.RoutesConsidered,
 				"routes_quoted":                    report.RoutesEvaluated,
 				"quote_age_blocks":                 report.QuoteAgeBlocks,
+				"quote_budget":                     report.QuoteBudget,
+				"quote_budget_used":                report.QuoteBudgetUsed,
+				"quote_budget_dropped":             report.QuoteBudgetDropped,
+				"no_quote_reason":                  report.NoQuoteReason,
 				"active_rpc_provider":              rpcClient.ActiveProvider(),
 				"active_wss_provider":              w.ActiveProvider(),
 				"rpc_provider_health":              rpcProviderHealthString(rpcClient.Snapshots()),
@@ -893,8 +912,12 @@ func marketSearchOptions(settings runtimeconfig.Settings) market.SearchOptions {
 	return market.SearchOptions{
 		EvaluationRoutesPerAsset: clampInt(depth*4, 8, 96),
 		OptimizerRoutesPerAsset:  clampInt(depth/2, 2, 16),
-		OptimizerSamplesPerRoute: clampInt(depth*2, 4, 64),
+		OptimizerSamplesPerRoute: envIntBounded("HIGH_SCORE_MAX_SAMPLES", clampInt(depth/2, 3, 5), 2, 16),
 		OptimizerSamplesPerCycle: optimizerSampleBudget(),
+		MaxQuotesPerCycle:        envIntBounded("MAX_QUOTES_PER_CYCLE", 40, 4, 256),
+		MaxOptimizedRoutes:       envIntBounded("MAX_OPTIMIZED_ROUTES_PER_CYCLE", 8, 1, 32),
+		NormalOptimizerSamples:   envIntBounded("NORMAL_MAX_SAMPLES", 3, 2, 16),
+		FullReconcileEvery:       uint64(envIntBounded("FULL_RECONCILE_EVERY_CYCLES", 2_400, 240, 100_000)),
 		DisablePreQuoteRanking:   strings.EqualFold(strings.TrimSpace(os.Getenv("PREQUOTE_RANKING_ENABLED")), "false"),
 		ExploreRatioBPS:          preQuoteExploreBPS(),
 		PersistentQuoteCache:     envEnabled("QUOTE_CACHE_ENABLED", true),
@@ -902,6 +925,42 @@ func marketSearchOptions(settings runtimeconfig.Settings) market.SearchOptions {
 		EarlyStop:                envEnabled("RPC_EARLY_STOP_ENABLED", true),
 		OptimizationFlagsSet:     true,
 	}
+}
+
+func envIntBounded(name string, fallback, min, max int) int {
+	raw := strings.TrimSpace(os.Getenv(name))
+	value, err := strconv.Atoi(raw)
+	if err != nil {
+		return fallback
+	}
+	return clampInt(value, min, max)
+}
+
+func blockBeyondTolerance(source, latest, tolerance uint64) bool {
+	return latest > source && latest-source > tolerance
+}
+
+func cancelWhenSuperseded(parent context.Context, latest func() uint64, source, tolerance uint64) (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(parent)
+	if latest == nil || source == 0 {
+		return ctx, cancel
+	}
+	go func() {
+		ticker := time.NewTicker(25 * time.Millisecond)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				if blockBeyondTolerance(source, latest(), tolerance) {
+					cancel()
+					return
+				}
+			}
+		}
+	}()
+	return ctx, cancel
 }
 
 func optimizerSampleBudget() int {
@@ -937,7 +996,7 @@ func rpcProviderConfigs(cfg config.Config) []rpc.ProviderConfig {
 		if strings.TrimSpace(provider.HTTP) == "" {
 			continue
 		}
-		out = append(out, rpc.ProviderConfig{Name: provider.Name, HTTP: provider.HTTP, MaxRPS: provider.MaxRPS, TargetRPS: provider.TargetRPS, Burst: provider.Burst, MaxBlockLag: provider.MaxBlockLag})
+		out = append(out, rpc.ProviderConfig{Name: provider.Name, HTTP: provider.HTTP, MaxRPS: provider.MaxRPS, TargetRPS: provider.TargetRPS, Burst: provider.Burst, MaxBlockLag: provider.MaxBlockLag, Tier: provider.Tier})
 	}
 	if len(out) == 0 {
 		out = append(out, rpc.ProviderConfig{Name: "primary", HTTP: cfg.HTTPRPCURL})
@@ -976,7 +1035,7 @@ func rpcProviderHealthString(snapshots []rpc.ProviderSnapshot) string {
 		if snapshot.Active {
 			active = ":active"
 		}
-		parts = append(parts, fmt.Sprintf("%s=%s%s,block=%d,latency_ms=%d,requests=%d,share_pct=%.1f,target_rps=%d,burst=%d,instantaneous_rps=%.1f,rate_limited=%d,cooldown_remaining_ms=%d,failures=%d", snapshot.Name, state, active, snapshot.LatestBlock, snapshot.Latency.Milliseconds(), snapshot.Requests, snapshot.SharePct, snapshot.TargetRPS, snapshot.Burst, snapshot.InstantaneousRPS, snapshot.RateLimited, snapshot.CooldownRemaining.Milliseconds(), snapshot.Failures))
+		parts = append(parts, fmt.Sprintf("%s=%s%s,tier=%s,block=%d,latency_ms=%d,requests=%d,share_pct=%.1f,target_rps=%d,burst=%d,inflight=%d,instantaneous_rps=%.1f,rate_limited=%d,cooldown_remaining_ms=%d,probation_remaining_ms=%d,failures=%d", snapshot.Name, state, active, snapshot.Tier, snapshot.LatestBlock, snapshot.Latency.Milliseconds(), snapshot.Requests, snapshot.SharePct, snapshot.TargetRPS, snapshot.Burst, snapshot.Inflight, snapshot.InstantaneousRPS, snapshot.RateLimited, snapshot.CooldownRemaining.Milliseconds(), snapshot.ProbationRemaining.Milliseconds(), snapshot.Failures))
 	}
 	return strings.Join(parts, ";")
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/dex"
 	"github.com/titanarb/titanarb-go/internal/pools"
 	"github.com/titanarb/titanarb-go/internal/quotes"
+	"github.com/titanarb/titanarb-go/internal/rpc"
 )
 
 type Caller interface {
@@ -98,6 +99,7 @@ func (s *Service) advanceHead(block uint64) {
 }
 
 func (s *Service) Run(ctx context.Context) {
+	ctx = rpc.WithRequestClass(ctx, rpc.Background)
 	if s == nil || s.Memory == nil || !s.Memory.cfg.Enabled || !s.started.CompareAndSwap(false, true) {
 		return
 	}

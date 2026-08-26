@@ -118,6 +118,9 @@ type Engine struct {
 	quoteDedup         uint64
 	quoteMisses        uint64
 	quoteInvalidations uint64
+	quoteBudget        int
+	quoteBudgetUsed    int
+	quoteBudgetDropped uint64
 }
 
 type QuoteCacheStats struct {
@@ -125,6 +128,9 @@ type QuoteCacheStats struct {
 	DedupHits     uint64
 	Misses        uint64
 	Invalidations uint64
+	Budget        int
+	BudgetUsed    int
+	BudgetDropped uint64
 	Entries       int
 }
 
@@ -163,6 +169,8 @@ func (e *Engine) ResetQuoteCache(block uint64) {
 	e.quoteDedup = 0
 	e.quoteMisses = 0
 	e.quoteInvalidations = 0
+	e.quoteBudgetUsed = 0
+	e.quoteBudgetDropped = 0
 	e.quoteMu.Unlock()
 }
 
@@ -179,6 +187,8 @@ func (e *Engine) PrepareQuoteCache(block uint64, dirty map[string]struct{}, pers
 	e.quoteDedup = 0
 	e.quoteMisses = 0
 	e.quoteInvalidations = 0
+	e.quoteBudgetUsed = 0
+	e.quoteBudgetDropped = 0
 	if e.quoteCache == nil || !persistent {
 		e.quoteCache = make(map[string]*quoteCacheEntry)
 		return
@@ -201,10 +211,26 @@ func (e *Engine) PrepareQuoteCache(block uint64, dirty map[string]struct{}, pers
 	}
 }
 
+// SetQuoteBudget caps fresh on-chain quote calls for the current market cycle.
+// Cache hits and concurrent deduplication do not consume budget. A non-positive
+// value disables the cap for backwards-compatible callers and tests.
+func (e *Engine) SetQuoteBudget(limit int) {
+	e.quoteMu.Lock()
+	e.quoteBudget = limit
+	e.quoteBudgetUsed = 0
+	e.quoteBudgetDropped = 0
+	e.quoteMu.Unlock()
+}
+
 func (e *Engine) QuoteCacheStats() QuoteCacheStats {
 	e.quoteMu.Lock()
 	defer e.quoteMu.Unlock()
-	return QuoteCacheStats{Hits: e.quoteHits, DedupHits: e.quoteDedup, Misses: e.quoteMisses, Invalidations: e.quoteInvalidations, Entries: len(e.quoteCache)}
+	return QuoteCacheStats{
+		Hits: e.quoteHits, DedupHits: e.quoteDedup, Misses: e.quoteMisses,
+		Invalidations: e.quoteInvalidations, Budget: e.quoteBudget,
+		BudgetUsed: e.quoteBudgetUsed, BudgetDropped: e.quoteBudgetDropped,
+		Entries: len(e.quoteCache),
+	}
 }
 
 type cachedCostEntry struct {
@@ -489,6 +515,12 @@ func (e *Engine) quote(ctx context.Context, quoter quotes.Quoter, req quotes.Req
 		return result, err
 	}
 	pool := strings.ToLower(req.Pool.Address)
+	if e.quoteBudget > 0 && e.quoteBudgetUsed >= e.quoteBudget {
+		e.quoteBudgetDropped++
+		e.quoteMu.Unlock()
+		return quotes.Result{}, fmt.Errorf("fresh quote budget exhausted")
+	}
+	e.quoteBudgetUsed++
 	entry := &quoteCacheEntry{ready: make(chan struct{}), pool: pool}
 	e.quoteCache[key] = entry
 	e.quoteMisses++

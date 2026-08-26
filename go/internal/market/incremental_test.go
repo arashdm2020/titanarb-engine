@@ -4,6 +4,7 @@ import (
 	"math/big"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/titanarb/titanarb-go/internal/config"
 	"github.com/titanarb/titanarb-go/internal/nearmiss"
@@ -167,6 +168,18 @@ func TestIdleCycleDoesNotAdvanceFullReconcileCounter(t *testing.T) {
 	}
 }
 
+func TestPeriodicFullReconcileIsRareAndConfigurable(t *testing.T) {
+	engine := &Engine{routeCache: []routes.Route{{Symbols: []string{"USDC", "WETH", "USDC"}}}, lastMaxHops: 4, lastMaxRoutes: 256, cyclesSinceFull: 2_399}
+	options := DefaultSearchOptions()
+	if engine.RequiresFullReconcile(4, 256, options) {
+		t.Fatal("periodic reconciliation triggered before configured interval")
+	}
+	engine.cyclesSinceFull = 2_400
+	if !engine.RequiresFullReconcile(4, 256, options) {
+		t.Fatal("periodic reconciliation did not trigger at configured interval")
+	}
+}
+
 func TestIncrementalRefreshBatchesSmallBlockDeltas(t *testing.T) {
 	if !shouldDeferIncrementalRefresh(100, 107, 8) {
 		t.Fatal("small block delta should be batched")
@@ -253,10 +266,33 @@ func TestSelectOptimizerCandidatesUsesRouteScoreBeforeRawProfit(t *testing.T) {
 
 func TestSamplesForScoreAllocatesMoreBudgetToHighScoreRoutes(t *testing.T) {
 	base := 8
-	high := samplesForScore(4_500, base)
-	low := samplesForScore(1_000, base)
+	high := samplesForScore(4_500, base, 3)
+	low := samplesForScore(1_000, base, 3)
 	if high != base || low != 2 {
 		t.Fatalf("unexpected sample allocation high=%d base=%d low=%d", high, base, low)
+	}
+}
+
+func TestBoundRoutesByQuoteCostEnforcesHopQuoteBudget(t *testing.T) {
+	twoHop := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3}, "1", "2")
+	threeHop := testRoute("USDC", []pools.DEX{pools.UniswapV3, pools.CamelotV3, pools.UniswapV3}, "3", "4", "5")
+	selected, used := boundRoutesByQuoteCost([]routes.Route{threeHop, twoHop, twoHop}, 5)
+	if used != 5 || len(selected) != 2 {
+		t.Fatalf("quote budget mismatch used=%d selected=%d", used, len(selected))
+	}
+}
+
+func TestMergeNearMissesRetainsLatestEconomicsAcrossIdleCycle(t *testing.T) {
+	old := nearmiss.Record{Route: "USDC -> WETH -> USDC", DEXPath: "uniswap_v3 -> camelot_v3", AmountIn: big.NewInt(1), GapToProfit: big.NewInt(10), Timestamp: time.Now().Add(-time.Minute)}
+	newer := old
+	newer.GapToProfit = big.NewInt(5)
+	newer.Timestamp = time.Now()
+	merged := mergeNearMisses([]nearmiss.Record{old}, []nearmiss.Record{newer}, 10)
+	if len(merged) != 1 || merged[0].GapToProfit.Cmp(big.NewInt(5)) != 0 {
+		t.Fatalf("rolling near miss mismatch: %+v", merged)
+	}
+	if idle := mergeNearMisses(merged, nil, 10); len(idle) != 1 {
+		t.Fatalf("idle cycle erased near miss: %+v", idle)
 	}
 }
 

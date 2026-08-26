@@ -49,6 +49,34 @@ func TestDynamicIntermediateKeepsExecutionAssetBoundary(t *testing.T) {
 	}
 }
 
+func TestCancelWhenSupersededCancelsOnlyBeyondTolerance(t *testing.T) {
+	var latest atomic.Uint64
+	latest.Store(100)
+	ctx, cancel := cancelWhenSuperseded(context.Background(), latest.Load, 100, 2)
+	defer cancel()
+	latest.Store(102)
+	select {
+	case <-ctx.Done():
+		t.Fatal("work cancelled inside configured block tolerance")
+	case <-time.After(60 * time.Millisecond):
+	}
+	latest.Store(103)
+	select {
+	case <-ctx.Done():
+	case <-time.After(250 * time.Millisecond):
+		t.Fatal("superseded work was not cancelled")
+	}
+}
+
+func TestBlockBeyondToleranceIsUint64Safe(t *testing.T) {
+	if blockBeyondTolerance(10, 9, 0) {
+		t.Fatal("older latest block underflowed")
+	}
+	if !blockBeyondTolerance(10, 13, 2) || blockBeyondTolerance(10, 12, 2) {
+		t.Fatal("block tolerance boundary mismatch")
+	}
+}
+
 func TestExplicitPerAssetRawAmountsAreRespected(t *testing.T) {
 	t.Setenv("TITANARB_MARKET_AMOUNT_WETH_RAW", "1000000000000000000")
 	market := config.MarketConfig{

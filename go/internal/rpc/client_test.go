@@ -3,6 +3,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"github.com/titanarb/titanarb-go/internal/metrics"
 	"net/http"
 	"net/http/httptest"
@@ -310,6 +311,22 @@ func TestRateLimitCooldownIsExponentialAndBounded(t *testing.T) {
 	}
 }
 
+func TestDailyQuotaExhaustionUsesLongCooldown(t *testing.T) {
+	primary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"error":{"code":-32001,"message":"daily request limit reached"}}`)
+	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x2"}`)
+	client := NewManaged([]ProviderConfig{{Name: "quicknode", HTTP: primary.URL}, {Name: "chainstack", HTTP: secondary.URL}}, time.Second, 1, nil)
+	if _, err := client.BlockNumber(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	quotaErr := fmt.Errorf("rpc error -32001: daily request limit reached")
+	client.recordFailure(client.providers[0], quotaErr)
+	client.recordFailure(client.providers[0], quotaErr)
+	snapshot := client.Snapshots()[0]
+	if snapshot.CooldownRemaining < 5*time.Hour {
+		t.Fatalf("quota-exhausted provider cooldown too short: %s", snapshot.CooldownRemaining)
+	}
+}
+
 func TestManagedClientGlobalReadLimiter(t *testing.T) {
 	var quicknodeCalls atomic.Int32
 	var chainstackCalls atomic.Int32
@@ -396,6 +413,9 @@ func TestManagedClientPrimaryRecoveryHysteresis(t *testing.T) {
 	client.lastSwitch = time.Now().Add(-3 * time.Minute)
 	client.providers[0].cooldownUntil = time.Now().Add(-time.Second)
 	client.providers[0].recent429Until = time.Now().Add(-time.Second)
+	client.providers[0].probationUntil = time.Now().Add(-time.Second)
+	client.providers[0].consecutiveFailure = 0
+	client.providers[1].inflight = 10
 	client.mu.Unlock()
 
 	if block, err := client.BlockNumber(context.Background()); err != nil || block != 0x3 {
@@ -406,6 +426,112 @@ func TestManagedClientPrimaryRecoveryHysteresis(t *testing.T) {
 	}
 	if primaryCalls.Load() != 2 || secondaryCalls.Load() != 2 {
 		t.Fatalf("unexpected request distribution primary=%d secondary=%d", primaryCalls.Load(), secondaryCalls.Load())
+	}
+}
+
+func TestAlchemyPremiumPoolDistributesHotPathAcrossThreeEndpoints(t *testing.T) {
+	counts := []*atomic.Int32{{}, {}, {}}
+	servers := make([]*httptest.Server, 0, 3)
+	configs := make([]ProviderConfig, 0, 3)
+	for i := range counts {
+		server := countingRPCServer(t, counts[i], `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+		servers = append(servers, server)
+		configs = append(configs, ProviderConfig{Name: fmt.Sprintf("alchemy_%d", i+1), HTTP: server.URL, Tier: "premium", TargetRPS: 100, Burst: 1})
+	}
+	client := NewManaged(configs, time.Second, 0, nil)
+	ctx := WithRequestClass(context.Background(), HotPath)
+	for i := 0; i < 12; i++ {
+		if _, err := client.BlockNumber(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, count := range counts {
+		if count.Load() == 0 {
+			t.Fatalf("alchemy endpoint %d received no hot-path reads", i+1)
+		}
+	}
+}
+
+func TestBackgroundTrafficExcludesHealthyPremiumPool(t *testing.T) {
+	var cheapCalls, premiumCalls atomic.Int32
+	cheap := countingRPCServer(t, &cheapCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	premium := countingRPCServer(t, &premiumCalls, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManaged([]ProviderConfig{
+		{Name: "chainstack", HTTP: cheap.URL, Tier: "cheap", TargetRPS: 100},
+		{Name: "alchemy_1", HTTP: premium.URL, Tier: "premium", TargetRPS: 100},
+	}, time.Second, 0, nil)
+	ctx := WithRequestClass(context.Background(), Background)
+	for i := 0; i < 5; i++ {
+		if _, err := client.BlockNumber(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if cheapCalls.Load() != 5 || premiumCalls.Load() != 0 {
+		t.Fatalf("background tier leak cheap=%d premium=%d", cheapCalls.Load(), premiumCalls.Load())
+	}
+}
+
+func TestHotPathUsesCheapFallbackOnlyWhenPremiumUnavailable(t *testing.T) {
+	client := NewManaged([]ProviderConfig{
+		{Name: "chainstack", HTTP: "http://cheap.invalid", Tier: "cheap", TargetRPS: 100},
+		{Name: "alchemy_1", HTTP: "http://premium.invalid", Tier: "premium", TargetRPS: 1},
+	}, time.Second, 0, nil)
+	client.providers[0].requests = 0
+	client.providers[1].requests = 1_000_000
+	provider, _, _ := client.chooseReadProvider(HotPath)
+	if provider.cfg.Name != "alchemy_1" {
+		t.Fatalf("healthy premium tier was bypassed because of historical load: %s", provider.cfg.Name)
+	}
+	client.providers[1].cooldownUntil = time.Now().Add(time.Minute)
+	provider, _, _ = client.chooseReadProvider(HotPath)
+	if provider.cfg.Name != "chainstack" {
+		t.Fatalf("cheap fallback not selected during premium cooldown: %s", provider.cfg.Name)
+	}
+}
+
+func TestPremiumAggregateBudgetPacesThreeEndpoints(t *testing.T) {
+	server := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManagedWithBudgets([]ProviderConfig{
+		{Name: "alchemy_1", HTTP: server.URL, Tier: "premium", TargetRPS: 100},
+		{Name: "alchemy_2", HTTP: server.URL, Tier: "premium", TargetRPS: 100},
+		{Name: "alchemy_3", HTTP: server.URL, Tier: "premium", TargetRPS: 100},
+	}, 0, 2, 0, 0, time.Second, 0, nil)
+	ctx := WithRequestClass(context.Background(), HotPath)
+	started := time.Now()
+	for i := 0; i < 3; i++ {
+		if _, err := client.BlockNumber(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if elapsed := time.Since(started); elapsed < 900*time.Millisecond {
+		t.Fatalf("aggregate premium RPS was not bounded: %s", elapsed)
+	}
+}
+
+func TestProviderProbationExcludesRecoveredEndpoint(t *testing.T) {
+	client := NewManaged([]ProviderConfig{
+		{Name: "alchemy_1", HTTP: "http://alchemy-1.invalid", Tier: "premium", TargetRPS: 10},
+		{Name: "alchemy_2", HTTP: "http://alchemy-2.invalid", Tier: "premium", TargetRPS: 10},
+	}, time.Second, 0, nil)
+	client.providers[0].probationUntil = time.Now().Add(time.Minute)
+	provider, _, _ := client.chooseReadProvider(HotPath)
+	if provider.cfg.Name != "alchemy_2" {
+		t.Fatalf("probation endpoint selected while healthy peer exists: %s", provider.cfg.Name)
+	}
+}
+
+func TestHotPathMinuteBudgetShedsQuotesButCriticalBypasses(t *testing.T) {
+	server := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManagedWithBudgets([]ProviderConfig{{Name: "alchemy_1", HTTP: server.URL, Tier: "premium", TargetRPS: 100}}, 0, 0, 0, 1, time.Second, 0, nil)
+	var out string
+	if err := client.Call(WithRequestClass(context.Background(), HotPath), "eth_call", []any{}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if err := client.Call(WithRequestClass(context.Background(), HotPath), "eth_call", []any{}, &out); err == nil || !strings.Contains(err.Error(), "hot-path minute budget") {
+		t.Fatalf("second hot-path call was not shed: %v", err)
+	}
+	if err := client.Call(WithRequestClass(context.Background(), Critical), "eth_call", []any{}, &out); err != nil {
+		t.Fatalf("critical RPC was starved by quote budget: %v", err)
 	}
 }
 

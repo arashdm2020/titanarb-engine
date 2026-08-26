@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/hex"
 	"math/big"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -309,5 +310,30 @@ func TestQuoteCacheRollbackUsesLegacyPerCycleState(t *testing.T) {
 	_, _ = e.EvaluateSilent(context.Background(), route, big.NewInt(1000))
 	if got := q.calls.Load(); got != 4 {
 		t.Fatalf("legacy per-cycle behavior was not restored: calls=%d", got)
+	}
+}
+
+func TestQuoteBudgetCapsFreshCallsButAllowsCacheReuse(t *testing.T) {
+	a := "0x0000000000000000000000000000000000000001"
+	b := "0x0000000000000000000000000000000000000002"
+	market := config.MarketConfig{AavePool: "0x0000000000000000000000000000000000000003", Tokens: map[string]config.Token{"USDC": token("USDC", a), "WETH": token("WETH", b)}}
+	p := pools.Pool{Address: "0x00000000000000000000000000000000000000ef", Token0: a, Token1: b, DEX: pools.UniswapV3, Fee: 500, Liquidity: big.NewInt(1)}
+	route := routes.Route{Symbols: []string{"USDC", "WETH", "USDC"}, Hops: []pools.Pool{p, p}}
+	q := &countingQuoter{}
+	e := New(caller{}, market, q, q, StaticCostModel{L2Fee: big.NewInt(1), L1Fee: big.NewInt(1)}, big.NewInt(1), 1, nil)
+	e.PrepareQuoteCache(123, nil, false)
+	e.SetQuoteBudget(2)
+	if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1000)); err != nil {
+		t.Fatalf("cached route should not consume budget: %v", err)
+	}
+	if _, err := e.EvaluateSilent(context.Background(), route, big.NewInt(1001)); err == nil || !strings.Contains(err.Error(), "budget exhausted") {
+		t.Fatalf("fresh amount exceeded quote budget without rejection: %v", err)
+	}
+	stats := e.QuoteCacheStats()
+	if stats.BudgetUsed != 2 || stats.BudgetDropped != 1 || q.calls.Load() != 2 {
+		t.Fatalf("quote budget telemetry mismatch stats=%+v calls=%d", stats, q.calls.Load())
 	}
 }

@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -100,6 +101,34 @@ func TestPrimarySecondaryRPCProviderConfig(t *testing.T) {
 	}
 	if cfg.RPCReadTargetRPS != 17 {
 		t.Fatalf("read target RPS mismatch: %+v", cfg)
+	}
+}
+
+func TestAlchemyPremiumReadPoolConfig(t *testing.T) {
+	v := validEnv()
+	v["RPC_PRIMARY_HTTP"] = "https://cheap.example"
+	v["RPC_PRIMARY_TIER"] = "emergency"
+	v["RPC_SECONDARY_HTTP"] = "https://background.example"
+	v["RPC_SECONDARY_TIER"] = "cheap"
+	v["RPC_ALCHEMY_ENDPOINT_RPS"] = "3"
+	v["RPC_ALCHEMY_ENDPOINT_BURST"] = "1"
+	for i := 1; i <= 3; i++ {
+		v[fmt.Sprintf("RPC_ALCHEMY_HTTP_%d", i)] = fmt.Sprintf("https://alchemy-%d.example", i)
+	}
+	cfg, err := FromLookup(lookup(v))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.RPCProviders) != 5 {
+		t.Fatalf("provider count=%d want 5: %+v", len(cfg.RPCProviders), cfg.RPCProviders)
+	}
+	for i, provider := range cfg.RPCProviders[2:] {
+		if provider.Name != fmt.Sprintf("alchemy_%d", i+1) || provider.Tier != "premium" || provider.TargetRPS != 3 || provider.Burst != 1 {
+			t.Fatalf("alchemy provider %d mismatch: %+v", i+1, provider)
+		}
+	}
+	if cfg.RPCReadTargetRPS != 8 || cfg.RPCPremiumAggregateRPS != 6 || cfg.RPCMaxEthCallsPerMinute != 480 || cfg.RPCMaxHotCallsPerMinute != 360 {
+		t.Fatalf("default RPC budgets mismatch: %+v", cfg)
 	}
 }
 

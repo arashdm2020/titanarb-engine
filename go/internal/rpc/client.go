@@ -36,16 +36,40 @@ func (e *Error) Error() string { return e.Err.Error() }
 func (e *Error) Unwrap() error { return e.Err }
 
 type Client struct {
-	endpoint    string
-	http        *http.Client
-	retries     int
-	metrics     *metrics.Metrics
-	providers   []*providerState
-	readLimiter *rateLimiter
-	mu          sync.Mutex
-	active      int
-	lastSwitch  time.Time
-	observer    func(Event)
+	endpoint       string
+	http           *http.Client
+	retries        int
+	metrics        *metrics.Metrics
+	providers      []*providerState
+	readLimiter    *rateLimiter
+	premiumLimiter *rateLimiter
+	ethBudget      *minuteBudget
+	hotBudget      *minuteBudget
+	mu             sync.Mutex
+	active         int
+	lastSwitch     time.Time
+	observer       func(Event)
+}
+
+type RequestClass string
+
+const (
+	Standard   RequestClass = "standard"
+	Background RequestClass = "background"
+	HotPath    RequestClass = "hot_path"
+	Critical   RequestClass = "critical"
+)
+
+type requestClassKey struct{}
+
+func WithRequestClass(ctx context.Context, class RequestClass) context.Context {
+	return context.WithValue(ctx, requestClassKey{}, class)
+}
+func requestClass(ctx context.Context) RequestClass {
+	if v, ok := ctx.Value(requestClassKey{}).(RequestClass); ok {
+		return v
+	}
+	return Standard
 }
 
 func New(endpoint string, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -53,8 +77,15 @@ func New(endpoint string, timeout time.Duration, retries int, m *metrics.Metrics
 }
 
 func NewManagedWithReadBudget(configs []ProviderConfig, readTargetRPS int, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
+	return NewManagedWithBudgets(configs, readTargetRPS, 0, 0, 0, timeout, retries, m)
+}
+
+func NewManagedWithBudgets(configs []ProviderConfig, readTargetRPS, premiumRPS, maxEthCallsPerMinute, maxHotCallsPerMinute int, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
 	client := newManaged(configs, timeout, retries, m)
 	client.readLimiter = newRateLimiter(readTargetRPS)
+	client.premiumLimiter = newRateLimiterWithBurst(premiumRPS, 1)
+	client.ethBudget = newMinuteBudget(maxEthCallsPerMinute)
+	client.hotBudget = newMinuteBudget(maxHotCallsPerMinute)
 	return client
 }
 
@@ -65,25 +96,29 @@ type ProviderConfig struct {
 	TargetRPS   int
 	Burst       int
 	MaxBlockLag int
+	Tier        string
 }
 
 type ProviderSnapshot struct {
-	Name              string
-	Healthy           bool
-	Active            bool
-	Requests          uint64
-	RateLimited       uint64
-	Failures          uint64
-	Latency           time.Duration
-	LatestBlock       uint64
-	CooldownUntil     time.Time
-	ConsecutiveFailed uint64
-	MaxRPS            int
-	TargetRPS         int
-	SharePct          float64
-	Burst             int
-	InstantaneousRPS  float64
-	CooldownRemaining time.Duration
+	Name               string
+	Healthy            bool
+	Active             bool
+	Requests           uint64
+	RateLimited        uint64
+	Failures           uint64
+	Latency            time.Duration
+	LatestBlock        uint64
+	CooldownUntil      time.Time
+	ConsecutiveFailed  uint64
+	MaxRPS             int
+	TargetRPS          int
+	SharePct           float64
+	Burst              int
+	InstantaneousRPS   float64
+	CooldownRemaining  time.Duration
+	Tier               string
+	Inflight           int
+	ProbationRemaining time.Duration
 }
 
 type Event struct {
@@ -110,6 +145,8 @@ type providerState struct {
 	requestTimes       []time.Time
 	rateLimitStreak    uint64
 	recent429Until     time.Time
+	probationUntil     time.Time
+	inflight           int
 }
 
 func NewManaged(configs []ProviderConfig, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -127,6 +164,7 @@ func newManaged(configs []ProviderConfig, timeout time.Duration, retries int, m 
 		if cfg.Name == "" {
 			cfg.Name = "provider"
 		}
+		cfg.Tier = normalizeTier(cfg.Tier)
 		client.providers = append(client.providers, &providerState{cfg: cfg, limiter: newRateLimiterWithBurst(effectiveRPS(cfg), effectiveBurst(cfg))})
 	}
 	if len(client.providers) > 0 {
@@ -180,13 +218,27 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 		return c.callOnceNoFailover(ctx, method, body, out)
 	}
 	var last error
+	class := requestClass(ctx)
 	for attempt := 0; attempt <= c.retries; attempt++ {
-		if err := c.readLimiter.Wait(ctx); err != nil {
-			return err
+		if method == "eth_call" && class == HotPath && c.hotBudget != nil && !c.hotBudget.Allow() {
+			return &Error{Network, errors.New("RPC hot-path minute budget exhausted")}
 		}
-		provider, providerIndex, providerDelay := c.chooseReadProvider()
+		if method == "eth_call" && class != Critical && c.ethBudget != nil && !c.ethBudget.Allow() {
+			return &Error{Network, errors.New("RPC eth_call minute budget exhausted")}
+		}
+		if class != Critical && c.readLimiter != nil {
+			if err := c.readLimiter.Wait(ctx); err != nil {
+				return err
+			}
+		}
+		provider, providerIndex, providerDelay := c.chooseReadProvider(class)
 		if provider == nil {
-			return &Error{Network, errors.New("no RPC provider configured")}
+			return &Error{Network, errors.New("no eligible RPC provider configured")}
+		}
+		if provider.cfg.Tier == "premium" && class != Critical && c.premiumLimiter != nil {
+			if err := c.premiumLimiter.Wait(ctx); err != nil {
+				return err
+			}
 		}
 		if err := waitDelay(ctx, providerDelay); err != nil {
 			return err
@@ -247,6 +299,10 @@ func (c *Client) callOnceNoFailover(ctx context.Context, method string, body []b
 }
 
 func (c *Client) callProvider(ctx context.Context, provider *providerState, body []byte, out any) error {
+	c.mu.Lock()
+	provider.inflight++
+	c.mu.Unlock()
+	defer func() { c.mu.Lock(); provider.inflight--; c.mu.Unlock() }()
 	started := time.Now()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, provider.cfg.HTTP, bytes.NewReader(body))
 	if err != nil {
@@ -263,6 +319,9 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 		return classify(readErr)
 	}
 	if resp.StatusCode == http.StatusTooManyRequests {
+		if quotaLimitMessage(string(data)) {
+			return &Error{HTTP, errors.New("rpc HTTP status 429: quota exhausted")}
+		}
 		return &Error{HTTP, fmt.Errorf("rpc HTTP status %d", resp.StatusCode)}
 	}
 	if resp.StatusCode >= 500 {
@@ -283,6 +342,9 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 	}
 	if envelope.Error != nil {
 		if rpcRateLimited(envelope.Error.Code, envelope.Error.Message) {
+			if quotaLimitMessage(envelope.Error.Message) {
+				return &Error{HTTP, errors.New("rpc HTTP status 429: quota exhausted")}
+			}
 			return &Error{HTTP, errors.New("rpc HTTP status 429")}
 		}
 		return &Error{RPC, errors.New(envelope.Error.Message)}
@@ -303,6 +365,13 @@ func rpcRateLimited(code int, message string) bool {
 		strings.Contains(m, "too many requests") ||
 		strings.Contains(m, "daily request limit") ||
 		strings.Contains(m, "usage limit")
+}
+
+func quotaLimitMessage(message string) bool {
+	m := strings.ToLower(message)
+	return strings.Contains(m, "daily request limit") ||
+		strings.Contains(m, "usage limit") ||
+		strings.Contains(m, "quota exhausted")
 }
 
 func (c *Client) chooseProvider() (*providerState, int) {
@@ -326,7 +395,11 @@ func (c *Client) chooseProvider() (*providerState, int) {
 	return c.providers[c.active], c.active
 }
 
-func (c *Client) chooseReadProvider() (*providerState, int, time.Duration) {
+func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, int, time.Duration) {
+	class := Standard
+	if len(classes) > 0 {
+		class = classes[0]
+	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if len(c.providers) == 0 {
@@ -336,36 +409,72 @@ func (c *Client) chooseReadProvider() (*providerState, int, time.Duration) {
 	bestBlock := c.bestKnownBlockLocked()
 	bestIndex := -1
 	var bestScore time.Duration
-	for index, provider := range c.providers {
-		if now.Before(provider.cooldownUntil) {
-			continue
-		}
-		if providerLagged(provider, bestBlock, now) {
-			continue
-		}
-		score := provider.limiter.Delay()
-		if now.Before(provider.recent429Until) {
-			score += 250 * time.Millisecond
-		}
-		if provider.latencyEMA > 0 {
-			score += provider.latencyEMA / 20
-		}
-		if rps := effectiveRPS(provider.cfg); rps > 0 {
-			score -= time.Second / time.Duration(rps*4)
-		}
-		if bestIndex == -1 || score < bestScore || (score == bestScore && index < bestIndex) {
-			bestIndex = index
-			bestScore = score
-		}
-	}
-	if bestIndex == -1 {
+	bestTier := 99
+	for pass := 0; pass < 2 && bestIndex == -1; pass++ {
 		for index, provider := range c.providers {
 			if now.Before(provider.cooldownUntil) {
 				continue
 			}
-			if bestIndex == -1 || provider.limiter.Delay() < bestScore {
+			rank := tierRank(class, provider.cfg.Tier)
+			if rank >= 99 {
+				continue
+			}
+			if pass == 0 && now.Before(provider.probationUntil) {
+				continue
+			}
+			if providerLagged(provider, bestBlock, now) {
+				continue
+			}
+			if rank > bestTier {
+				continue
+			}
+			if rank < bestTier {
+				bestTier = rank
+				bestIndex = -1
+			}
+			score := provider.limiter.Delay()
+			if now.Before(provider.recent429Until) {
+				score += 250 * time.Millisecond
+			}
+			if provider.latencyEMA > 0 {
+				score += provider.latencyEMA / 20
+			}
+			score += time.Duration(provider.inflight) * 25 * time.Millisecond
+			score += time.Duration(provider.consecutiveFailure) * 100 * time.Millisecond
+			if rps := effectiveRPS(provider.cfg); rps > 0 {
+				// Weighted virtual finish time prevents a consistently faster or
+				// earlier-listed endpoint from starving healthy peers while still
+				// assigning proportionally more work to larger configured budgets.
+				score += time.Duration(provider.requests) * time.Second / time.Duration(rps)
+			}
+			if bestIndex == -1 || score < bestScore || (score == bestScore && index < bestIndex) {
 				bestIndex = index
-				bestScore = provider.limiter.Delay()
+				bestScore = score
+			}
+		}
+	}
+	if bestIndex == -1 {
+		bestTier = 99
+		for index, provider := range c.providers {
+			rank := tierRank(class, provider.cfg.Tier)
+			if rank >= 99 {
+				continue
+			}
+			if rank > bestTier {
+				continue
+			}
+			if rank < bestTier {
+				bestTier = rank
+				bestIndex = -1
+			}
+			delay := provider.limiter.Delay()
+			if cooldown := time.Until(provider.cooldownUntil); cooldown > delay {
+				delay = cooldown
+			}
+			score := delay
+			if bestIndex == -1 || score < bestScore {
+				bestIndex = index
+				bestScore = score
 			}
 		}
 	}
@@ -378,7 +487,11 @@ func (c *Client) chooseReadProvider() (*providerState, int, time.Duration) {
 	}
 	c.active = bestIndex
 	provider := c.providers[bestIndex]
-	return provider, bestIndex, provider.limiter.ReserveDelay()
+	delay := provider.limiter.ReserveDelay()
+	if cooldown := time.Until(provider.cooldownUntil); cooldown > delay {
+		delay = cooldown
+	}
+	return provider, bestIndex, delay
 }
 
 func (c *Client) bestKnownBlockLocked() uint64 {
@@ -443,11 +556,18 @@ func (c *Client) recordFailure(provider *providerState, err error) {
 		provider.rateLimited++
 		provider.rateLimitStreak++
 		cooldown = exponentialRateLimitCooldown(provider.rateLimitStreak)
+		if quotaLimitMessage(err.Error()) {
+			cooldown = 6 * time.Hour
+		}
 		provider.recent429Until = time.Now().Add(cooldown + 2*time.Minute)
 	}
 	provider.cooldownUntil = time.Now().Add(cooldown)
+	provider.probationUntil = provider.cooldownUntil.Add(time.Minute)
 	if provider.consecutiveFailure >= 3 {
-		provider.cooldownUntil = time.Now().Add(60 * time.Second)
+		minimumCooldown := time.Now().Add(60 * time.Second)
+		if provider.cooldownUntil.Before(minimumCooldown) {
+			provider.cooldownUntil = minimumCooldown
+		}
 	}
 }
 
@@ -570,9 +690,76 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 			Burst:             effectiveBurst(provider.cfg),
 			InstantaneousRPS:  float64(len(provider.requestTimes)),
 			CooldownRemaining: positiveDuration(unavailableUntil.Sub(now)),
+			Tier:              provider.cfg.Tier, Inflight: provider.inflight,
+			ProbationRemaining: positiveDuration(provider.probationUntil.Sub(now)),
 		})
 	}
 	return out
+}
+
+func normalizeTier(tier string) string {
+	tier = strings.ToLower(strings.TrimSpace(tier))
+	if tier != "premium" && tier != "emergency" {
+		return "cheap"
+	}
+	return tier
+}
+func tierRank(class RequestClass, tier string) int {
+	switch class {
+	case Background:
+		if tier == "cheap" {
+			return 0
+		}
+		if tier == "emergency" {
+			return 1
+		}
+		return 99
+	case HotPath, Critical:
+		if tier == "premium" {
+			return 0
+		}
+		if tier == "cheap" {
+			return 1
+		}
+		return 2
+	default:
+		if tier == "cheap" {
+			return 0
+		}
+		if tier == "premium" {
+			return 1
+		}
+		return 2
+	}
+}
+
+type minuteBudget struct {
+	mu    sync.Mutex
+	limit int
+	calls []time.Time
+}
+
+func newMinuteBudget(limit int) *minuteBudget {
+	if limit <= 0 {
+		return nil
+	}
+	return &minuteBudget{limit: limit}
+}
+func (b *minuteBudget) Allow() bool {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	now := time.Now()
+	cutoff := now.Add(-time.Minute)
+	i := 0
+	for i < len(b.calls) && b.calls[i].Before(cutoff) {
+		i++
+	}
+	b.calls = append(b.calls[:0], b.calls[i:]...)
+	if len(b.calls) >= b.limit {
+		return false
+	}
+	b.calls = append(b.calls, now)
+	return true
 }
 
 func effectiveRPS(cfg ProviderConfig) int {
