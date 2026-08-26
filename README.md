@@ -1,181 +1,235 @@
-# TitanArb — Arbitrum One Arbitrage Engine
-
-TitanArb is a production-oriented arbitrage engine for **Arbitrum One**. The current runtime is written in **Go** and combines block-driven market discovery, multi-venue route search, executable quoting, adaptive opportunity ranking, Aave V3 flash-loan execution, and a guarded on-chain executor.
-
-The active architecture is built around:
-
-- **Arbitrum One** (`chainId = 42161`)
-- **Go runtime** under `go/`
-- **Aave V3** flash liquidity
-- **Uniswap V3** and **Camelot V3 / Algebra** adapters
-- **2-hop, 3-hop, and 4-hop** cycle discovery
-- incremental dirty-pool refresh and latest-head block coalescing
-- dynamic market-only universe expansion
-- pre-quote route intelligence with durable `RouteMemory`
-- exploit/explore scheduling
-- adaptive optimizer depth
-- active-active HTTP RPC reads with provider failover
-- single-owner WSS subscriptions
-- live execution preflight, simulation, profitability, slippage, repayment, and stale-state gates
-- structured observability and Telegram operational reporting
-
-> TitanArb is an engineering system for detecting and attempting arbitrage. It does not guarantee profitable opportunities or successful execution.
-
----
-
-## 1. Current architecture
-
 ```text
-                           Arbitrum One
-                                │
-                     WSS heads / pool logs
-                                │
-                                ▼
-                    ┌─────────────────────┐
-                    │ scheduler.Latest    │
-                    │ latest-head coalesce│
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ Market Engine       │
-                    │ incremental refresh │
-                    │ dirty route subset  │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ Route Intelligence  │
-                    │ RouteMemory         │
-                    │ PreQuoteScore       │
-                    │ exploit / explore   │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ Executable Quotes   │
-                    │ Uni V3 / Camelot V3 │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ Opportunity Engine  │
-                    │ premium + fees      │
-                    │ min-profit economics│
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ Optimizer           │
-                    │ adaptive samples    │
-                    │ near-miss ranking   │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ Execution Pipeline  │
-                    │ freshness           │
-                    │ simulation          │
-                    │ slippage / repayment│
-                    │ broadcast           │
-                    └──────────┬──────────┘
-                               │
-                               ▼
-                    ┌─────────────────────┐
-                    │ FlashArbitrage      │
-                    │ Executor            │
-                    └──────────┬──────────┘
-                               │
-                  Aave V3 flash loan callback
-                               │
-                               ▼
-                  Uniswap V3 / Camelot V3 swaps
-                               │
-                               ▼
-                      repay + realized profit
+████████╗██╗████████╗ █████╗ ███╗   ██╗ █████╗ ██████╗ ██████╗
+╚══██╔══╝██║╚══██╔══╝██╔══██╗████╗  ██║██╔══██╗██╔══██╗██╔══██╗
+   ██║   ██║   ██║   ███████║██╔██╗ ██║███████║██████╔╝██████╔╝
+   ██║   ██║   ██║   ██╔══██║██║╚██╗██║██╔══██║██╔══██╗██╔══██╗
+   ██║   ██║   ██║   ██║  ██║██║ ╚████║██║  ██║██║  ██║██║  ██║
+   ╚═╝   ╚═╝   ╚═╝   ╚═╝  ╚═╝╚═╝  ╚═══╝╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚═╝
+
+                 ARBITRUM ONE ARBITRAGE ENGINE
 ```
 
-The detector and execution layers are intentionally separated: detector scoring may change which routes receive quote/optimizer budget, but it does not bypass execution profitability or safety checks.
+# TitanArb
+
+**A production-grade, live-capable DeFi arbitrage engine for Arbitrum One.**
+
+![Arbitrum](https://img.shields.io/badge/Network-Arbitrum%20One-2D374B?style=flat-square)
+![Go](https://img.shields.io/badge/Runtime-Go-00ADD8?style=flat-square)
+![Aave](https://img.shields.io/badge/Flash%20Liquidity-Aave%20V3-B6509E?style=flat-square)
+![Uniswap](https://img.shields.io/badge/DEX-Uniswap%20V3-FF007A?style=flat-square)
+![Camelot](https://img.shields.io/badge/DEX-Camelot%20V3-E5523E?style=flat-square)
+![Execution](https://img.shields.io/badge/Execution-Live%20Capable-2EA44F?style=flat-square)
+
+TitanArb continuously converts new Arbitrum state into a bounded set of executable arbitrage candidates, ranks the best routes, quotes them against real DEX execution paths, optimizes flash-loan size, verifies economics, simulates the transaction, and only then allows a trade to reach the on-chain executor.
+
+This is not a spot-price comparison script and it is not a fixed triangular-arbitrage demo. TitanArb is built around **executable economics**: flash-loan premium, DEX fees, gas, slippage, price impact, liquidity, block freshness, route quality, and repayment all have to survive before a candidate can execute.
+
+> **The goal is not to trade often. The goal is to identify when a trade is actually worth executing.**
 
 ---
 
-## 2. Repository layout
+## Production status
+
+TitanArb contains the production runtime and deployed Arbitrum contracts used by the engine.
+
+- ✅ **Go production runtime**
+- ✅ **Arbitrum One deployment**
+- ✅ **Aave V3 flash-loan execution path**
+- ✅ **Uniswap V3 + Camelot V3 / Algebra adapters**
+- ✅ **2-hop, 3-hop, and 4-hop route search**
+- ✅ **Live execution preflight + simulation**
+- ✅ **Pair-centric market intelligence**
+- ✅ **Persistent RouteMemory and pre-quote ranking**
+- ✅ **Bounded quote and optimizer budgets**
+- ✅ **Incremental dirty-pool processing**
+- ✅ **Checkpointed background reconciliation**
+- ✅ **Health/latency-aware multi-provider RPC routing**
+- ✅ **Single-owner WSS and single-path transaction broadcast**
+- ✅ **Structured production telemetry and Telegram operations**
+
+---
+
+## At a glance
+
+| Area | TitanArb |
+|---|---|
+| Network | Arbitrum One (`chainId 42161`) |
+| Runtime | Go |
+| Flash liquidity | Aave V3 |
+| DEX execution | Uniswap V3, Camelot V3 / Algebra |
+| Route depth | 2-hop, 3-hop, 4-hop cycles |
+| Market model | Dirty-pool incremental updates + checkpointed reconciliation |
+| Search intelligence | PairScore + RouteMemory + exploit/explore/new scheduling |
+| Quote model | Executable DEX quotes, bounded globally |
+| Optimizer | Adaptive, score-aware loan-size search |
+| RPC | Tiered, health-aware, latency-aware, load-aware |
+| Execution | Preflight → economics → freshness → simulation → broadcast |
+| Safety boundary | Market discovery cannot bypass execution gates |
+
+---
+
+## Why TitanArb exists
+
+A visible price difference between two pools is not automatically an arbitrage opportunity.
+
+A route can look profitable and still fail after accounting for:
+
+- Aave flash-loan premium
+- DEX swap fees
+- L1 data cost and L2 gas
+- slippage
+- price impact
+- available liquidity
+- stale state
+- route execution constraints
+- repayment requirements
+
+TitanArb treats those costs as part of the opportunity itself, not as an afterthought.
+
+That changes the core question from:
+
+> “Where is the price different?”
+
+into:
+
+> **“Which route, at what loan size, is still executable and profitable after every real cost?”**
+
+---
+
+## Performance
+
+A major part of TitanArb is keeping the hot path small enough to react to Arbitrum state without drowning in its own RPC workload.
+
+A representative production benchmark after the hot-path/RPC refactor:
+
+| Metric | Before | After |
+|---|---:|---:|
+| Dirty market cycle | ~16.6s | **~2.56s** |
+| Quote duration | ~14.2s | **~1.43s** |
+| RPC calls / cycle | ~128 | **~15** |
+| Fresh quotes / cycle | ~84–90 | **~4** |
+| Block lag | ~66 | **~10** |
+
+Full reconciliation was also moved away from a large synchronous refresh. It now progresses through small checkpointed units and yields to latency-sensitive market work instead of blocking the engine with a single large RPC burst.
+
+Production timings depend on market activity and RPC conditions; the important property is that expensive work is **bounded, prioritized, and observable**.
+
+---
+
+## Architecture
 
 ```text
-.
-├── go/                         # Current production runtime
-│   ├── cmd/titanarb/           # Main TitanArb process
-│   ├── internal/
-│   │   ├── config/             # Runtime / market configuration
-│   │   ├── market/             # Block-driven market engine
-│   │   ├── scheduler/          # Latest-head coalescing
-│   │   ├── pools/              # Pool discovery / refresh
-│   │   ├── routes/             # 2/3/4-hop route graph + builders
-│   │   ├── quotes/             # Executable quote plumbing
-│   │   ├── opportunity/        # Route economics
-│   │   ├── nearmiss/           # Rejected economics + RouteMemory
-│   │   ├── optimizer/          # Loan-size search
-│   │   ├── execution/          # Simulation / live execution pipeline
-│   │   ├── rpc/                # Multi-provider HTTP RPC client
-│   │   ├── websocket/          # Managed WSS subscriptions
-│   │   ├── universe/           # Dynamic market universe
-│   │   ├── metrics/            # Runtime metrics
-│   │   ├── observability/      # JSONL telemetry
-│   │   └── telegram/           # Operational Telegram interface
-│   └── pkg/
-├── contracts/
-│   ├── FlashArbitrageExecutor.sol
-│   ├── FlashTriangularArbitrage.sol     # Legacy contract retained for history/tests
-│   └── adapters/
-│       ├── UniswapV3Adapter.sol
-│       └── CamelotV3Adapter.sol
-├── config/
-├── test/
-├── script/
-├── RUNBOOK_ARBITRUM_FORK.md
-└── GO_MIGRATION_PHASE*.md
+                                Arbitrum One
+                                     │
+                           WSS heads + pool logs
+                                     │
+                                     ▼
+                         ┌─────────────────────┐
+                         │ Latest-head scheduler│
+                         │ coalesce stale work  │
+                         └──────────┬──────────┘
+                                    │
+                                    ▼
+                         ┌─────────────────────┐
+                         │ Market Engine       │
+                         │ dirty pool refresh  │
+                         │ incremental graph   │
+                         └──────────┬──────────┘
+                                    │
+                   ┌────────────────┴────────────────┐
+                   ▼                                 ▼
+        ┌─────────────────────┐           ┌─────────────────────┐
+        │ Pair Intelligence   │           │ Reconciliation      │
+        │ volatility / depth  │           │ checkpointed units  │
+        │ venue diversity     │           │ background / yielding│
+        └──────────┬──────────┘           └─────────────────────┘
+                   │
+                   ▼
+        ┌─────────────────────┐
+        │ Route Intelligence  │
+        │ PairScore           │
+        │ RouteMemory         │
+        │ exploit/explore/new │
+        └──────────┬──────────┘
+                   │
+                   ▼
+        ┌─────────────────────┐
+        │ Bounded Quotes      │
+        │ Uni V3 / Camelot V3 │
+        └──────────┬──────────┘
+                   │
+                   ▼
+        ┌─────────────────────┐
+        │ Opportunity Engine  │
+        │ fees + premium      │
+        │ gas + impact        │
+        │ net profitability   │
+        └──────────┬──────────┘
+                   │
+                   ▼
+        ┌─────────────────────┐
+        │ Adaptive Optimizer  │
+        │ loan-size search    │
+        │ bounded samples     │
+        └──────────┬──────────┘
+                   │
+                   ▼
+        ┌─────────────────────┐
+        │ Execution Pipeline  │
+        │ freshness           │
+        │ simulation          │
+        │ slippage            │
+        │ repayment           │
+        └──────────┬──────────┘
+                   │
+                   ▼
+        ┌─────────────────────┐
+        │ FlashArbitrage      │
+        │ Executor            │
+        └──────────┬──────────┘
+                   │
+             Aave V3 callback
+                   │
+                   ▼
+       Uniswap V3 / Camelot V3 swaps
+                   │
+                   ▼
+            repay + realized PnL
 ```
 
-The old `bot/` Python implementation and Polygon-era material remain in the repository as migration/history artifacts. **They are not the current production runtime.**
+The detector and executor are intentionally separate systems. Search intelligence decides **where to spend expensive evaluation budget**; it never grants permission to bypass execution safety.
 
 ---
 
-## 3. Market engine
+## Market intelligence
 
-TitanArb is event-driven rather than a blind full-market polling loop.
+TitanArb does not rank the market only by token popularity.
 
-### Block scheduling
+The engine maintains pair-level intelligence using signals such as:
 
-`scheduler.Latest` keeps a single pending latest head. If several blocks arrive while a market cycle is running, intermediate heads can be superseded instead of building an unbounded backlog.
+- realized volatility across multiple windows
+- turnover and swap activity
+- executable depth
+- venue diversity
+- quote success/failure history
+- dislocation frequency
+- liquidity quality
+- recent failures and cooldowns
 
-### Incremental refresh
+Pair intelligence feeds route quality while preserving a strict boundary between:
 
-The market engine distinguishes between:
+- **market assets** — assets allowed to participate in route discovery
+- **execution / loan assets** — assets explicitly approved for flash-loan starts and execution
 
-- **full reconcile** — rebuild/refresh the broader route state periodically or when route-search configuration changes
-- **incremental refresh** — update dirty pools and routes affected by those pools
-
-This keeps the route graph reusable between cycles and avoids rebuilding every route on every head.
-
-### Route search
-
-The production route builder supports bounded **2-hop, 3-hop, and 4-hop** cycles and preserves per-loan-asset route budgeting. Routes are assembled from the market graph rather than a single hardcoded triangular path.
+A dynamically admitted market asset does not silently become an execution asset.
 
 ---
 
-## 4. Route intelligence and near-miss memory
+## Route intelligence
 
-TitanArb records rejected route economics and uses that history to decide where expensive quote/optimizer work should be spent.
+TitanArb keeps persistent route history so expensive RPC work is not allocated blindly.
 
-`go/internal/nearmiss` contains:
-
-- full rejected-route economics
-- cross-venue detection
-- route scoring
-- persistent in-process `RouteMemory`
-- pre-quote scoring
-
-Representative route-memory fields include:
+Representative `RouteMemory` signals include:
 
 ```text
 GapEMA
@@ -190,146 +244,148 @@ Observations
 LastLatencyMS
 ```
 
-The pre-quote scorer is deliberately **zero-RPC**. It uses cached/history signals before the first expensive route evaluation.
+The pre-quote scorer is **zero-RPC** and ranks routes before the first expensive quote.
 
-### Exploit / explore
+Route scheduling mixes:
 
-The detector does not only evaluate the current highest-ranked routes. A configurable exploration share keeps unseen and low-observation routes eligible so the scoring loop does not permanently starve new candidates.
+```text
+70% exploit
+20% explore
+10% new / under-observed
+```
 
-Cross-venue routes receive a positive search prior, but same-DEX routes remain eligible; venue diversity is a ranking signal, not an execution rule.
-
----
-
-## 5. Dynamic universe
-
-TitanArb separates the **market graph** from the **execution / loan-asset boundary**.
-
-A dynamically discovered asset may participate as a market/intermediate graph node without automatically becoming a flash-loan asset or execution-allowlisted token.
-
-This distinction allows the detector to expand connectivity without silently expanding execution authority.
-
-Universe management considers objective market signals such as pool availability, connectivity, quote viability, and configured admission policy.
+Cross-venue routes receive a positive search prior, while same-DEX routes remain eligible when their economics justify evaluation.
 
 ---
 
-## 6. RPC architecture
+## Bounded hot path
 
-The Go runtime supports multiple RPC providers.
+TitanArb deliberately limits how much work a single market cycle may trigger.
 
-### HTTP reads
+Production controls include:
 
-Read-heavy JSON-RPC traffic can be distributed across healthy providers using an active-active dispatcher. Provider choice considers:
+- global quote budget
+- bounded routes considered per cycle
+- bounded optimizer routes
+- score-dependent optimizer samples
+- persistent quote cache
+- state-aware quote deduplication
+- dirty-route invalidation
+- latest-head coalescing
+- stale-work cancellation
 
-- configured target request budget
-- provider cooldown / health
-- observed latency
+The engine sheds low-priority background work before starving simulation, execution, or transaction-critical RPC.
+
+---
+
+## RPC architecture
+
+RPC selection is part of the trading architecture, not just infrastructure plumbing.
+
+Production read priority is:
+
+```text
+1. Alchemy
+2. Ankr
+3. Chainstack
+4. QuickNode
+5. Arbitrum official RPC — emergency fallback
+```
+
+Within provider pools, selection remains health/latency/inflight-aware rather than blind round-robin.
+
+The RPC layer tracks provider characteristics including:
+
+- latency EMA / p95
+- inflight requests
+- configured capacity
 - block freshness
-- recent transport / rate-limit failures
+- transport failures
+- rate limits / 429s
+- cooldown and probation state
+- workload/stage usage
 
-A **global read limiter** caps aggregate read traffic so adding a second provider does not double the engine's RPC demand.
+A global read limiter keeps aggregate RPC demand bounded; adding providers does not mean multiplying total request volume.
+
+### Request priority
+
+Latency-sensitive work has scheduling priority over background work:
+
+```text
+execution / simulation / critical reads
+                 ↓
+        quotes / hot market reads
+                 ↓
+ pool refresh / reconciliation / discovery
+                 ↓
+       pair-intelligence exploration
+```
 
 ### WSS
 
-WebSocket ownership is intentionally single-active:
-
-```text
-primary WSS
-   ↓ failure
-secondary WSS
-```
-
-Only one subscription stream is allowed to drive market scheduling at a time, preventing duplicate block/log processing.
+WSS is single-owner. Only one active subscription stream drives market scheduling at a time.
 
 ### Broadcast
 
-`eth_sendRawTransaction` remains a single-provider path. The RPC layer does not blindly broadcast the same signed transaction through multiple providers.
-
-Provider configuration is environment-driven; provider credentials are not part of the repository.
+Signed transactions are broadcast through a single execution path rather than blindly sent through every provider.
 
 ---
 
-## 7. Opportunity economics
+## Opportunity economics
 
-A route is evaluated using executable output and explicit cost components rather than simple spot-price comparison.
-
-The opportunity layer tracks values such as:
+Every evaluated route carries explicit economics instead of a simple spread percentage.
 
 ```text
 amount_in
 amount_out
 gross_profit
 Aave premium
+DEX fees
 L1 data fee
-L2 fee / gas estimate
+L2 gas estimate
 price impact
-expected / net profit
+expected net profit
 minimum profit threshold
 profitability gap
 ```
 
-Rejected opportunities feed the detector's near-miss telemetry and future route priority.
+Rejected opportunities are not thrown away. Near-miss data feeds telemetry and future route ranking so the engine learns which routes are close enough to deserve attention.
 
 ---
 
-## 8. Optimizer
+## Flash-loan execution
 
-The optimizer searches loan size for routes that survive initial route selection/evaluation.
+TitanArb uses Aave V3 flash liquidity as part of the execution model.
 
-Current scheduling supports score-dependent sample depth: stronger candidates can receive more optimizer budget while weak candidates receive less work. The optimizer remains bounded by market-cycle and RPC constraints.
+A candidate reaching the executor has already passed the detector/economics path, but execution still independently verifies:
 
-Detector ranking and optimizer ranking have different jobs:
+1. deployed executor/adapters/routers
+2. approved assets and route boundaries
+3. market-state freshness
+4. minimum-profit economics
+5. slippage constraints
+6. transaction simulation
+7. Aave repayment feasibility
+8. signer / nonce / broadcast conditions
 
-- **Pre-quote score:** which routes deserve expensive evaluation?
-- **Post-quote / near-miss score:** which evaluated routes deserve deeper size search?
-
----
-
-## 9. Execution pipeline
-
-The live execution path is guarded independently from detector scoring.
-
-The execution pipeline preserves checks for:
-
-- chain / deployment preflight
-- executor and adapter verification
-- route / asset allow-lists
-- current state freshness
-- minimum-profit economics
-- slippage bounds
-- simulation
-- Aave repayment feasibility
-- signer / nonce / transaction handling
-
-A high detector score cannot bypass these gates.
+If repayment or another required condition fails, the atomic transaction cannot complete successfully.
 
 ---
 
-## 10. Smart contracts
+## Smart contracts
 
-### `FlashArbitrageExecutor.sol`
+### FlashArbitrageExecutor
 
-Current generalized flash-arbitrage executor used by the Arbitrum architecture.
+`contracts/FlashArbitrageExecutor.sol` is the generalized Arbitrum flash-arbitrage executor.
 
-It delegates swap execution through approved adapters and is designed around Aave V3 flash liquidity and bounded multi-hop routes.
-
-### DEX adapters
-
-Current adapter implementations:
+Venue-specific swap behavior is delegated to approved adapters:
 
 - `contracts/adapters/UniswapV3Adapter.sol`
 - `contracts/adapters/CamelotV3Adapter.sol`
 
-These keep venue-specific router semantics outside the generalized executor.
+This keeps the executor generic while isolating DEX-specific router semantics.
 
-### Legacy contract
-
-`FlashTriangularArbitrage.sol` belongs to the earlier fixed triangular design and is retained for migration/history compatibility. It is not the architectural description of the current Go/Arbitrum engine.
-
----
-
-## 11. Current Arbitrum deployment
-
-Production deployment addresses currently used by TitanArb:
+### Arbitrum deployment
 
 | Component | Address |
 |---|---|
@@ -340,38 +396,48 @@ Production deployment addresses currently used by TitanArb:
 | Uniswap V3 Router | `0xE592427A0AEce92De3Edee1F18E0157C05861564` |
 | Camelot / Algebra Router | `0x1F721E2E82F6676FCE4eA07A5958cF098D339e18` |
 
-Common configured market assets include WETH, USDC, USDT, ARB, and market-only dynamic assets such as USDC.e when admitted by the universe manager.
-
-Execution-eligible assets and dynamic market assets are intentionally separate configuration concepts.
+Common market assets include WETH, USDC, USDT, ARB, and dynamically admitted market-only assets such as USDC.e.
 
 ---
 
-## 12. Configuration
-
-Runtime configuration is environment-driven and market configuration is loaded from repository config files.
-
-Typical runtime categories include:
+## Repository layout
 
 ```text
-CHAIN_ID
-HTTP / WSS RPC providers
-provider target / max RPS
-execution mode
-private signer configuration
-executor / adapter addresses
-profit thresholds
-route-search depth / budget
-slippage / price-impact limits
-universe policy
-Telegram / observability configuration
-pre-quote ranking / exploration controls
+.
+├── go/                         # Production runtime
+│   ├── cmd/titanarb/           # Main process
+│   ├── internal/
+│   │   ├── config/             # Runtime + market configuration
+│   │   ├── market/             # Block-driven market engine
+│   │   ├── scheduler/          # Latest-head coalescing
+│   │   ├── pools/              # Pool discovery / refresh
+│   │   ├── routes/             # 2/3/4-hop route graph
+│   │   ├── quotes/             # Executable quote plumbing
+│   │   ├── opportunity/        # Economics
+│   │   ├── nearmiss/           # Near-miss + RouteMemory
+│   │   ├── optimizer/          # Loan-size optimizer
+│   │   ├── execution/          # Simulation + live execution
+│   │   ├── rpc/                # Managed multi-provider RPC
+│   │   ├── websocket/          # Managed WSS ownership
+│   │   ├── universe/           # Dynamic market universe
+│   │   ├── metrics/            # Runtime metrics
+│   │   ├── observability/      # Structured telemetry
+│   │   └── telegram/           # Operational interface
+│   └── pkg/
+├── contracts/
+│   ├── FlashArbitrageExecutor.sol
+│   └── adapters/
+│       ├── UniswapV3Adapter.sol
+│       └── CamelotV3Adapter.sol
+├── config/
+├── test/
+├── script/
+└── RUNBOOK_ARBITRUM_FORK.md
 ```
-
-Do not treat examples in historical Polygon files as current Arbitrum production configuration.
 
 ---
 
-## 13. Build and test
+## Build and validate
 
 The production Go module lives under `go/`.
 
@@ -383,113 +449,69 @@ go vet ./cmd/titanarb ./internal/...
 go build -buildvcs=false ./cmd/titanarb
 ```
 
-For the broadest repository validation where the local platform supports all dependencies:
+For race-sensitive packages:
 
 ```bash
-cd go
-go test ./...
-go vet ./...
+go test -race ./internal/rpc ./internal/market ./internal/pools ./internal/execution ./internal/routes
 ```
 
-Foundry tests and Arbitrum fork validation are documented separately in `RUNBOOK_ARBITRUM_FORK.md` and the migration/integration notes.
+Foundry and Arbitrum fork validation are documented in `RUNBOOK_ARBITRUM_FORK.md`.
 
 ---
 
-## 14. Production runtime
+## Runtime observability
 
-The production process is intended to run as a long-lived service.
+TitanArb emits structured telemetry for the market and execution pipelines, including:
 
-Typical deployment shape:
-
-```text
-systemd
-  └── titanarb
-       └── Go binary
-            ├── managed HTTP RPC providers
-            ├── managed WSS provider
-            ├── market engine
-            ├── optimizer
-            ├── execution worker
-            └── observability / Telegram
-```
-
-Production deployment should validate tests/build, contract preflight, provider connectivity, and runtime telemetry before considering a release healthy.
-
----
-
-## 15. Observability
-
-TitanArb emits structured operational events and market-cycle telemetry. Depending on build/configuration, this includes:
-
-- active universe assets
-- route counts and hop distribution
-- DEX diversity
-- routes considered / quoted
-- exploit / explore counts
-- pre-quote score statistics
-- near-miss economics
-- optimizer runs / samples
-- RPC calls and provider health
-- active HTTP / WSS provider
+- active pools and assets
+- route counts by hop
+- routes considered / quoted / skipped
+- PairScore and pre-quote statistics
+- quote-cache effectiveness
+- optimizer runs and sample budgets
+- near-miss economics and rejection reason
 - cycle duration and block lag
-- stale candidates
-- execution preflight and transaction outcomes
+- RPC calls by workload stage
+- provider latency, health, cooldown, and traffic share
+- reconciliation progress
+- simulation attempts
+- execution preflight
+- transaction outcomes
 
-Telegram is an operational view over this telemetry rather than the source of truth; JSONL/runtime logs remain useful for detailed analysis.
-
----
-
-## 16. Design principles
-
-TitanArb currently follows several important architectural boundaries:
-
-1. **Detector intelligence does not weaken execution gates.**
-2. **Dynamic market assets do not automatically become execution assets.**
-3. **Cross-venue is a search prior, not a hard requirement.**
-4. **Exploration prevents history-driven route starvation.**
-5. **Dirty-pool updates should invalidate/revive only affected work where possible.**
-6. **RPC resilience must not multiply total RPC demand.**
-7. **WSS remains single-owner to avoid duplicate market cycles.**
-8. **Transaction broadcast remains single-path.**
-9. **Profitability is evaluated after Aave premium and chain fees, not from gross spread alone.**
-10. **Production changes are measured through telemetry, not assumed to improve opportunity yield.**
+The operational goal is simple: if the engine is slow, skipping work, rejecting a candidate, or changing providers, the reason should be visible in telemetry.
 
 ---
 
-## 17. Legacy Polygon / Python implementation
+## Design principles
 
-This repository began as a Polygon triangular-arbitrage project using Python, Web3.py, a fixed three-leg Uniswap V3 route, and `FlashTriangularArbitrage.sol`.
-
-That code is intentionally retained for historical context and migration evidence, including:
-
-- `bot/`
-- Polygon configuration
-- original Python tests
-- migration phase documents
-- Go-vs-Python benchmarks
-
-The legacy code should not be confused with the current production architecture described above.
-
----
-
-## 18. Additional documentation
-
-Useful repository documents include:
-
-- `RUNBOOK_ARBITRUM_FORK.md`
-- `GO_MIGRATION_PHASE1.md`
-- `GO_MIGRATION_PHASE2.md`
-- `GO_MIGRATION_PHASE3.md`
-- `GO_MIGRATION_PHASE4.md`
-- `GO_VS_PYTHON_BENCHMARK.md`
-- `GO_VS_PYTHON_FINAL_BENCHMARK.md`
-- `PHASE2_INTEGRATION_VALIDATION.md`
-- `go/BENCHMARK.md`
-
-Some older documents describe intermediate migration states; when documentation conflicts with current Go source, the current source is authoritative.
+1. **Executable profit matters more than visible spread.**
+2. **Search intelligence never weakens execution gates.**
+3. **Dynamic market admission never silently expands execution authority.**
+4. **The hot path is bounded; background work yields first.**
+5. **Dirty state should invalidate only affected work whenever possible.**
+6. **RPC resilience must not multiply aggregate RPC demand.**
+7. **WSS stays single-owner to avoid duplicate market scheduling.**
+8. **Transaction broadcast stays single-path.**
+9. **Rejected economics are useful data, not wasted work.**
+10. **Production performance is measured from telemetry, not assumed.**
 
 ---
 
-## License / use
+## Historical migration notes
 
-No profitability guarantee is made. Operational behavior depends on live market state, liquidity, fees, provider quality, execution timing, configuration, and deployed contract state.
+<details>
+<summary>Python / Polygon history</summary>
+
+TitanArb originally began as a Polygon triangular-arbitrage project using Python, Web3.py, and a fixed three-leg design.
+
+The repository retains migration artifacts, benchmark documents, and the older `FlashTriangularArbitrage.sol` contract for engineering history and regression context.
+
+The **Go / Arbitrum architecture described in this README is the production system**; the legacy Python/Polygon material is not the active runtime.
+
+</details>
+
+---
+
+## Disclaimer
+
+TitanArb is engineering software for detecting and attempting atomic arbitrage. It does not guarantee profitable opportunities or successful execution. Real results depend on live market state, fees, liquidity, RPC quality, execution timing, configuration, and deployed contract state.
