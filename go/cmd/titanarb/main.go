@@ -167,12 +167,17 @@ func main() {
 				settings = runtimeRisk.Snapshot()
 			}
 			searchOptions := marketSearchOptions(settings)
-			timeoutCtx, stopTimeout := context.WithTimeout(runCtx, 45*time.Second)
+			fullReconcile := marketEngine.RequiresFullReconcile(settings.RouteSearchDepth, routeBudget(settings), searchOptions)
+			cycleTimeout := 45 * time.Second
+			if fullReconcile {
+				cycleTimeout = time.Duration(envIntBounded("FULL_RECONCILE_TIMEOUT_SECONDS", 60, 45, 120)) * time.Second
+			}
+			timeoutCtx, stopTimeout := context.WithTimeout(runCtx, cycleTimeout)
 			defer stopTimeout()
 			maxWorkLag := uint64(envIntBounded("MAX_DETECTOR_WORK_LAG_BLOCKS", 12, 0, 64))
 			cycleCtx := timeoutCtx
 			stopStale := context.CancelFunc(func() {})
-			if !marketEngine.RequiresFullReconcile(settings.RouteSearchDepth, routeBudget(settings), searchOptions) {
+			if !fullReconcile {
 				cycleCtx, stopStale = cancelWhenSuperseded(timeoutCtx, marketScheduler.LatestBlock, trigger.Block, maxWorkLag)
 			}
 			defer stopStale()
