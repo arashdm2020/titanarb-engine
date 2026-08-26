@@ -115,16 +115,27 @@ func TestAlchemyPremiumReadPoolConfig(t *testing.T) {
 	for i := 1; i <= 3; i++ {
 		v[fmt.Sprintf("RPC_ALCHEMY_HTTP_%d", i)] = fmt.Sprintf("https://alchemy-%d.example", i)
 	}
+	v["RPC_ANKR_HTTP_1"] = "https://ankr-1.example"
+	v["RPC_ANKR_HTTP_2"] = "https://ankr-2.example"
+	v["RPC_ANKR_ENDPOINT_RPS"] = "4"
 	cfg, err := FromLookup(lookup(v))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(cfg.RPCProviders) != 5 {
-		t.Fatalf("provider count=%d want 5: %+v", len(cfg.RPCProviders), cfg.RPCProviders)
+	if len(cfg.RPCProviders) != 7 {
+		t.Fatalf("provider count=%d want 7: %+v", len(cfg.RPCProviders), cfg.RPCProviders)
 	}
 	for i, provider := range cfg.RPCProviders[2:] {
+		if i >= 3 {
+			break
+		}
 		if provider.Name != fmt.Sprintf("alchemy_%d", i+1) || provider.Tier != "premium" || provider.TargetRPS != 3 || provider.Burst != 1 {
 			t.Fatalf("alchemy provider %d mismatch: %+v", i+1, provider)
+		}
+	}
+	for i, provider := range cfg.RPCProviders[5:] {
+		if provider.Name != fmt.Sprintf("ankr_%d", i+1) || provider.Tier != "secondary" || provider.TargetRPS != 4 || provider.Burst != 1 {
+			t.Fatalf("ankr provider %d mismatch: %+v", i+1, provider)
 		}
 	}
 	if cfg.RPCReadTargetRPS != 8 || cfg.RPCPremiumAggregateRPS != 6 || cfg.RPCMaxEthCallsPerMinute != 480 || cfg.RPCMaxHotCallsPerMinute != 360 {

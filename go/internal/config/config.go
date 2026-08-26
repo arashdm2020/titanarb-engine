@@ -320,6 +320,19 @@ func rpcProvidersFromLookup(get func(string) string) []RPCProviderConfig {
 		}
 		providers = append(providers, RPCProviderConfig{Name: fmt.Sprintf("alchemy_%d", i), HTTP: url, MaxRPS: alchemyRPS, TargetRPS: alchemyRPS, Burst: alchemyBurst, MaxBlockLag: primary.MaxBlockLag, Tier: "premium"})
 	}
+	ankrRPS := int(parseUintDefault(get("RPC_ANKR_ENDPOINT_RPS"), 4))
+	ankrBurst := int(parseUintDefault(get("RPC_ANKR_ENDPOINT_BURST"), 1))
+	for i := 1; i <= 2; i++ {
+		url := strings.TrimSpace(get(fmt.Sprintf("RPC_ANKR_HTTP_%d", i)))
+		if url == "" {
+			continue
+		}
+		providers = append(providers, RPCProviderConfig{Name: fmt.Sprintf("ankr_%d", i), HTTP: url, MaxRPS: ankrRPS, TargetRPS: ankrRPS, Burst: ankrBurst, MaxBlockLag: primary.MaxBlockLag, Tier: "secondary"})
+	}
+	if url := strings.TrimSpace(get("RPC_QUICKNODE_HTTP")); url != "" {
+		quicknodeRPS := int(parseUintDefault(get("RPC_QUICKNODE_TARGET_RPS"), 1))
+		providers = append(providers, RPCProviderConfig{Name: "quicknode", HTTP: url, MaxRPS: quicknodeRPS, TargetRPS: quicknodeRPS, Burst: int(parseUintDefault(get("RPC_QUICKNODE_BURST"), 1)), MaxBlockLag: primary.MaxBlockLag, Tier: "limited"})
+	}
 	return providers
 }
 

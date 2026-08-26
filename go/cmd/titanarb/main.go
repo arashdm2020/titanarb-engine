@@ -344,6 +344,7 @@ func main() {
 				"active_rpc_provider":              rpcClient.ActiveProvider(),
 				"active_wss_provider":              w.ActiveProvider(),
 				"rpc_provider_health":              rpcProviderHealthString(rpcClient.Snapshots()),
+				"rpc_tier_traffic":                 rpcTierTrafficString(rpcClient.Snapshots()),
 			}
 			if pairService != nil {
 				pairStats := pairService.Snapshot()
@@ -1035,9 +1036,26 @@ func rpcProviderHealthString(snapshots []rpc.ProviderSnapshot) string {
 		if snapshot.Active {
 			active = ":active"
 		}
-		parts = append(parts, fmt.Sprintf("%s=%s%s,tier=%s,block=%d,latency_ms=%d,requests=%d,share_pct=%.1f,target_rps=%d,burst=%d,inflight=%d,instantaneous_rps=%.1f,rate_limited=%d,cooldown_remaining_ms=%d,probation_remaining_ms=%d,failures=%d", snapshot.Name, state, active, snapshot.Tier, snapshot.LatestBlock, snapshot.Latency.Milliseconds(), snapshot.Requests, snapshot.SharePct, snapshot.TargetRPS, snapshot.Burst, snapshot.Inflight, snapshot.InstantaneousRPS, snapshot.RateLimited, snapshot.CooldownRemaining.Milliseconds(), snapshot.ProbationRemaining.Milliseconds(), snapshot.Failures))
+		parts = append(parts, fmt.Sprintf("%s=%s%s,tier=%s,block=%d,latency_ms=%d,latency_p95_ms=%d,requests=%d,eth_calls=%d,quote_requests=%d,success_pct=%.1f,share_pct=%.1f,target_rps=%d,burst=%d,inflight=%d,instantaneous_rps=%.1f,rate_limited=%d,forbidden=%d,cooldown_events=%d,cooldown_remaining_ms=%d,probation_remaining_ms=%d,failures=%d", snapshot.Name, state, active, snapshot.Tier, snapshot.LatestBlock, snapshot.Latency.Milliseconds(), snapshot.LatencyP95.Milliseconds(), snapshot.Requests, snapshot.EthCallRequests, snapshot.QuoteRequests, snapshot.SuccessRatePct, snapshot.SharePct, snapshot.TargetRPS, snapshot.Burst, snapshot.Inflight, snapshot.InstantaneousRPS, snapshot.RateLimited, snapshot.Forbidden, snapshot.CooldownEvents, snapshot.CooldownRemaining.Milliseconds(), snapshot.ProbationRemaining.Milliseconds(), snapshot.Failures))
 	}
 	return strings.Join(parts, ";")
+}
+
+func rpcTierTrafficString(snapshots []rpc.ProviderSnapshot) string {
+	counts := make(map[string]uint64)
+	var total uint64
+	for _, snapshot := range snapshots {
+		counts[snapshot.Tier] += snapshot.Requests
+		total += snapshot.Requests
+	}
+	if total == 0 {
+		return "premium:0.0,secondary:0.0,limited:0.0,emergency:0.0"
+	}
+	parts := make([]string, 0, 4)
+	for _, tier := range []string{"premium", "secondary", "limited", "emergency"} {
+		parts = append(parts, fmt.Sprintf("%s:%.1f", tier, float64(counts[tier])*100/float64(total)))
+	}
+	return strings.Join(parts, ",")
 }
 
 func preQuoteExploreBPS() int {

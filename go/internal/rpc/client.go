@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -119,6 +120,13 @@ type ProviderSnapshot struct {
 	Tier               string
 	Inflight           int
 	ProbationRemaining time.Duration
+	EthCallRequests    uint64
+	QuoteRequests      uint64
+	Successes          uint64
+	SuccessRatePct     float64
+	Forbidden          uint64
+	CooldownEvents     uint64
+	LatencyP95         time.Duration
 }
 
 type Event struct {
@@ -147,6 +155,12 @@ type providerState struct {
 	recent429Until     time.Time
 	probationUntil     time.Time
 	inflight           int
+	ethCallRequests    uint64
+	quoteRequests      uint64
+	successes          uint64
+	forbidden          uint64
+	cooldownEvents     uint64
+	latencySamples     []time.Duration
 }
 
 func NewManaged(configs []ProviderConfig, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -243,7 +257,7 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 		if err := waitDelay(ctx, providerDelay); err != nil {
 			return err
 		}
-		c.recordRequest(provider)
+		c.recordRequest(provider, method, class)
 		err := c.callProvider(ctx, provider, body, out)
 		if err == nil {
 			c.recordSuccess(provider, method, out)
@@ -280,7 +294,7 @@ func (c *Client) callOnceNoFailover(ctx context.Context, method string, body []b
 	if err := provider.limiter.Wait(ctx); err != nil {
 		return err
 	}
-	c.recordRequest(provider)
+	c.recordRequest(provider, method, Critical)
 	err := c.callProvider(ctx, provider, body, out)
 	if err == nil {
 		c.recordSuccess(provider, method, out)
@@ -410,6 +424,7 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 	bestIndex := -1
 	var bestScore time.Duration
 	bestTier := 99
+	flexibleHotPath := class == HotPath
 	for pass := 0; pass < 2 && bestIndex == -1; pass++ {
 		for index, provider := range c.providers {
 			if now.Before(provider.cooldownUntil) {
@@ -425,14 +440,22 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 			if providerLagged(provider, bestBlock, now) {
 				continue
 			}
-			if rank > bestTier {
-				continue
-			}
-			if rank < bestTier {
-				bestTier = rank
-				bestIndex = -1
+			if !flexibleHotPath {
+				if rank > bestTier {
+					continue
+				}
+				if rank < bestTier {
+					bestTier = rank
+					bestIndex = -1
+				}
 			}
 			score := provider.limiter.Delay()
+			if flexibleHotPath {
+				// Premium keeps a small deterministic preference, while a saturated
+				// premium pool can spill bounded quote reads to healthy secondary
+				// providers. Critical execution reads retain strict tier ordering.
+				score += time.Duration(rank) * 75 * time.Millisecond
+			}
 			if now.Before(provider.recent429Until) {
 				score += 250 * time.Millisecond
 			}
@@ -460,18 +483,23 @@ func (c *Client) chooseReadProvider(classes ...RequestClass) (*providerState, in
 			if rank >= 99 {
 				continue
 			}
-			if rank > bestTier {
-				continue
-			}
-			if rank < bestTier {
-				bestTier = rank
-				bestIndex = -1
+			if !flexibleHotPath {
+				if rank > bestTier {
+					continue
+				}
+				if rank < bestTier {
+					bestTier = rank
+					bestIndex = -1
+				}
 			}
 			delay := provider.limiter.Delay()
 			if cooldown := time.Until(provider.cooldownUntil); cooldown > delay {
 				delay = cooldown
 			}
 			score := delay
+			if flexibleHotPath {
+				score += time.Duration(rank) * 75 * time.Millisecond
+			}
 			if bestIndex == -1 || score < bestScore {
 				bestIndex = index
 				bestScore = score
@@ -517,12 +545,18 @@ func providerLagged(provider *providerState, best uint64, now time.Time) bool {
 	return best-provider.latestBlock > uint64(provider.cfg.MaxBlockLag)
 }
 
-func (c *Client) recordRequest(provider *providerState) {
+func (c *Client) recordRequest(provider *providerState, method string, class RequestClass) {
 	if c.metrics != nil {
 		c.metrics.IncRPCCalls()
 	}
 	c.mu.Lock()
 	provider.requests++
+	if method == "eth_call" {
+		provider.ethCallRequests++
+		if class == HotPath {
+			provider.quoteRequests++
+		}
+	}
 	now := time.Now()
 	provider.requestTimes = append(provider.requestTimes, now)
 	provider.requestTimes = pruneRequestTimes(provider.requestTimes, now.Add(-time.Second))
@@ -533,6 +567,7 @@ func (c *Client) recordSuccess(provider *providerState, method string, out any) 
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	provider.consecutiveFailure = 0
+	provider.successes++
 	provider.lastSuccessful = time.Now()
 	provider.rateLimitStreak = 0
 	if method == "eth_blockNumber" {
@@ -549,6 +584,10 @@ func (c *Client) recordFailure(provider *providerState, err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	provider.failures++
+	if strings.Contains(err.Error(), " 403") {
+		provider.forbidden++
+	}
+	provider.cooldownEvents++
 	provider.consecutiveFailure++
 	provider.lastFailure = time.Now()
 	cooldown := 15 * time.Second
@@ -607,9 +646,13 @@ func (c *Client) updateLatency(provider *providerState, latency time.Duration) {
 	defer c.mu.Unlock()
 	if provider.latencyEMA == 0 {
 		provider.latencyEMA = latency
-		return
+	} else {
+		provider.latencyEMA = time.Duration(float64(provider.latencyEMA)*0.8 + float64(latency)*0.2)
 	}
-	provider.latencyEMA = time.Duration(float64(provider.latencyEMA)*0.8 + float64(latency)*0.2)
+	provider.latencySamples = append(provider.latencySamples, latency)
+	if len(provider.latencySamples) > 256 {
+		provider.latencySamples = append(provider.latencySamples[:0], provider.latencySamples[len(provider.latencySamples)-256:]...)
+	}
 }
 
 func providerFailure(err error) bool {
@@ -620,7 +663,7 @@ func providerFailure(err error) bool {
 	if rpcErr.Kind == RPC {
 		return false
 	}
-	if rpcErr.Kind == HTTP && !strings.Contains(rpcErr.Error(), " 429") && !strings.Contains(rpcErr.Error(), " 5") {
+	if rpcErr.Kind == HTTP && !strings.Contains(rpcErr.Error(), " 403") && !strings.Contains(rpcErr.Error(), " 429") && !strings.Contains(rpcErr.Error(), " 5") {
 		return false
 	}
 	return true
@@ -670,8 +713,12 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 			unavailableUntil = provider.recent429Until
 		}
 		share := 0.0
+		successRate := 0.0
 		if total > 0 {
 			share = float64(provider.requests) * 100 / float64(total)
+		}
+		if provider.successes+provider.failures > 0 {
+			successRate = float64(provider.successes) * 100 / float64(provider.successes+provider.failures)
 		}
 		out = append(out, ProviderSnapshot{
 			Name:              provider.cfg.Name,
@@ -692,6 +739,9 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 			CooldownRemaining: positiveDuration(unavailableUntil.Sub(now)),
 			Tier:              provider.cfg.Tier, Inflight: provider.inflight,
 			ProbationRemaining: positiveDuration(provider.probationUntil.Sub(now)),
+			EthCallRequests:    provider.ethCallRequests, QuoteRequests: provider.quoteRequests,
+			Successes: provider.successes, SuccessRatePct: successRate, Forbidden: provider.forbidden,
+			CooldownEvents: provider.cooldownEvents, LatencyP95: durationP95(provider.latencySamples),
 		})
 	}
 	return out
@@ -699,38 +749,66 @@ func (c *Client) Snapshots() []ProviderSnapshot {
 
 func normalizeTier(tier string) string {
 	tier = strings.ToLower(strings.TrimSpace(tier))
-	if tier != "premium" && tier != "emergency" {
-		return "cheap"
+	if tier == "cheap" {
+		return "secondary"
+	}
+	if tier != "premium" && tier != "secondary" && tier != "limited" && tier != "emergency" {
+		return "secondary"
 	}
 	return tier
 }
 func tierRank(class RequestClass, tier string) int {
 	switch class {
 	case Background:
-		if tier == "cheap" {
+		if tier == "secondary" {
 			return 0
 		}
-		if tier == "emergency" {
+		if tier == "limited" {
 			return 1
+		}
+		if tier == "emergency" {
+			return 2
 		}
 		return 99
 	case HotPath, Critical:
 		if tier == "premium" {
 			return 0
 		}
-		if tier == "cheap" {
+		if tier == "secondary" {
 			return 1
 		}
-		return 2
+		if tier == "limited" {
+			return 2
+		}
+		return 3
 	default:
-		if tier == "cheap" {
+		if tier == "secondary" {
 			return 0
 		}
-		if tier == "premium" {
+		if tier == "limited" {
 			return 1
 		}
-		return 2
+		if tier == "premium" {
+			return 2
+		}
+		return 3
 	}
+}
+
+func durationP95(samples []time.Duration) time.Duration {
+	if len(samples) == 0 {
+		return 0
+	}
+	ordered := append([]time.Duration(nil), samples...)
+	sort.Slice(ordered, func(i, j int) bool { return ordered[i] < ordered[j] })
+	index := (len(ordered)*95+99)/100 - 1
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(ordered) {
+		index = len(ordered) - 1
+	}
+	return ordered[index]
 }
 
 type minuteBudget struct {

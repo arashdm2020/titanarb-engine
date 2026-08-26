@@ -471,21 +471,69 @@ func TestBackgroundTrafficExcludesHealthyPremiumPool(t *testing.T) {
 	}
 }
 
-func TestHotPathUsesCheapFallbackOnlyWhenPremiumUnavailable(t *testing.T) {
+func TestHotPathPrefersUnsaturatedPremiumAndFallsBackWhenUnavailable(t *testing.T) {
 	client := NewManaged([]ProviderConfig{
 		{Name: "chainstack", HTTP: "http://cheap.invalid", Tier: "cheap", TargetRPS: 100},
 		{Name: "alchemy_1", HTTP: "http://premium.invalid", Tier: "premium", TargetRPS: 1},
 	}, time.Second, 0, nil)
-	client.providers[0].requests = 0
-	client.providers[1].requests = 1_000_000
 	provider, _, _ := client.chooseReadProvider(HotPath)
 	if provider.cfg.Name != "alchemy_1" {
-		t.Fatalf("healthy premium tier was bypassed because of historical load: %s", provider.cfg.Name)
+		t.Fatalf("unsaturated premium tier was bypassed: %s", provider.cfg.Name)
 	}
 	client.providers[1].cooldownUntil = time.Now().Add(time.Minute)
 	provider, _, _ = client.chooseReadProvider(HotPath)
 	if provider.cfg.Name != "chainstack" {
 		t.Fatalf("cheap fallback not selected during premium cooldown: %s", provider.cfg.Name)
+	}
+}
+
+func TestAnkrSecondaryEndpointsReceiveIndependentBackgroundTraffic(t *testing.T) {
+	counts := []*atomic.Int32{{}, {}}
+	configs := make([]ProviderConfig, 0, 2)
+	for i := range counts {
+		server := countingRPCServer(t, counts[i], `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+		configs = append(configs, ProviderConfig{Name: fmt.Sprintf("ankr_%d", i+1), HTTP: server.URL, Tier: "secondary", TargetRPS: 100, Burst: 1})
+	}
+	client := NewManaged(configs, time.Second, 0, nil)
+	ctx := WithRequestClass(context.Background(), Background)
+	for i := 0; i < 8; i++ {
+		if _, err := client.BlockNumber(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if counts[0].Load() == 0 || counts[1].Load() == 0 {
+		t.Fatalf("Ankr endpoints were not independently used: %d/%d", counts[0].Load(), counts[1].Load())
+	}
+}
+
+func TestSaturatedPremiumHotPathSpillsToHealthySecondary(t *testing.T) {
+	client := NewManaged([]ProviderConfig{
+		{Name: "alchemy_1", HTTP: "http://alchemy.invalid", Tier: "premium", TargetRPS: 1},
+		{Name: "ankr_1", HTTP: "http://ankr.invalid", Tier: "secondary", TargetRPS: 4},
+	}, time.Second, 0, nil)
+	client.providers[0].requests = 100
+	client.providers[0].latencyEMA = 20 * time.Millisecond
+	client.providers[1].latencyEMA = 25 * time.Millisecond
+	provider, _, _ := client.chooseReadProvider(HotPath)
+	if provider.cfg.Name != "ankr_1" {
+		t.Fatalf("saturated premium traffic did not spill to Ankr: %s", provider.cfg.Name)
+	}
+	provider, _, _ = client.chooseReadProvider(Critical)
+	if provider.cfg.Name != "alchemy_1" {
+		t.Fatalf("critical traffic lost premium priority: %s", provider.cfg.Name)
+	}
+}
+
+func TestProviderSnapshotTracksMethodLatencyAndHealthCounters(t *testing.T) {
+	server := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":"0x1"}`)
+	client := NewManaged([]ProviderConfig{{Name: "ankr_1", HTTP: server.URL, Tier: "secondary", TargetRPS: 100}}, time.Second, 0, nil)
+	var out string
+	if err := client.Call(WithRequestClass(context.Background(), HotPath), "eth_call", []any{}, &out); err != nil {
+		t.Fatal(err)
+	}
+	snapshot := client.Snapshots()[0]
+	if snapshot.EthCallRequests != 1 || snapshot.QuoteRequests != 1 || snapshot.Successes != 1 || snapshot.SuccessRatePct != 100 || snapshot.LatencyP95 <= 0 {
+		t.Fatalf("incomplete provider telemetry: %+v", snapshot)
 	}
 }
 
