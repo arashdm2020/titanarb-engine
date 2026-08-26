@@ -183,9 +183,11 @@ func TestPeriodicFullReconcileNeverDisablesStaleWorkCancellation(t *testing.T) {
 func TestReconciliationCheckpointBuildsBoundedCanonicalJobs(t *testing.T) {
 	engine := &Engine{market: config.MarketConfig{Tokens: map[string]config.Token{
 		"A": {Symbol: "A", Address: "0x1"}, "B": {Symbol: "B", Address: "0x2"}, "C": {Symbol: "C", Address: "0x3"},
-	}, MarketAssetNames: []string{"A", "B", "C"}}}
+	}, MarketAssetNames: []string{"A", "B", "C"}}, discoverer: pools.NewDiscoverer(nil, "", "", []uint32{100, 500})}
 	engine.startReconciliation(4, 256)
-	if engine.reconciliation == nil || len(engine.reconciliation.jobs) != 3 || engine.reconciliation.next != 0 {
+	// Three canonical pairs, each split into two Uniswap fee units plus one
+	// Camelot unit.
+	if engine.reconciliation == nil || len(engine.reconciliation.jobs) != 9 || engine.reconciliation.next != 0 {
 		t.Fatalf("unexpected reconciliation checkpoint: %+v", engine.reconciliation)
 	}
 	if got := DefaultSearchOptions().Normalized().ReconcileBatchPairs; got != 1 {

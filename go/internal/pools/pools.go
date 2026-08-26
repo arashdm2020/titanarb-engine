@@ -139,6 +139,30 @@ func (d *Discoverer) DiscoverPairAt(ctx context.Context, tokenA, tokenB string, 
 	return found, nil
 }
 
+// DiscoveryFeeTiers returns a copy of the configured Uniswap fee tiers so a
+// background reconciler can checkpoint work at one venue/fee unit at a time.
+func (d *Discoverer) DiscoveryFeeTiers() []uint32 {
+	return append([]uint32(nil), d.fees...)
+}
+
+// DiscoverUniswapFeeAt discovers one bounded Uniswap fee-tier unit.
+func (d *Discoverer) DiscoverUniswapFeeAt(ctx context.Context, tokenA, tokenB string, fee uint32, block uint64) ([]Pool, error) {
+	pool, err := d.uniswapPool(ctx, tokenA, tokenB, fee, block)
+	if err != nil || pool == nil || pool.Liquidity.Sign() <= 0 {
+		return nil, err
+	}
+	return []Pool{*pool}, nil
+}
+
+// DiscoverCamelotPairAt discovers one bounded Camelot/Algebra pair unit.
+func (d *Discoverer) DiscoverCamelotPairAt(ctx context.Context, tokenA, tokenB string, block uint64) ([]Pool, error) {
+	pool, err := d.camelotPool(ctx, tokenA, tokenB, block)
+	if err != nil || pool == nil || pool.Liquidity.Sign() <= 0 {
+		return nil, err
+	}
+	return []Pool{*pool}, nil
+}
+
 // RefreshPoolAt updates only mutable pool state. Factory, token and static fee
 // reads are intentionally reused from the cache during incremental cycles.
 func (d *Discoverer) RefreshPoolAt(ctx context.Context, pool Pool, block uint64) (Pool, error) {

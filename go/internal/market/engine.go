@@ -64,7 +64,11 @@ type Engine struct {
 	forceEvaluateNext  bool
 }
 
-type reconcileJob struct{ from, to string }
+type reconcileJob struct {
+	from, to string
+	dex      pools.DEX
+	fee      uint32
+}
 
 type reconcileState struct {
 	jobs       []reconcileJob
@@ -645,7 +649,10 @@ func (e *Engine) startReconciliation(maxHops, maxRoutes int) {
 	for i, from := range symbols {
 		for _, to := range symbols[i+1:] {
 			if e.marketPairAllowed(from, to) {
-				state.jobs = append(state.jobs, reconcileJob{from: from, to: to})
+				for _, fee := range e.discoverer.DiscoveryFeeTiers() {
+					state.jobs = append(state.jobs, reconcileJob{from: from, to: to, dex: pools.UniswapV3, fee: fee})
+				}
+				state.jobs = append(state.jobs, reconcileJob{from: from, to: to, dex: pools.CamelotV3})
 			}
 		}
 	}
@@ -672,7 +679,7 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 	// forever. Finish at most this one bounded batch, then the scheduler resumes
 	// the remaining jobs against its newest head.
 	reconcileCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(context.WithoutCancel(ctx), rpc.Background), "reconcile", stateBlock)
-	batchCtx, cancel := context.WithTimeout(reconcileCtx, 4*time.Second)
+	batchCtx, cancel := context.WithTimeout(reconcileCtx, 2500*time.Millisecond)
 	defer cancel()
 	processed := 0
 	for state.next < len(state.jobs) && processed < batchSize {
@@ -684,7 +691,13 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 			processed++
 			continue
 		}
-		found, err := e.discoverer.DiscoverPairAt(batchCtx, a.Address, b.Address, stateBlock)
+		var found []pools.Pool
+		var err error
+		if job.dex == pools.UniswapV3 {
+			found, err = e.discoverer.DiscoverUniswapFeeAt(batchCtx, a.Address, b.Address, job.fee, stateBlock)
+		} else {
+			found, err = e.discoverer.DiscoverCamelotPairAt(batchCtx, a.Address, b.Address, stateBlock)
+		}
 		if err != nil {
 			report.ReconcileError = fmt.Sprintf("%T", err)
 			if batchCtx.Err() != nil {
@@ -698,8 +711,9 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 			continue
 		}
 		pair := routes.Pair{From: job.from, To: job.to}
-		state.byPair[pair] = found
-		state.byPair[routes.Pair{From: job.to, To: job.from}] = found
+		state.byPair[pair] = append(state.byPair[pair], found...)
+		reverse := routes.Pair{From: job.to, To: job.from}
+		state.byPair[reverse] = append(state.byPair[reverse], found...)
 		for _, pool := range found {
 			state.discovered[strings.ToLower(pool.Address)] = pool
 			if e.metrics != nil {
