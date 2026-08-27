@@ -518,7 +518,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	if e.lastStateBlock > 0 && e.lastStateBlock < stateBlock {
 		fromBlock = e.lastStateBlock + 1
 	}
-	refreshCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.Background), "pool_refresh", stateBlock)
+	refreshCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "pool_refresh", stateBlock)
 	dirty, err = e.incrementalRefresh(refreshCtx, fromBlock, stateBlock)
 	if err != nil {
 		return report, err
