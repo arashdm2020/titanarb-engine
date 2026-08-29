@@ -7,6 +7,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/metrics"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -32,6 +33,13 @@ func TestContextCanceledIsNotProviderFailure(t *testing.T) {
 	}
 	if got := failureReason(err); got != "canceled" {
 		t.Fatalf("reason=%s", got)
+	}
+	err = classify(&url.Error{Op: "Post", URL: "https://provider.example/secret", Err: context.Canceled})
+	if providerFailure(err) {
+		t.Fatal("wrapped URL context cancellation must not mark an RPC provider unhealthy")
+	}
+	if strings.Contains(err.Error(), "provider.example") || strings.Contains(err.Error(), "secret") {
+		t.Fatalf("provider URL leaked through classified error: %v", err)
 	}
 }
 

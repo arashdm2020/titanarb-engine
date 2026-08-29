@@ -10,6 +10,7 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"net/url"
 	"sort"
 	"strconv"
 	"strings"
@@ -1231,6 +1232,10 @@ func hexBig(raw string) (*big.Int, error) {
 	return v, nil
 }
 func classify(err error) *Error {
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) && urlErr.Err != nil {
+		err = urlErr.Err
+	}
 	if errors.Is(err, context.DeadlineExceeded) {
 		return &Error{Kind: Timeout, Err: err}
 	}
