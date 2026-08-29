@@ -11,6 +11,7 @@ import (
 	"sync"
 
 	"github.com/titanarb/titanarb-go/internal/dex"
+	"github.com/titanarb/titanarb-go/internal/rpc"
 )
 
 type DEX string
@@ -166,7 +167,7 @@ func (d *Discoverer) DiscoverCamelotPairAt(ctx context.Context, tokenA, tokenB s
 // RefreshPoolAt updates only mutable pool state. Factory, token and static fee
 // reads are intentionally reused from the cache during incremental cycles.
 func (d *Discoverer) RefreshPoolAt(ctx context.Context, pool Pool, block uint64) (Pool, error) {
-	liquidityRaw, err := d.call(ctx, pool.Address, dex.StaticCall("liquidity()"), block)
+	liquidityRaw, err := d.poolRefreshCall(ctx, pool, "liquidity()", block)
 	if err != nil {
 		return Pool{}, err
 	}
@@ -180,7 +181,7 @@ func (d *Discoverer) RefreshPoolAt(ctx context.Context, pool Pool, block uint64)
 	} else if pool.DEX != UniswapV3 {
 		return Pool{}, fmt.Errorf("unsupported pool DEX")
 	}
-	stateRaw, err := d.call(ctx, pool.Address, dex.StaticCall(stateMethod), block)
+	stateRaw, err := d.poolRefreshCall(ctx, pool, stateMethod, block)
 	if err != nil {
 		return Pool{}, err
 	}
@@ -194,6 +195,25 @@ func (d *Discoverer) RefreshPoolAt(ctx context.Context, pool Pool, block uint64)
 	updated.LastUpdatedBlock = block
 	d.notifyPool(updated)
 	return updated, nil
+}
+
+func (d *Discoverer) poolRefreshCall(ctx context.Context, pool Pool, signature string, block uint64) (string, error) {
+	data := dex.StaticCall(signature)
+	ctx = rpc.WithRequestMetadataFields(ctx, map[string]string{
+		"contract_address":  strings.ToLower(pool.Address),
+		"pool_address":      strings.ToLower(pool.Address),
+		"calldata_selector": selector(data),
+		"pool_call":         signature,
+		"dex":               string(pool.DEX),
+		"token_pair":        strings.ToLower(pool.Token0) + "/" + strings.ToLower(pool.Token1),
+		"token0":            strings.ToLower(pool.Token0),
+		"token1":            strings.ToLower(pool.Token1),
+	})
+	raw, err := d.call(ctx, pool.Address, data, block)
+	if err != nil {
+		return "", fmt.Errorf("pool refresh %s %s %s/%s: %w", pool.DEX, signature, pool.Token0, pool.Token1, err)
+	}
+	return raw, nil
 }
 
 // ChangedPoolAddressesAt obtains the dirty pool set for an inclusive block
@@ -359,6 +379,13 @@ func (d *Discoverer) call(ctx context.Context, to, data string, block uint64) (s
 		return historical.EthCallAt(ctx, map[string]string{"to": to, "data": data}, fmt.Sprintf("0x%x", block))
 	}
 	return d.caller.EthCall(ctx, map[string]string{"to": to, "data": data})
+}
+
+func selector(data string) string {
+	if len(data) >= 10 {
+		return strings.ToLower(data[:10])
+	}
+	return strings.ToLower(data)
 }
 
 func isZeroAddress(address string) bool {

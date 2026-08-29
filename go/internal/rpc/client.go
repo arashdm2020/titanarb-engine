@@ -69,12 +69,14 @@ type requestClassKey struct{}
 type requestMetadataKey struct{}
 
 type RequestMetadata struct {
-	Stage string
-	Block uint64
+	Stage  string
+	Block  uint64
+	Fields map[string]string
 }
 
 type FailureEvent struct {
 	Provider, Endpoint, Tier, Method, Stage string
+	Fields                                  map[string]string
 	HTTPStatus, RPCCode                     int
 	RPCMessage                              string
 	Retryable, RateLimited, Timeout         bool
@@ -96,11 +98,37 @@ func WithRequestMetadata(ctx context.Context, stage string, block uint64) contex
 	return context.WithValue(ctx, requestMetadataKey{}, RequestMetadata{Stage: strings.TrimSpace(stage), Block: block})
 }
 
+func WithRequestMetadataFields(ctx context.Context, fields map[string]string) context.Context {
+	metadata := requestMetadata(ctx, requestClass(ctx))
+	if len(fields) > 0 {
+		metadata.Fields = cloneMetadataFields(metadata.Fields)
+		for key, value := range fields {
+			key = strings.TrimSpace(key)
+			if key == "" {
+				continue
+			}
+			metadata.Fields[key] = strings.TrimSpace(value)
+		}
+	}
+	return context.WithValue(ctx, requestMetadataKey{}, metadata)
+}
+
 func requestMetadata(ctx context.Context, class RequestClass) RequestMetadata {
 	if value, ok := ctx.Value(requestMetadataKey{}).(RequestMetadata); ok && value.Stage != "" {
 		return value
 	}
 	return RequestMetadata{Stage: string(class)}
+}
+
+func cloneMetadataFields(input map[string]string) map[string]string {
+	if len(input) == 0 {
+		return make(map[string]string)
+	}
+	output := make(map[string]string, len(input))
+	for key, value := range input {
+		output[key] = value
+	}
+	return output
 }
 
 func New(endpoint string, timeout time.Duration, retries int, m *metrics.Metrics) *Client {
@@ -722,7 +750,7 @@ func (c *Client) emitFailure(provider *providerState, method string, metadata Re
 		return
 	}
 	var rpcErr *Error
-	event := FailureEvent{Provider: provider.cfg.Name, Endpoint: provider.cfg.Name, Tier: provider.cfg.Tier, Method: method, Stage: metadata.Stage, Retryable: providerFailure(err), RateLimited: failureReason(err) == "rate_limit", Timeout: errors.Is(err, context.DeadlineExceeded), Cooldown: cooldown, Latency: latency, Block: metadata.Block}
+	event := FailureEvent{Provider: provider.cfg.Name, Endpoint: provider.cfg.Name, Tier: provider.cfg.Tier, Method: method, Stage: metadata.Stage, Fields: cloneMetadataFields(metadata.Fields), Retryable: providerFailure(err), RateLimited: failureReason(err) == "rate_limit", Timeout: errors.Is(err, context.DeadlineExceeded), Cooldown: cooldown, Latency: latency, Block: metadata.Block}
 	if errors.As(err, &rpcErr) {
 		event.HTTPStatus, event.RPCCode, event.RPCMessage = rpcErr.HTTPStatus, rpcErr.RPCCode, rpcErr.RPCMessage
 		event.Timeout = event.Timeout || rpcErr.Kind == Timeout
@@ -784,6 +812,9 @@ func (c *Client) updateLatency(provider *providerState, latency time.Duration) {
 }
 
 func providerFailure(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
 	var rpcErr *Error
 	if !errors.As(err, &rpcErr) {
 		return false
@@ -798,6 +829,9 @@ func providerFailure(err error) bool {
 }
 
 func failureReason(err error) string {
+	if errors.Is(err, context.Canceled) {
+		return "canceled"
+	}
 	var rpcErr *Error
 	if errors.As(err, &rpcErr) {
 		if rpcErr.Kind == Timeout {

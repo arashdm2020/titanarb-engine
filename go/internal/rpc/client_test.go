@@ -24,6 +24,41 @@ func TestMockSuccess(t *testing.T) {
 		t.Fatalf("id=%d err=%v", id, err)
 	}
 }
+
+func TestContextCanceledIsNotProviderFailure(t *testing.T) {
+	err := classify(context.Canceled)
+	if providerFailure(err) {
+		t.Fatal("context cancellation must not mark an RPC provider unhealthy")
+	}
+	if got := failureReason(err); got != "canceled" {
+		t.Fatalf("reason=%s", got)
+	}
+}
+
+func TestFailureEventCarriesSafeRequestMetadataFields(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = w.Write([]byte(`provider unavailable`))
+	}))
+	defer server.Close()
+	client := NewManaged([]ProviderConfig{{Name: "p1", HTTP: server.URL}}, time.Second, 0, nil)
+	var event FailureEvent
+	client.SetFailureObserver(func(observed FailureEvent) { event = observed })
+	ctx := WithRequestMetadata(context.Background(), "pool_refresh", 123)
+	ctx = WithRequestMetadataFields(ctx, map[string]string{
+		"pool_address":      "0xpool",
+		"calldata_selector": "0x3850c7bd",
+		"dex":               "uniswap_v3",
+	})
+	var out string
+	_ = client.Call(ctx, "eth_call", []any{map[string]string{"to": "0xpool", "data": "0x3850c7bd"}, "latest"}, &out)
+	if event.Stage != "pool_refresh" || event.Block != 123 {
+		t.Fatalf("metadata not propagated: %#v", event)
+	}
+	if event.Fields["pool_address"] != "0xpool" || event.Fields["calldata_selector"] != "0x3850c7bd" || event.Fields["dex"] != "uniswap_v3" {
+		t.Fatalf("failure fields not propagated: %#v", event.Fields)
+	}
+}
 func TestRetryBehavior(t *testing.T) {
 	var calls atomic.Int32
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

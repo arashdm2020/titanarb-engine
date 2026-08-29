@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math/big"
 	"os"
@@ -92,12 +93,17 @@ func main() {
 			"cooldown_ms": event.Cooldown.Milliseconds(), "stage": event.Stage,
 			"request_latency_ms": event.Latency.Milliseconds(), "block": event.Block,
 		}
+		for key, value := range event.Fields {
+			fields[key] = safeRPCField(value)
+		}
 		level := logger.Debug
 		if event.Retryable {
 			level = logger.Warn
 		}
 		log.Event(level, "rpc_request_failed", "rpc", "RPC request failed", fields)
-		publish(operationSink, observability.Errors, "rpc_request_failed", telegram.Warning, "RPC request failed", fields)
+		if event.Retryable {
+			publish(operationSink, observability.Errors, "rpc_request_failed", telegram.Warning, "RPC request failed", fields)
+		}
 	})
 	chain, err := rpcClient.ChainID(ctx)
 	if err != nil || chain != config.ArbitrumOneChainID {
@@ -199,7 +205,7 @@ func main() {
 			defer stopStale()
 			report, cycleErr := marketEngine.CycleAtWithSearchOptions(cycleCtx, trigger.Block, settings.RouteSearchDepth, routeBudget(settings), settings.VolatilityWeight, searchOptions)
 			if cycleErr != nil {
-				if cycleCtx.Err() == context.Canceled && blockBeyondTolerance(trigger.Block, marketScheduler.LatestBlock(), maxWorkLag) {
+				if errors.Is(cycleErr, context.Canceled) || cycleCtx.Err() == context.Canceled {
 					publish(operationSink, observability.Performance, "market_cycle_superseded", telegram.Info, "stale market work cancelled", map[string]any{"source_block": trigger.Block, "latest_block": marketScheduler.LatestBlock(), "max_work_lag_blocks": maxWorkLag})
 					return
 				}
@@ -1114,6 +1120,17 @@ func safeRPCMessage(message string) string {
 		return message[:240]
 	}
 	return message
+}
+
+func safeRPCField(value string) string {
+	value = strings.TrimSpace(value)
+	if strings.Contains(value, "://") {
+		return "[redacted]"
+	}
+	if len(value) > 240 {
+		return value[:240]
+	}
+	return value
 }
 
 func preQuoteExploreBPS() int {
