@@ -183,12 +183,8 @@ func (s *Service) scanOnce(ctx context.Context) {
 		if from > to {
 			continue
 		}
-		if err := s.limiter.Wait(ctx, s.HotBusy); err != nil {
-			return
-		}
-		var logs []factoryLog
-		filter := map[string]any{"address": factory.Address, "fromBlock": fmt.Sprintf("0x%x", from), "toBlock": fmt.Sprintf("0x%x", to)}
-		if err := s.Caller.Call(ctx, "eth_getLogs", []any{filter}, &logs); err != nil {
+		logs, err := s.factoryLogs(ctx, factory, from, to)
+		if err != nil {
 			continue
 		}
 		for _, entry := range logs {
@@ -219,6 +215,70 @@ func (s *Service) scanOnce(ctx context.Context) {
 		s.Memory.SetCheckpoint(factory.Name, to)
 	}
 	_ = s.Memory.Save(s.StatePath)
+}
+
+const (
+	defaultFactoryLogChunkBlocks = uint64(5)
+	maxFactoryLogChunkBlocks     = uint64(10_000)
+)
+
+func pairIntelGetLogsChunkSize() uint64 {
+	raw := strings.TrimSpace(os.Getenv("TITANARB_GETLOGS_BLOCK_CHUNK_SIZE"))
+	if raw == "" {
+		return defaultFactoryLogChunkBlocks
+	}
+	parsed, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || parsed == 0 {
+		return defaultFactoryLogChunkBlocks
+	}
+	if parsed > maxFactoryLogChunkBlocks {
+		return maxFactoryLogChunkBlocks
+	}
+	return parsed
+}
+
+func (s *Service) factoryLogs(ctx context.Context, factory Factory, from, to uint64) ([]factoryLog, error) {
+	if from == 0 || from > to {
+		from = to
+	}
+	chunkSize := pairIntelGetLogsChunkSize()
+	totalBlocks := to - from + 1
+	chunkTotal := (totalBlocks + chunkSize - 1) / chunkSize
+	logs := make([]factoryLog, 0)
+	for chunkStart, chunkIndex := from, uint64(1); chunkStart <= to; chunkIndex++ {
+		chunkEnd := chunkStart + chunkSize - 1
+		if chunkEnd < chunkStart || chunkEnd > to {
+			chunkEnd = to
+		}
+		if err := s.limiter.Wait(ctx, s.HotBusy); err != nil {
+			return logs, err
+		}
+		var chunk []factoryLog
+		filter := map[string]any{
+			"address":   factory.Address,
+			"fromBlock": fmt.Sprintf("0x%x", chunkStart),
+			"toBlock":   fmt.Sprintf("0x%x", chunkEnd),
+		}
+		chunkCtx := rpc.WithRequestMetadataFields(ctx, map[string]string{
+			"method":        "eth_getLogs",
+			"from_block":    fmt.Sprintf("%d", chunkStart),
+			"to_block":      fmt.Sprintf("%d", chunkEnd),
+			"block_count":   fmt.Sprintf("%d", chunkEnd-chunkStart+1),
+			"address_count": "1",
+			"chunk_index":   fmt.Sprintf("%d", chunkIndex),
+			"chunk_total":   fmt.Sprintf("%d", chunkTotal),
+			"dex":           string(factory.DEX),
+		})
+		if err := s.Caller.Call(chunkCtx, "eth_getLogs", []any{filter}, &chunk); err != nil {
+			return logs, err
+		}
+		logs = append(logs, chunk...)
+		if chunkEnd == to {
+			break
+		}
+		chunkStart = chunkEnd + 1
+	}
+	return logs, nil
 }
 
 func (s *Service) duplicate(pool string) bool {

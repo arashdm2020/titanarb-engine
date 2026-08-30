@@ -1,0 +1,132 @@
+{
+  "summary": {
+    "scope": "limited market-data pipeline reliability remediation",
+    "trading_behavior_changed": false,
+    "execution_safety_changed": false,
+    "min_profit_changed": false,
+    "route_generation_semantics_changed": false,
+    "deployment_status": "deployed",
+    "final_verdict": "PASS"
+  },
+  "files_changed": {
+    "source": [
+      "go/internal/pools/pools.go",
+      "go/internal/rpc/client.go",
+      "go/internal/market/engine.go",
+      "go/internal/pairintel/service.go",
+      "go/cmd/titanarb/main.go"
+    ],
+    "tests": [
+      "go/internal/pools/pools_test.go",
+      "go/internal/rpc/client_test.go",
+      "go/internal/market/incremental_test.go",
+      "go/internal/pairintel/service_test.go"
+    ],
+    "artifacts": [
+      "TITANARB_MARKET_PIPELINE_REMEDIATION.md",
+      "TITANARB_MARKET_PIPELINE_REMEDIATION.json"
+    ]
+  },
+  "implementation": {
+    "getlogs_chunking": {
+      "enabled_for": ["pool_refresh", "pairintel_factory_scan"],
+      "env": "TITANARB_GETLOGS_BLOCK_CHUNK_SIZE",
+      "default_blocks": 5,
+      "min_blocks": 1,
+      "max_blocks": 10000,
+      "inclusive_semantics_preserved": true,
+      "deduplicates_dirty_addresses": true
+    },
+    "rpc_error_classification": {
+      "http_400_plan_limit_retryable": true,
+      "http_400_malformed_terminal": true,
+      "decodes_json_rpc_error_on_non_2xx": true
+    },
+    "dirty_refresh_isolation": {
+      "independent_pool_refresh": true,
+      "failed_pools_remain_unresolved_dirty": true,
+      "routes_touching_unresolved_pools_skipped": true,
+      "watermark_advances_only_on_complete_refresh": true
+    },
+    "reconciliation": {
+      "startup_batch_default_units": 4,
+      "startup_batch_max_units": 8,
+      "startup_batch_timeout_ms": 2500,
+      "background_batch_units": 1,
+      "background_batch_timeout_ms": 1500,
+      "deferred_hot_path_runs_reconcile": false,
+      "atomic_route_cache_commit_preserved": true
+    }
+  },
+  "validation": {
+    "vps": {
+      "go_test_cmd_titanarb_internal": "PASS",
+      "race_rpc_market_pools_execution_pairintel": "PASS",
+      "go_vet_cmd_titanarb_internal": "PASS",
+      "go_build_cmd_titanarb": "PASS"
+    },
+    "production": {
+      "service_active": true,
+      "bot_started": true,
+      "execution_preflight_verified": true
+    }
+  },
+  "post_deploy_evidence": {
+    "observation_window_start_utc": "2026-08-30T14:48:09Z",
+    "route_cache_completed_at_utc": "2026-08-30T14:50:35.198Z",
+    "route_cache_ready": true,
+    "route_cache_size": 256,
+    "reconciliation_discovered_pools": 49,
+    "reconciliation_generated_routes": 256,
+    "avg_rps_after": 5.66,
+    "p95_rps_after": 7.0,
+    "route_cache_ready_cycles_sampled": 38,
+    "getlogs_chunks_attempted": 25,
+    "getlogs_chunks_failed": 0,
+    "getlogs_blocks_scanned": 104,
+    "dirty_pools": 5,
+    "routes_considered": 25,
+    "routes_evaluated": 22,
+    "quotes": 30,
+    "refresh_pools_failed": 0,
+    "rejected_min_profit": 26,
+    "profitable_candidates": 0,
+    "optimizer_runs": 0,
+    "opportunity_found": 0
+  },
+  "funnel_before_after": {
+    "before": {
+      "reconciliation_in_progress": "147/164 cycles",
+      "dirty_pools": 0,
+      "routes_considered": 0,
+      "routes_evaluated": 0,
+      "quotes": 0,
+      "dominant_failure": "oversized eth_getLogs HTTP 400 range-limit failures"
+    },
+    "after": {
+      "route_cache_ready": true,
+      "dirty_pools": 5,
+      "routes_considered": 25,
+      "routes_evaluated": 22,
+      "quotes": 30,
+      "getlogs_chunks_failed": 0,
+      "range_limit_failures_observed": 0
+    }
+  },
+  "remaining_issues": [
+    "Startup reconciliation remains wall-clock bounded by RPC pacing and provider latency, but cycle duration is bounded and checkpoint progress completes.",
+    "Bounded reconciliation eth_call context timeouts still occur and are retryable; they do not block route-cache completion.",
+    "No profitable candidate was observed in the validation window."
+  ],
+  "verdicts": {
+    "eth_getlogs_chunking": "PASS",
+    "rpc_plan_limit_classification": "PASS",
+    "dirty_refresh_isolation": "PASS",
+    "failed_pool_unresolved_safety": "PASS",
+    "reconciliation_bounded_progress": "PASS",
+    "market_funnel_reaches_quote_economics": "PASS",
+    "rpc_budget": "PASS",
+    "execution_safety_unchanged": "PASS",
+    "overall": "PASS"
+  }
+}

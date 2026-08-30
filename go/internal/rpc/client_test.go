@@ -261,6 +261,35 @@ func TestManagedClientRPCRevertDoesNotMarkProviderUnhealthy(t *testing.T) {
 	}
 }
 
+func TestHTTP400PlanLimitCanFailOver(t *testing.T) {
+	primary := rpcServer(t, http.StatusBadRequest, `{"jsonrpc":"2.0","id":1,"error":{"code":-32600,"message":"Free tier allows requests up to a 10 block range"}}`)
+	secondary := rpcServer(t, http.StatusOK, `{"jsonrpc":"2.0","id":1,"result":[]}`)
+	client := NewManaged([]ProviderConfig{{Name: "alchemy_1", HTTP: primary.URL}, {Name: "ankr_1", HTTP: secondary.URL}}, time.Second, 1, nil)
+	var logs []map[string]any
+	if err := client.Call(context.Background(), "eth_getLogs", []any{map[string]any{"fromBlock": "0x1", "toBlock": "0x20"}}, &logs); err != nil {
+		t.Fatalf("plan limit did not fail over: %v", err)
+	}
+	if got := client.ActiveProvider(); got != "ankr_1" {
+		t.Fatalf("provider=%s want ankr_1", got)
+	}
+}
+
+func TestHTTP400MalformedRequestIsTerminal(t *testing.T) {
+	var secondaryCalls atomic.Int32
+	primary := rpcServer(t, http.StatusBadRequest, `{"jsonrpc":"2.0","id":1,"error":{"code":-32602,"message":"invalid params: malformed filter"}}`)
+	secondary := countingRPCServer(t, &secondaryCalls, `{"jsonrpc":"2.0","id":1,"result":[]}`)
+	client := NewManaged([]ProviderConfig{{Name: "alchemy_1", HTTP: primary.URL}, {Name: "ankr_1", HTTP: secondary.URL}}, time.Second, 1, nil)
+	var logs []map[string]any
+	err := client.Call(context.Background(), "eth_getLogs", []any{map[string]any{"fromBlock": "bad"}}, &logs)
+	var rpcErr *Error
+	if !errors.As(err, &rpcErr) || rpcErr.HTTPStatus != http.StatusBadRequest {
+		t.Fatalf("expected HTTP 400 error, got %T %v", err, err)
+	}
+	if secondaryCalls.Load() != 0 {
+		t.Fatalf("malformed 400 retried on secondary %d times", secondaryCalls.Load())
+	}
+}
+
 func TestManagedClientCallerContextTimeoutDoesNotFailover(t *testing.T) {
 	var secondaryCalls atomic.Int32
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

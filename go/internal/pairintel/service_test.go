@@ -3,6 +3,7 @@ package pairintel
 import (
 	"context"
 	"fmt"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -93,6 +94,70 @@ func TestPairConfigDefaultsToBoundedShadow(t *testing.T) {
 	if !cfg.Enabled || cfg.Mode != "shadow" || cfg.MaxTrackedPairs != 16 || cfg.MaxShadowPairs != 8 || cfg.MaxDynamicAssets != 4 || cfg.MaxLivePairs != 2 || cfg.MaxLiveDynamicAssets != 2 || cfg.MinScore != 65 || cfg.MinConfidence != .70 || cfg.MinObservation != time.Hour || cfg.MaxRPS != .5 || cfg.Burst != 1 {
 		t.Fatalf("defaults=%+v", cfg)
 	}
+}
+
+func TestFactoryLogsChunksProviderSafeRanges(t *testing.T) {
+	t.Setenv("TITANARB_GETLOGS_BLOCK_CHUNK_SIZE", "5")
+	caller := &factoryLogCaller{}
+	cfg := DefaultConfig()
+	cfg.MaxRPS = 1000
+	s := NewService(NewMemory(cfg), caller, nil, nil, nil, "", nil)
+	got, err := s.factoryLogs(context.Background(), Factory{Name: "uni", Address: poolA, DEX: pools.UniswapV3}, 10, 30)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 5 {
+		t.Fatalf("logs=%d want 5", len(got))
+	}
+	want := [][2]string{{"0xa", "0xe"}, {"0xf", "0x13"}, {"0x14", "0x18"}, {"0x19", "0x1d"}, {"0x1e", "0x1e"}}
+	if !reflect.DeepEqual(caller.ranges, want) {
+		t.Fatalf("ranges=%v want %v", caller.ranges, want)
+	}
+}
+
+func TestFactoryLogsStopsOnChunkFailureWithoutSkippingCheckpointRange(t *testing.T) {
+	t.Setenv("TITANARB_GETLOGS_BLOCK_CHUNK_SIZE", "5")
+	caller := &factoryLogCaller{failAt: 2}
+	cfg := DefaultConfig()
+	cfg.MaxRPS = 1000
+	s := NewService(NewMemory(cfg), caller, nil, nil, nil, "", nil)
+	got, err := s.factoryLogs(context.Background(), Factory{Name: "uni", Address: poolA, DEX: pools.UniswapV3}, 1, 11)
+	if err == nil {
+		t.Fatal("expected middle chunk failure")
+	}
+	if len(got) != 1 {
+		t.Fatalf("logs before failure=%d want 1", len(got))
+	}
+	want := [][2]string{{"0x1", "0x5"}, {"0x6", "0xa"}}
+	if !reflect.DeepEqual(caller.ranges, want) {
+		t.Fatalf("ranges=%v want %v", caller.ranges, want)
+	}
+}
+
+type factoryLogCaller struct {
+	ranges [][2]string
+	failAt int
+}
+
+func (f *factoryLogCaller) Call(_ context.Context, method string, params any, out any) error {
+	if method != "eth_getLogs" {
+		return nil
+	}
+	filter := params.([]any)[0].(map[string]any)
+	f.ranges = append(f.ranges, [2]string{filter["fromBlock"].(string), filter["toBlock"].(string)})
+	if f.failAt > 0 && len(f.ranges) == f.failAt {
+		return fmt.Errorf("range limit")
+	}
+	*(out.(*[]factoryLog)) = []factoryLog{{Address: poolA, BlockNumber: filter["fromBlock"].(string)}}
+	return nil
+}
+
+func (f *factoryLogCaller) EthCall(context.Context, map[string]string) (string, error) {
+	return "0x", nil
+}
+
+func (f *factoryLogCaller) BlockNumber(context.Context) (uint64, error) {
+	return 0, nil
 }
 
 func wordHex(v uint64) string { return fmt.Sprintf("0x%064x", v) }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"math/big"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -78,7 +79,18 @@ type reconcileState struct {
 	maxHops    int
 	maxRoutes  int
 	batches    uint64
+	failures   int
 	started    time.Time
+}
+
+type refreshStats struct {
+	Logs                  pools.LogQueryStats
+	PoolsAttempted        uint64
+	PoolsSucceeded        uint64
+	PoolsFailed           uint64
+	UnresolvedDirty       map[string]struct{}
+	MarketStateIncomplete bool
+	LastFailure           string
 }
 
 type Snapshot struct {
@@ -87,71 +99,89 @@ type Snapshot struct {
 }
 
 type CycleReport struct {
-	StateBlock              uint64
-	FullReconcile           bool
-	DirtyPools              uint64
-	RoutesRecomputed        uint64
-	RoutesReused            uint64
-	QuoteDuration           time.Duration
-	OptimizerDuration       time.Duration
-	OptimizerRuns           uint64
-	OptimizerSamples        uint64
-	RoutesEvaluated         uint64
-	Duration                time.Duration
-	Routes                  []routes.Route
-	UniverseAssets          []string
-	DynamicAssets           []string
-	UniverseDecisions       []string
-	RouteCountBefore        int
-	RouteCountAfter         int
-	RoutesByHop             map[int]int
-	DEXRoutes               map[string]int
-	TopNearMisses           []map[string]any
-	RouteScores             map[string]int
-	OptimizerBudget         map[string]int
-	RejectionReasons        map[string]int
-	ExploitSelected         uint64
-	ExploreSelected         uint64
-	NewSelected             uint64
-	MemoryRoutes            int
-	AvgPreQuoteScore        int64
-	CrossVenueQuoted        uint64
-	SameDEXQuoted           uint64
-	RoutesConsidered        uint64
-	QuoteAgeBlocks          uint64
-	PreQuoteRanking         bool
-	RPCCallsByStage         map[string]uint64
-	RPCCallsPoolRefresh     uint64
-	RPCCallsInitialQuotes   uint64
-	RPCCallsOptimizer       uint64
-	RPCCallsEconomics       uint64
-	QuoteCacheHits          uint64
-	QuoteCacheMisses        uint64
-	QuoteDedupHits          uint64
-	QuoteCacheInvalidations uint64
-	QuoteBudget             int
-	QuoteBudgetUsed         int
-	QuoteBudgetDropped      uint64
-	NoQuoteReason           string
-	OptimizerRequested      uint64
-	OptimizerSaved          uint64
-	RoutesDeepOptimized     uint64
-	RoutesProbeOnly         uint64
-	RoutesSkippedDeep       uint64
-	RoutesSkippedByPreQuote uint64
-	RPCPerEvaluatedRoute    float64
-	RPCPerOptimizerRoute    float64
-	ScoreDeciles            map[string]map[string]any
-	ReconcilePending        bool
-	ReconcileBatchSize      int
-	ReconcilePairsDone      int
-	ReconcilePairsTotal     int
-	ReconcileUnitsDone      int
-	ReconcileUnitsTotal     int
-	ReconcileRPC            uint64
-	ReconcileDuration       time.Duration
-	ReconcileCompleted      bool
-	ReconcileError          string
+	StateBlock               uint64
+	FullReconcile            bool
+	DirtyPools               uint64
+	RoutesRecomputed         uint64
+	RoutesReused             uint64
+	QuoteDuration            time.Duration
+	OptimizerDuration        time.Duration
+	OptimizerRuns            uint64
+	OptimizerSamples         uint64
+	RoutesEvaluated          uint64
+	Duration                 time.Duration
+	Routes                   []routes.Route
+	UniverseAssets           []string
+	DynamicAssets            []string
+	UniverseDecisions        []string
+	RouteCountBefore         int
+	RouteCountAfter          int
+	RoutesByHop              map[int]int
+	DEXRoutes                map[string]int
+	TopNearMisses            []map[string]any
+	RouteScores              map[string]int
+	OptimizerBudget          map[string]int
+	RejectionReasons         map[string]int
+	ExploitSelected          uint64
+	ExploreSelected          uint64
+	NewSelected              uint64
+	MemoryRoutes             int
+	AvgPreQuoteScore         int64
+	CrossVenueQuoted         uint64
+	SameDEXQuoted            uint64
+	RoutesConsidered         uint64
+	QuoteAgeBlocks           uint64
+	PreQuoteRanking          bool
+	RPCCallsByStage          map[string]uint64
+	RPCCallsPoolRefresh      uint64
+	RPCCallsInitialQuotes    uint64
+	RPCCallsOptimizer        uint64
+	RPCCallsEconomics        uint64
+	QuoteCacheHits           uint64
+	QuoteCacheMisses         uint64
+	QuoteDedupHits           uint64
+	QuoteCacheInvalidations  uint64
+	QuoteBudget              int
+	QuoteBudgetUsed          int
+	QuoteBudgetDropped       uint64
+	NoQuoteReason            string
+	OptimizerRequested       uint64
+	OptimizerSaved           uint64
+	RoutesDeepOptimized      uint64
+	RoutesProbeOnly          uint64
+	RoutesSkippedDeep        uint64
+	RoutesSkippedByPreQuote  uint64
+	RPCPerEvaluatedRoute     float64
+	RPCPerOptimizerRoute     float64
+	ScoreDeciles             map[string]map[string]any
+	ReconcilePending         bool
+	ReconcileBatchSize       int
+	ReconcilePairsDone       int
+	ReconcilePairsTotal      int
+	ReconcileUnitsDone       int
+	ReconcileUnitsTotal      int
+	ReconcileRPC             uint64
+	ReconcileDuration        time.Duration
+	ReconcileCompleted       bool
+	ReconcileError           string
+	ReconcileUnitsThisCycle  int
+	ReconcileFailures        int
+	ReconcileTotalDuration   time.Duration
+	ReconcileFailedUnits     int
+	ReconcileDiscoveredPools int
+	ReconcileGeneratedRoutes int
+	RouteCacheReady          bool
+	RouteCacheSize           int
+	GetLogsChunksAttempted   uint64
+	GetLogsChunksSucceeded   uint64
+	GetLogsChunksFailed      uint64
+	GetLogsBlocksScanned     uint64
+	RefreshPoolsAttempted    uint64
+	RefreshPoolsSucceeded    uint64
+	RefreshPoolsFailed       uint64
+	UnresolvedDirtyPools     uint64
+	RoutesSkippedUnresolved  uint64
+	MarketStateIncomplete    bool
 }
 
 const incrementalRefreshBatchBlocks = 8
@@ -187,7 +217,7 @@ func DefaultSearchOptions() SearchOptions {
 		MaxOptimizedRoutes:       8,
 		NormalOptimizerSamples:   3,
 		FullReconcileEvery:       2_400,
-		ReconcileBatchPairs:      1,
+		ReconcileBatchPairs:      4,
 		DisablePreQuoteRanking:   false,
 		ExploreRatioBPS:          2_000,
 		PersistentQuoteCache:     true,
@@ -238,8 +268,8 @@ func (o SearchOptions) Normalized() SearchOptions {
 	if o.ReconcileBatchPairs < 1 {
 		o.ReconcileBatchPairs = defaults.ReconcileBatchPairs
 	}
-	if o.ReconcileBatchPairs > 4 {
-		o.ReconcileBatchPairs = 4
+	if o.ReconcileBatchPairs > 8 {
+		o.ReconcileBatchPairs = 8
 	}
 	if o.ExploreRatioBPS < 0 {
 		o.ExploreRatioBPS = 0
@@ -341,6 +371,9 @@ func (e *Engine) applyPendingMarket() bool {
 	e.pendingDynamic = nil
 	e.pendingMu.Unlock()
 	if next == nil {
+		return false
+	}
+	if reflect.DeepEqual(e.market, *next) && stringSetEqual(e.livePairKeys, pairKeys) && stringSetEqual(e.liveDynamic, dynamic) {
 		return false
 	}
 	e.market = *next
@@ -458,6 +491,8 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	started := time.Now()
 	report := CycleReport{StateBlock: stateBlock}
 	report.RouteCountBefore = len(e.routeCache)
+	report.RouteCacheReady = len(e.routeCache) > 0
+	report.RouteCacheSize = len(e.routeCache)
 	e.statsMu.RLock()
 	report.UniverseAssets = append([]string(nil), e.universeAssets...)
 	report.DynamicAssets = append([]string(nil), e.dynamicAssets...)
@@ -483,6 +518,8 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		report.Duration = time.Since(started)
 		report.Routes = append([]routes.Route(nil), e.routeCache...)
 		report.RouteCountAfter = len(report.Routes)
+		report.RouteCacheReady = len(e.routeCache) > 0
+		report.RouteCacheSize = len(e.routeCache)
 		report.RoutesByHop = routesByHop(report.Routes)
 		report.DEXRoutes = routeDEXDiversity(report.Routes)
 		if len(report.Routes) == 0 {
@@ -496,7 +533,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	if shouldDeferIncrementalRefresh(e.lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
 		routesFound := refreshRoutes(e.routeCache, liquidPools(e.cache.Snapshot()))
 		report.RoutesReused = uint64(len(routesFound))
-		e.advanceReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
+		e.describeReconciliation(&report)
 		report.Duration = time.Since(started)
 		report.Routes = routesFound
 		report.RouteCountAfter = len(routesFound)
@@ -510,6 +547,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		return report, nil
 	}
 	var dirty map[string]struct{}
+	var refresh refreshStats
 	var err error
 	rpcAtStart := e.rpcCalls()
 	forceAllEvaluation := e.forceEvaluateNext
@@ -519,7 +557,16 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		fromBlock = e.lastStateBlock + 1
 	}
 	refreshCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "pool_refresh", stateBlock)
-	dirty, err = e.incrementalRefresh(refreshCtx, fromBlock, stateBlock)
+	dirty, refresh, err = e.incrementalRefresh(refreshCtx, fromBlock, stateBlock)
+	report.GetLogsChunksAttempted = refresh.Logs.ChunksAttempted
+	report.GetLogsChunksSucceeded = refresh.Logs.ChunksSucceeded
+	report.GetLogsChunksFailed = refresh.Logs.ChunksFailed
+	report.GetLogsBlocksScanned = refresh.Logs.BlocksScanned
+	report.RefreshPoolsAttempted = refresh.PoolsAttempted
+	report.RefreshPoolsSucceeded = refresh.PoolsSucceeded
+	report.RefreshPoolsFailed = refresh.PoolsFailed
+	report.UnresolvedDirtyPools = uint64(len(refresh.UnresolvedDirty))
+	report.MarketStateIncomplete = refresh.MarketStateIncomplete
 	if err != nil {
 		return report, err
 	}
@@ -543,6 +590,11 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		return routesFound[i].String() < routesFound[j].String()
 	})
 	affected := routesAffectedBy(routesFound, dirty, forceAllEvaluation)
+	if len(refresh.UnresolvedDirty) > 0 {
+		before := len(affected)
+		affected = routesWithoutPools(affected, refresh.UnresolvedDirty)
+		report.RoutesSkippedUnresolved = uint64(before - len(affected))
+	}
 	e.reviveDirtyRouteMemory(affected, stateBlock)
 	report.RoutesRecomputed = uint64(len(affected))
 	if len(routesFound) > len(affected) {
@@ -618,15 +670,17 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	// Dirty/live market work owns the cycle. Background reconciliation advances
 	// only on an otherwise idle head so it cannot add latency to fresh quotes.
 	if len(dirty) == 0 {
-		e.advanceReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
+		e.advanceBackgroundReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
 	}
 	report.RPCCallsByStage["reconcile"] = report.ReconcileRPC
 	report.Duration = time.Since(started)
 	report.Routes = routesFound
 	report.RouteCountAfter = len(routesFound)
+	report.RouteCacheReady = len(e.routeCache) > 0
+	report.RouteCacheSize = len(e.routeCache)
 	report.RoutesByHop = routesByHop(routesFound)
 	report.DEXRoutes = routeDEXDiversity(routesFound)
-	if stateBlock > 0 {
+	if stateBlock > 0 && !refresh.MarketStateIncomplete {
 		e.lastStateBlock = stateBlock
 	}
 	return report, nil
@@ -667,13 +721,40 @@ func (e *Engine) startReconciliation(maxHops, maxRoutes int) {
 
 // advanceReconciliationBatch performs a small resumable unit of discovery.
 // Existing routes/cache remain live until the final atomic commit.
+func (e *Engine) describeReconciliation(report *CycleReport) {
+	state := e.reconciliation
+	if state == nil || report == nil {
+		return
+	}
+	report.ReconcilePending = true
+	report.ReconcilePairsDone = state.next
+	report.ReconcilePairsTotal = len(state.jobs)
+	report.ReconcileUnitsDone = state.next
+	report.ReconcileUnitsTotal = len(state.jobs)
+	report.ReconcileFailures = state.failures
+}
+
 func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint64, batchSize int, report *CycleReport) {
+	e.advanceReconciliationBatchWithin(ctx, stateBlock, batchSize, 2500*time.Millisecond, report)
+}
+
+func (e *Engine) advanceBackgroundReconciliationBatch(ctx context.Context, stateBlock uint64, batchSize int, report *CycleReport) {
+	if batchSize > 1 {
+		batchSize = 1
+	}
+	e.advanceReconciliationBatchWithin(ctx, stateBlock, batchSize, 1500*time.Millisecond, report)
+}
+
+func (e *Engine) advanceReconciliationBatchWithin(ctx context.Context, stateBlock uint64, batchSize int, timeout time.Duration, report *CycleReport) {
 	state := e.reconciliation
 	if state == nil || report == nil {
 		return
 	}
 	if batchSize < 1 {
 		batchSize = 1
+	}
+	if timeout <= 0 {
+		timeout = 2500 * time.Millisecond
 	}
 	report.ReconcilePending = true
 	report.ReconcileBatchSize = batchSize
@@ -687,7 +768,7 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 	// forever. Finish at most this one bounded batch, then the scheduler resumes
 	// the remaining jobs against its newest head.
 	reconcileCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(context.WithoutCancel(ctx), rpc.Background), "reconcile", stateBlock)
-	batchCtx, cancel := context.WithTimeout(reconcileCtx, 2500*time.Millisecond)
+	batchCtx, cancel := context.WithTimeout(reconcileCtx, timeout)
 	defer cancel()
 	processed := 0
 	for state.next < len(state.jobs) && processed < batchSize {
@@ -711,6 +792,7 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 			if batchCtx.Err() != nil {
 				break
 			}
+			state.failures++
 			// Preserve the existing cache entry and let the next periodic
 			// reconciliation retry this pair; one unavailable pair/provider must
 			// not permanently block checkpoint progress.
@@ -744,6 +826,8 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 	report.ReconcileUnitsTotal = len(state.jobs)
 	report.ReconcileRPC = safeUint64Delta(e.rpcCalls(), rpcBefore)
 	report.ReconcileDuration = time.Since(started)
+	report.ReconcileUnitsThisCycle = processed
+	report.ReconcileFailures = state.failures
 	if state.next < len(state.jobs) {
 		return
 	}
@@ -780,6 +864,12 @@ func (e *Engine) advanceReconciliationBatch(ctx context.Context, stateBlock uint
 	report.ReconcilePending = false
 	report.ReconcileCompleted = true
 	report.FullReconcile = true
+	report.ReconcileTotalDuration = time.Since(state.started)
+	report.ReconcileFailedUnits = state.failures
+	report.ReconcileDiscoveredPools = len(discovered)
+	report.ReconcileGeneratedRoutes = len(filtered)
+	report.RouteCacheReady = len(e.routeCache) > 0
+	report.RouteCacheSize = len(e.routeCache)
 }
 
 func (e *Engine) fullReconcile(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int) ([]routes.Route, error) {
@@ -909,20 +999,27 @@ func canonicalAddressPair(a, b string) string {
 	return a + ":" + b
 }
 
-func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock uint64) (map[string]struct{}, error) {
+func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock uint64) (map[string]struct{}, refreshStats, error) {
+	stats := refreshStats{UnresolvedDirty: make(map[string]struct{})}
 	current := e.cache.Snapshot()
 	if len(current) == 0 {
-		return map[string]struct{}{}, nil
+		return map[string]struct{}{}, stats, nil
 	}
 	addresses := make([]string, 0, len(current))
 	for _, pool := range current {
 		addresses = append(addresses, pool.Address)
 	}
-	dirty, logErr := e.discoverer.ChangedPoolAddressesAt(ctx, addresses, fromBlock, stateBlock)
+	dirty, logStats, logErr := e.discoverer.ChangedPoolAddressesAtWithStats(ctx, addresses, fromBlock, stateBlock)
+	stats.Logs = logStats
 	refresh := current
 	if logErr == nil {
 		refresh = poolsByAddress(current, dirty)
 	} else {
+		if ctx.Err() != nil {
+			return nil, stats, ctx.Err()
+		}
+		stats.MarketStateIncomplete = true
+		stats.LastFailure = fmt.Sprintf("%T", logErr)
 		// Correctness fallback: if log-based invalidation is unavailable, refresh
 		// and recompute every cached pool rather than risk a stale candidate.
 		dirty = make(map[string]struct{}, len(current))
@@ -931,7 +1028,7 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 		}
 	}
 	if len(refresh) == 0 {
-		return dirty, nil
+		return dirty, stats, nil
 	}
 	type result struct {
 		before, after pools.Pool
@@ -962,9 +1059,22 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 	}()
 	go func() { wg.Wait(); close(results) }()
 	for result := range results {
+		stats.PoolsAttempted++
 		if result.err != nil {
-			return nil, result.err
+			if ctx.Err() != nil {
+				return nil, stats, ctx.Err()
+			}
+			stats.PoolsFailed++
+			stats.MarketStateIncomplete = true
+			stats.LastFailure = fmt.Sprintf("%T", result.err)
+			address := strings.ToLower(result.before.Address)
+			if address != "" {
+				stats.UnresolvedDirty[address] = struct{}{}
+				dirty[address] = struct{}{}
+			}
+			continue
 		}
+		stats.PoolsSucceeded++
 		address := strings.ToLower(result.after.Address)
 		changed := poolChanged(result.before, result.after)
 		if !changed {
@@ -978,7 +1088,7 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 			delete(dirty, address)
 		}
 	}
-	return dirty, nil
+	return dirty, stats, nil
 }
 
 func changedPoolAddresses(before, after []pools.Pool) map[string]struct{} {
@@ -1011,6 +1121,38 @@ func poolsByAddress(all []pools.Pool, selected map[string]struct{}) []pools.Pool
 		}
 	}
 	return result
+}
+
+func routesWithoutPools(all []routes.Route, excluded map[string]struct{}) []routes.Route {
+	if len(excluded) == 0 {
+		return all
+	}
+	out := make([]routes.Route, 0, len(all))
+	for _, route := range all {
+		blocked := false
+		for _, pool := range route.Hops {
+			if _, ok := excluded[strings.ToLower(pool.Address)]; ok {
+				blocked = true
+				break
+			}
+		}
+		if !blocked {
+			out = append(out, route)
+		}
+	}
+	return out
+}
+
+func stringSetEqual(a, b map[string]struct{}) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for key := range a {
+		if _, ok := b[key]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 type evaluationReport struct {

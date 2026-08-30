@@ -7,6 +7,8 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 
@@ -71,16 +73,17 @@ type logCaller interface {
 var ErrLogQueryUnsupported = errors.New("pool log query unsupported")
 
 type Discoverer struct {
-	caller         Caller
-	uniswapFactory string
-	camelotFactory string
-	fees           []uint32
-	observerMu     sync.RWMutex
-	observer       Observer
+	caller                Caller
+	uniswapFactory        string
+	camelotFactory        string
+	fees                  []uint32
+	getLogsBlockChunkSize uint64
+	observerMu            sync.RWMutex
+	observer              Observer
 }
 
 func NewDiscoverer(caller Caller, uniswapFactory, camelotFactory string, fees []uint32) *Discoverer {
-	return &Discoverer{caller: caller, uniswapFactory: uniswapFactory, camelotFactory: camelotFactory, fees: append([]uint32(nil), fees...)}
+	return &Discoverer{caller: caller, uniswapFactory: uniswapFactory, camelotFactory: camelotFactory, fees: append([]uint32(nil), fees...), getLogsBlockChunkSize: getLogsBlockChunkSizeFromEnv()}
 }
 
 func (d *Discoverer) SetObserver(observer Observer) {
@@ -216,45 +219,117 @@ func (d *Discoverer) poolRefreshCall(ctx context.Context, pool Pool, signature s
 	return raw, nil
 }
 
+type LogQueryStats struct {
+	ChunksAttempted uint64
+	ChunksSucceeded uint64
+	ChunksFailed    uint64
+	BlocksScanned   uint64
+}
+
+const (
+	defaultGetLogsBlockChunkSize = uint64(5)
+	maxGetLogsBlockChunkSize     = uint64(10_000)
+)
+
+func getLogsBlockChunkSizeFromEnv() uint64 {
+	raw := strings.TrimSpace(os.Getenv("TITANARB_GETLOGS_BLOCK_CHUNK_SIZE"))
+	if raw == "" {
+		return defaultGetLogsBlockChunkSize
+	}
+	parsed, err := strconv.ParseUint(raw, 10, 64)
+	if err != nil || parsed < 1 {
+		return defaultGetLogsBlockChunkSize
+	}
+	if parsed > maxGetLogsBlockChunkSize {
+		return maxGetLogsBlockChunkSize
+	}
+	return parsed
+}
+
+func (d *Discoverer) getLogsChunkSize() uint64 {
+	if d == nil || d.getLogsBlockChunkSize == 0 {
+		return defaultGetLogsBlockChunkSize
+	}
+	return d.getLogsBlockChunkSize
+}
+
 // ChangedPoolAddressesAt obtains the dirty pool set for an inclusive block
-// range with one eth_getLogs request. Any event from a supported pool marks the
-// pool dirty; this conservatively includes swaps and in/out-of-range liquidity
-// changes without assuming identical Uniswap and Algebra event ABIs.
+// range with bounded eth_getLogs requests. Any event from a supported pool marks
+// the pool dirty; this conservatively includes swaps and in/out-of-range
+// liquidity changes without assuming identical Uniswap and Algebra event ABIs.
 func (d *Discoverer) ChangedPoolAddressesAt(ctx context.Context, poolAddresses []string, fromBlock, toBlock uint64) (map[string]struct{}, error) {
+	changed, _, err := d.ChangedPoolAddressesAtWithStats(ctx, poolAddresses, fromBlock, toBlock)
+	return changed, err
+}
+
+func (d *Discoverer) ChangedPoolAddressesAtWithStats(ctx context.Context, poolAddresses []string, fromBlock, toBlock uint64) (map[string]struct{}, LogQueryStats, error) {
 	changed := make(map[string]struct{})
+	var stats LogQueryStats
 	if len(poolAddresses) == 0 || toBlock == 0 {
-		return changed, nil
+		return changed, stats, nil
 	}
 	caller, ok := d.caller.(logCaller)
 	if !ok {
-		return nil, ErrLogQueryUnsupported
+		return nil, stats, ErrLogQueryUnsupported
 	}
 	if fromBlock == 0 || fromBlock > toBlock {
 		fromBlock = toBlock
 	}
-	var logs []struct {
-		Address     string   `json:"address"`
-		Data        string   `json:"data"`
-		Topics      []string `json:"topics"`
-		BlockNumber string   `json:"blockNumber"`
-	}
-	filter := map[string]any{
-		"fromBlock": fmt.Sprintf("0x%x", fromBlock),
-		"toBlock":   fmt.Sprintf("0x%x", toBlock),
-		"address":   poolAddresses,
-	}
-	if err := caller.Call(ctx, "eth_getLogs", []any{filter}, &logs); err != nil {
-		return nil, err
-	}
-	for _, entry := range logs {
-		if entry.Address != "" {
-			changed[strings.ToLower(entry.Address)] = struct{}{}
+	chunkSize := d.getLogsChunkSize()
+	totalBlocks := toBlock - fromBlock + 1
+	chunkTotal := (totalBlocks + chunkSize - 1) / chunkSize
+	addresses := append([]string(nil), poolAddresses...)
+	for chunkStart, chunkIndex := fromBlock, uint64(1); chunkStart <= toBlock; chunkIndex++ {
+		if err := ctx.Err(); err != nil {
+			return changed, stats, err
 		}
-		if swap, ok := decodeSwapLog(entry.Address, entry.Data, entry.Topics, entry.BlockNumber); ok {
-			d.notifySwap(swap)
+		chunkEnd := chunkStart + chunkSize - 1
+		if chunkEnd < chunkStart || chunkEnd > toBlock {
+			chunkEnd = toBlock
 		}
+		blockCount := chunkEnd - chunkStart + 1
+		stats.ChunksAttempted++
+		stats.BlocksScanned += blockCount
+		var logs []struct {
+			Address     string   `json:"address"`
+			Data        string   `json:"data"`
+			Topics      []string `json:"topics"`
+			BlockNumber string   `json:"blockNumber"`
+		}
+		filter := map[string]any{
+			"fromBlock": fmt.Sprintf("0x%x", chunkStart),
+			"toBlock":   fmt.Sprintf("0x%x", chunkEnd),
+			"address":   addresses,
+		}
+		batchCtx := rpc.WithRequestMetadataFields(ctx, map[string]string{
+			"method":        "eth_getLogs",
+			"from_block":    strconv.FormatUint(chunkStart, 10),
+			"to_block":      strconv.FormatUint(chunkEnd, 10),
+			"block_count":   strconv.FormatUint(blockCount, 10),
+			"address_count": strconv.Itoa(len(addresses)),
+			"chunk_index":   strconv.FormatUint(chunkIndex, 10),
+			"chunk_total":   strconv.FormatUint(chunkTotal, 10),
+		})
+		err := caller.Call(batchCtx, "eth_getLogs", []any{filter}, &logs)
+		if err != nil {
+			stats.ChunksFailed++
+			return changed, stats, err
+		}
+		stats.ChunksSucceeded++
+		for _, entry := range logs {
+			if entry.Address != "" {
+				changed[strings.ToLower(entry.Address)] = struct{}{}
+			}
+			if swap, ok := decodeSwapLog(entry.Address, entry.Data, entry.Topics, entry.BlockNumber); ok {
+				d.notifySwap(swap)
+			}
+		}
+		if chunkEnd == toBlock {
+			break
+		}
+		chunkStart = chunkEnd + 1
 	}
-	return changed, nil
+	return changed, stats, nil
 }
 
 func (d *Discoverer) uniswapPool(ctx context.Context, a, b string, fee uint32, block uint64) (*Pool, error) {

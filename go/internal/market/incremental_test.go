@@ -1,12 +1,17 @@
 package market
 
 import (
+	"context"
+	"errors"
+	"fmt"
 	"math/big"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/titanarb/titanarb-go/internal/cache"
 	"github.com/titanarb/titanarb-go/internal/config"
+	"github.com/titanarb/titanarb-go/internal/dex"
 	"github.com/titanarb/titanarb-go/internal/nearmiss"
 	"github.com/titanarb/titanarb-go/internal/optimizer"
 	"github.com/titanarb/titanarb-go/internal/pools"
@@ -66,6 +71,26 @@ func TestLiveMarketAllowsOnlyAdmittedDynamicPairEdges(t *testing.T) {
 	}
 	if e.marketPairAllowed("USDC", "DYN_B") || e.marketPairAllowed("DYN_A", "DYN_B") {
 		t.Fatal("unadmitted dynamic edge accepted")
+	}
+}
+
+func TestRepeatedLiveMarketSnapshotIsNoop(t *testing.T) {
+	base := config.MarketConfig{
+		ExecutionAssetNames: []string{"USDC"},
+		MarketAssetNames:    []string{"USDC", "DYN"},
+		Tokens: map[string]config.Token{
+			"USDC": {Symbol: "USDC", Address: "0x0000000000000000000000000000000000000001"},
+			"DYN":  {Symbol: "DYN", Address: "0x0000000000000000000000000000000000000002"},
+		},
+	}
+	pairKeys := []string{"0x0000000000000000000000000000000000000001:0x0000000000000000000000000000000000000002"}
+	e := &Engine{market: base, executionAssets: []string{"USDC"}, livePairKeys: map[string]struct{}{pairKeys[0]: {}}, liveDynamic: map[string]struct{}{"DYN": {}}}
+	e.QueueLiveMarket(cloneTestMarket(base), pairKeys, []string{"DYN"})
+	if e.applyPendingMarket() {
+		t.Fatal("identical live market snapshot triggered reconciliation")
+	}
+	if e.forceFull {
+		t.Fatal("noop snapshot set forceFull")
 	}
 }
 
@@ -190,8 +215,19 @@ func TestReconciliationCheckpointBuildsBoundedCanonicalJobs(t *testing.T) {
 	if engine.reconciliation == nil || len(engine.reconciliation.jobs) != 9 || engine.reconciliation.next != 0 {
 		t.Fatalf("unexpected reconciliation checkpoint: %+v", engine.reconciliation)
 	}
-	if got := DefaultSearchOptions().Normalized().ReconcileBatchPairs; got != 1 {
-		t.Fatalf("default reconciliation batch=%d want 1", got)
+	if got := DefaultSearchOptions().Normalized().ReconcileBatchPairs; got != 4 {
+		t.Fatalf("default reconciliation batch=%d want 4", got)
+	}
+}
+
+func TestDefaultReconciliationBatchIsBounded(t *testing.T) {
+	if got := DefaultSearchOptions().Normalized().ReconcileBatchPairs; got != 4 {
+		t.Fatalf("default reconciliation batch=%d want 4", got)
+	}
+	options := DefaultSearchOptions()
+	options.ReconcileBatchPairs = 99
+	if got := options.Normalized().ReconcileBatchPairs; got != 8 {
+		t.Fatalf("bounded reconciliation batch=%d want 8", got)
 	}
 }
 
@@ -215,6 +251,113 @@ func TestRefreshRoutesDropsInactivePool(t *testing.T) {
 	}
 	if got := refreshRoutes([]routes.Route{route}, []pools.Pool{p}); len(got) != 1 {
 		t.Fatalf("active route was removed: %#v", got)
+	}
+}
+
+type incrementalFakeCaller struct {
+	logDirty     map[string]struct{}
+	failRefresh  map[string]struct{}
+	liquidity    *big.Int
+	sqrtPriceX96 *big.Int
+}
+
+func (f *incrementalFakeCaller) BlockNumber(context.Context) (uint64, error) { return 1, nil }
+
+func (f *incrementalFakeCaller) EthCall(_ context.Context, call map[string]string) (string, error) {
+	address := strings.ToLower(call["to"])
+	if _, fail := f.failRefresh[address]; fail {
+		return "", errors.New("pool refresh failed")
+	}
+	switch call["data"] {
+	case dex.StaticCall("liquidity()"):
+		return testResponse(testWord(f.liquidity)), nil
+	case dex.StaticCall("slot0()"):
+		return testResponse(testWord(f.sqrtPriceX96)), nil
+	case dex.StaticCall("globalState()"):
+		return testResponse(testWord(f.sqrtPriceX96)), nil
+	default:
+		return "", errors.New("unexpected eth_call")
+	}
+}
+
+func (f *incrementalFakeCaller) Call(_ context.Context, method string, _ any, out any) error {
+	if method != "eth_getLogs" {
+		return errors.New("unexpected method")
+	}
+	logs := make([]struct {
+		Address     string   `json:"address"`
+		Data        string   `json:"data"`
+		Topics      []string `json:"topics"`
+		BlockNumber string   `json:"blockNumber"`
+	}, 0, len(f.logDirty))
+	for address := range f.logDirty {
+		logs = append(logs, struct {
+			Address     string   `json:"address"`
+			Data        string   `json:"data"`
+			Topics      []string `json:"topics"`
+			BlockNumber string   `json:"blockNumber"`
+		}{Address: address})
+	}
+	target := out.(*[]struct {
+		Address     string   `json:"address"`
+		Data        string   `json:"data"`
+		Topics      []string `json:"topics"`
+		BlockNumber string   `json:"blockNumber"`
+	})
+	*target = logs
+	return nil
+}
+
+func testWord(v *big.Int) string {
+	if v == nil {
+		v = big.NewInt(0)
+	}
+	return fmt.Sprintf("%064x", v)
+}
+
+func testResponse(words ...string) string {
+	return "0x" + strings.Join(words, "")
+}
+
+func TestIncrementalRefreshIsolatesFailedPoolRefresh(t *testing.T) {
+	p1 := pools.Pool{Address: "0x0000000000000000000000000000000000000001", DEX: pools.UniswapV3, Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20), LastUpdatedBlock: 10}
+	p2 := pools.Pool{Address: "0x0000000000000000000000000000000000000002", DEX: pools.UniswapV3, Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20), LastUpdatedBlock: 10}
+	c := cache.NewPoolCache(nil)
+	c.Put(p1)
+	c.Put(p2)
+	caller := &incrementalFakeCaller{
+		logDirty:     map[string]struct{}{strings.ToLower(p1.Address): {}, strings.ToLower(p2.Address): {}},
+		failRefresh:  map[string]struct{}{strings.ToLower(p2.Address): {}},
+		liquidity:    big.NewInt(10),
+		sqrtPriceX96: big.NewInt(21),
+	}
+	d := pools.NewDiscoverer(caller, "", "", nil)
+	engine := &Engine{discoverer: d, cache: c, discoveryWorkers: 1}
+	dirty, stats, err := engine.incrementalRefresh(context.Background(), 11, 12)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.PoolsAttempted != 2 || stats.PoolsSucceeded != 1 || stats.PoolsFailed != 1 || !stats.MarketStateIncomplete {
+		t.Fatalf("stats=%+v", stats)
+	}
+	if _, ok := stats.UnresolvedDirty[strings.ToLower(p2.Address)]; !ok {
+		t.Fatalf("failed pool not unresolved: %+v", stats.UnresolvedDirty)
+	}
+	if _, ok := dirty[strings.ToLower(p1.Address)]; !ok {
+		t.Fatalf("successful changed pool not dirty: %+v", dirty)
+	}
+}
+
+func TestRoutesWithoutUnresolvedPools(t *testing.T) {
+	p1 := pools.Pool{Address: "0x0000000000000000000000000000000000000001"}
+	p2 := pools.Pool{Address: "0x0000000000000000000000000000000000000002"}
+	all := []routes.Route{
+		{Symbols: []string{"A", "B", "A"}, Hops: []pools.Pool{p1}},
+		{Symbols: []string{"A", "C", "A"}, Hops: []pools.Pool{p2}},
+	}
+	filtered := routesWithoutPools(all, map[string]struct{}{strings.ToLower(p2.Address): {}})
+	if len(filtered) != 1 || filtered[0].Symbols[1] != "B" {
+		t.Fatalf("filtered routes=%+v", filtered)
 	}
 }
 

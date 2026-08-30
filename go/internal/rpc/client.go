@@ -411,18 +411,6 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 	if readErr != nil {
 		return classify(readErr)
 	}
-	if resp.StatusCode == http.StatusTooManyRequests {
-		if quotaLimitMessage(string(data)) {
-			return &Error{Kind: HTTP, Err: errors.New("rpc HTTP status 429: quota exhausted"), HTTPStatus: resp.StatusCode}
-		}
-		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode}
-	}
-	if resp.StatusCode >= 500 {
-		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode}
-	}
-	if resp.StatusCode/100 != 2 {
-		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode}
-	}
 	var envelope struct {
 		Result json.RawMessage `json:"result"`
 		Error  *struct {
@@ -430,8 +418,23 @@ func (c *Client) callProvider(ctx context.Context, provider *providerState, body
 			Message string `json:"message"`
 		} `json:"error"`
 	}
-	if err = json.Unmarshal(data, &envelope); err != nil {
-		return err
+	decodedEnvelope := json.Unmarshal(data, &envelope) == nil
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if quotaLimitMessage(string(data)) {
+			return &Error{Kind: HTTP, Err: errors.New("rpc HTTP status 429: quota exhausted"), HTTPStatus: resp.StatusCode, RPCCode: envelopeCode(decodedEnvelope, envelope.Error), RPCMessage: envelopeMessage(decodedEnvelope, envelope.Error, string(data))}
+		}
+		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode, RPCCode: envelopeCode(decodedEnvelope, envelope.Error), RPCMessage: envelopeMessage(decodedEnvelope, envelope.Error, string(data))}
+	}
+	if resp.StatusCode >= 500 {
+		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode, RPCCode: envelopeCode(decodedEnvelope, envelope.Error), RPCMessage: envelopeMessage(decodedEnvelope, envelope.Error, string(data))}
+	}
+	if resp.StatusCode/100 != 2 {
+		return &Error{Kind: HTTP, Err: fmt.Errorf("rpc HTTP status %d", resp.StatusCode), HTTPStatus: resp.StatusCode, RPCCode: envelopeCode(decodedEnvelope, envelope.Error), RPCMessage: envelopeMessage(decodedEnvelope, envelope.Error, string(data))}
+	}
+	if !decodedEnvelope {
+		if err = json.Unmarshal(data, &envelope); err != nil {
+			return err
+		}
 	}
 	if envelope.Error != nil {
 		if rpcRateLimited(envelope.Error.Code, envelope.Error.Message) {
@@ -465,6 +468,26 @@ func quotaLimitMessage(message string) bool {
 	return strings.Contains(m, "daily request limit") ||
 		strings.Contains(m, "usage limit") ||
 		strings.Contains(m, "quota exhausted")
+}
+
+func envelopeCode(decoded bool, err *struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}) int {
+	if !decoded || err == nil {
+		return 0
+	}
+	return err.Code
+}
+
+func envelopeMessage(decoded bool, err *struct {
+	Code    int    `json:"code"`
+	Message string `json:"message"`
+}, fallback string) string {
+	if decoded && err != nil && strings.TrimSpace(err.Message) != "" {
+		return err.Message
+	}
+	return strings.TrimSpace(fallback)
 }
 
 func (c *Client) chooseProvider() (*providerState, int) {
@@ -823,10 +846,26 @@ func providerFailure(err error) bool {
 	if rpcErr.Kind == RPC {
 		return false
 	}
+	if rpcErr.Kind == HTTP && rpcErr.HTTPStatus == http.StatusBadRequest && planLimitMessage(rpcErr.RPCMessage) {
+		return true
+	}
 	if rpcErr.Kind == HTTP && !strings.Contains(rpcErr.Error(), " 403") && !strings.Contains(rpcErr.Error(), " 429") && !strings.Contains(rpcErr.Error(), " 5") {
 		return false
 	}
 	return true
+}
+
+func planLimitMessage(message string) bool {
+	m := strings.ToLower(message)
+	if strings.Contains(m, "invalid params") || strings.Contains(m, "malformed") || strings.Contains(m, "parse error") {
+		return false
+	}
+	return strings.Contains(m, "block range") ||
+		strings.Contains(m, "too many blocks") ||
+		strings.Contains(m, "range too large") ||
+		strings.Contains(m, "query returned more than") ||
+		strings.Contains(m, "response size") ||
+		strings.Contains(m, "limit exceeded")
 }
 
 func failureReason(err error) string {

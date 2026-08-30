@@ -3,6 +3,7 @@ package pools
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"math/big"
 	"strings"
@@ -88,5 +89,127 @@ func TestRefreshPoolReadsOnlyMutableState(t *testing.T) {
 	}
 	if updated.Liquidity.Cmp(big.NewInt(123)) != 0 || updated.SqrtPriceX96.Cmp(big.NewInt(456)) != 0 || updated.LastUpdatedBlock != 99 {
 		t.Fatalf("unexpected refreshed state: %+v", updated)
+	}
+}
+
+type logFakeCaller struct {
+	fakeCaller
+	errAtChunk       int
+	duplicateAddress string
+	calls            []map[string]any
+}
+
+func (f *logFakeCaller) Call(ctx context.Context, method string, params any, out any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if method != "eth_getLogs" {
+		return fmt.Errorf("unexpected method %s", method)
+	}
+	args := params.([]any)
+	filter := args[0].(map[string]any)
+	copied := make(map[string]any, len(filter))
+	for key, value := range filter {
+		copied[key] = value
+	}
+	f.calls = append(f.calls, copied)
+	if f.errAtChunk > 0 && len(f.calls) == f.errAtChunk {
+		return errors.New("range limit")
+	}
+	address := fmt.Sprintf("0x%040x", len(f.calls))
+	if f.duplicateAddress != "" {
+		address = f.duplicateAddress
+	}
+	logs := []struct {
+		Address     string   `json:"address"`
+		Data        string   `json:"data"`
+		Topics      []string `json:"topics"`
+		BlockNumber string   `json:"blockNumber"`
+	}{
+		{Address: address},
+	}
+	target := out.(*[]struct {
+		Address     string   `json:"address"`
+		Data        string   `json:"data"`
+		Topics      []string `json:"topics"`
+		BlockNumber string   `json:"blockNumber"`
+	})
+	*target = logs
+	return nil
+}
+
+func TestChangedPoolAddressesAtChunksInclusiveRanges(t *testing.T) {
+	tests := []struct {
+		name    string
+		from    uint64
+		to      uint64
+		want    [][2]string
+		chunks  uint64
+		scanned uint64
+	}{
+		{name: "one block", from: 7, to: 7, want: [][2]string{{"0x7", "0x7"}}, chunks: 1, scanned: 1},
+		{name: "exactly five blocks", from: 10, to: 14, want: [][2]string{{"0xa", "0xe"}}, chunks: 1, scanned: 5},
+		{name: "six blocks", from: 10, to: 15, want: [][2]string{{"0xa", "0xe"}, {"0xf", "0xf"}}, chunks: 2, scanned: 6},
+		{name: "twenty one blocks", from: 1, to: 21, want: [][2]string{{"0x1", "0x5"}, {"0x6", "0xa"}, {"0xb", "0xf"}, {"0x10", "0x14"}, {"0x15", "0x15"}}, chunks: 5, scanned: 21},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			caller := &logFakeCaller{}
+			d := NewDiscoverer(caller, "", "", nil)
+			d.getLogsBlockChunkSize = 5
+			changed, stats, err := d.ChangedPoolAddressesAtWithStats(context.Background(), []string{"0x0000000000000000000000000000000000000001"}, tt.from, tt.to)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if stats.ChunksAttempted != tt.chunks || stats.ChunksSucceeded != tt.chunks || stats.BlocksScanned != tt.scanned {
+				t.Fatalf("stats=%+v", stats)
+			}
+			if len(caller.calls) != len(tt.want) || len(changed) != int(tt.chunks) {
+				t.Fatalf("calls=%d changed=%d", len(caller.calls), len(changed))
+			}
+			for i, want := range tt.want {
+				if caller.calls[i]["fromBlock"] != want[0] || caller.calls[i]["toBlock"] != want[1] {
+					t.Fatalf("chunk %d=%+v want=%+v", i, caller.calls[i], want)
+				}
+			}
+		})
+	}
+}
+
+func TestChangedPoolAddressesAtDeduplicatesAcrossChunks(t *testing.T) {
+	caller := &logFakeCaller{duplicateAddress: "0x00000000000000000000000000000000000000aa"}
+	d := NewDiscoverer(caller, "", "", nil)
+	d.getLogsBlockChunkSize = 1
+	changed, stats, err := d.ChangedPoolAddressesAtWithStats(context.Background(), []string{"0x0000000000000000000000000000000000000001"}, 1, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stats.ChunksSucceeded != 2 || len(changed) != 1 {
+		t.Fatalf("stats=%+v changed=%+v", stats, changed)
+	}
+}
+
+func TestChangedPoolAddressesAtStopsOnMiddleChunkFailure(t *testing.T) {
+	caller := &logFakeCaller{errAtChunk: 2}
+	d := NewDiscoverer(caller, "", "", nil)
+	d.getLogsBlockChunkSize = 5
+	_, stats, err := d.ChangedPoolAddressesAtWithStats(context.Background(), []string{"0x0000000000000000000000000000000000000001"}, 1, 11)
+	if err == nil {
+		t.Fatal("expected middle chunk failure")
+	}
+	if stats.ChunksAttempted != 2 || stats.ChunksSucceeded != 1 || stats.ChunksFailed != 1 || len(caller.calls) != 2 {
+		t.Fatalf("stats=%+v calls=%d", stats, len(caller.calls))
+	}
+}
+
+func TestChangedPoolAddressesAtHonorsContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	caller := &logFakeCaller{}
+	d := NewDiscoverer(caller, "", "", nil)
+	d.getLogsBlockChunkSize = 5
+	_, stats, err := d.ChangedPoolAddressesAtWithStats(ctx, []string{"0x0000000000000000000000000000000000000001"}, 1, 5)
+	if !errors.Is(err, context.Canceled) || stats.ChunksAttempted != 0 || len(caller.calls) != 0 {
+		t.Fatalf("err=%v stats=%+v calls=%d", err, stats, len(caller.calls))
 	}
 }
