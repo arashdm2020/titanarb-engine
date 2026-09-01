@@ -333,7 +333,7 @@ func TestIncrementalRefreshIsolatesFailedPoolRefresh(t *testing.T) {
 	}
 	d := pools.NewDiscoverer(caller, "", "", nil)
 	engine := &Engine{discoverer: d, cache: c, discoveryWorkers: 1}
-	dirty, stats, err := engine.incrementalRefresh(context.Background(), 11, 12)
+	dirty, stats, err := engine.incrementalRefresh(context.Background(), 11, 12, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

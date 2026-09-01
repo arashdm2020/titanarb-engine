@@ -253,6 +253,10 @@ func (d *Discoverer) getLogsChunkSize() uint64 {
 	return d.getLogsBlockChunkSize
 }
 
+func (d *Discoverer) GetLogsChunkSize() uint64 {
+	return d.getLogsChunkSize()
+}
+
 // ChangedPoolAddressesAt obtains the dirty pool set for an inclusive block
 // range with bounded eth_getLogs requests. Any event from a supported pool marks
 // the pool dirty; this conservatively includes swaps and in/out-of-range

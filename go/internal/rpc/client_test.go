@@ -67,6 +67,46 @@ func TestFailureEventCarriesSafeRequestMetadataFields(t *testing.T) {
 		t.Fatalf("failure fields not propagated: %#v", event.Fields)
 	}
 }
+
+func TestTimingObserverSeparatesLimiterWaitAndTransport(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(5 * time.Millisecond)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"jsonrpc":"2.0","id":1,"result":"0x1"}`))
+	}))
+	defer server.Close()
+	client := NewManagedWithReadBudget([]ProviderConfig{{Name: "p1", HTTP: server.URL, TargetRPS: 1}}, 1, 2*time.Second, 0, nil)
+	observer := &testTimingObserver{}
+	ctx := WithTimingObserver(context.Background(), observer)
+	var out string
+	if err := client.Call(ctx, "eth_blockNumber", []any{}, &out); err != nil {
+		t.Fatal(err)
+	}
+	if observer.transport <= 0 || observer.completed != 1 {
+		t.Fatalf("transport timing not observed: %+v", observer)
+	}
+	if observer.wait < 0 {
+		t.Fatalf("invalid wait timing: %+v", observer)
+	}
+}
+
+type testTimingObserver struct {
+	wait      time.Duration
+	transport time.Duration
+	completed int
+}
+
+func (o *testTimingObserver) ObserveRPCWait(wait time.Duration) {
+	o.wait += wait
+}
+
+func (o *testTimingObserver) ObserveRPCTransport(elapsed time.Duration, completed bool) {
+	o.transport += elapsed
+	if completed {
+		o.completed++
+	}
+}
+
 func TestRetryBehavior(t *testing.T) {
 	var calls atomic.Int32
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

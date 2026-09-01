@@ -75,6 +75,11 @@ type RequestMetadata struct {
 	Fields map[string]string
 }
 
+type TimingObserver interface {
+	ObserveRPCWait(time.Duration)
+	ObserveRPCTransport(time.Duration, bool)
+}
+
 type FailureEvent struct {
 	Provider, Endpoint, Tier, Method, Stage string
 	Fields                                  map[string]string
@@ -112,6 +117,22 @@ func WithRequestMetadataFields(ctx context.Context, fields map[string]string) co
 		}
 	}
 	return context.WithValue(ctx, requestMetadataKey{}, metadata)
+}
+
+type timingObserverKey struct{}
+
+func WithTimingObserver(ctx context.Context, observer TimingObserver) context.Context {
+	if observer == nil {
+		return ctx
+	}
+	return context.WithValue(ctx, timingObserverKey{}, observer)
+}
+
+func timingObserver(ctx context.Context) TimingObserver {
+	if value, ok := ctx.Value(timingObserverKey{}).(TimingObserver); ok {
+		return value
+	}
+	return nil
 }
 
 func requestMetadata(ctx context.Context, class RequestClass) RequestMetadata {
@@ -308,8 +329,12 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 			return &Error{Kind: Network, Err: errors.New("RPC eth_call minute budget exhausted")}
 		}
 		if class != Critical && c.readLimiter != nil {
+			waitStarted := time.Now()
 			if err := c.readLimiter.Wait(ctx); err != nil {
 				return err
+			}
+			if observer := timingObserver(ctx); observer != nil {
+				observer.ObserveRPCWait(time.Since(waitStarted))
 			}
 		}
 		provider, providerIndex, providerDelay := c.chooseReadProvider(class)
@@ -317,17 +342,28 @@ func (c *Client) Call(ctx context.Context, method string, params any, out any) e
 			return &Error{Kind: Network, Err: errors.New("no eligible RPC provider configured")}
 		}
 		if provider.cfg.Tier == "premium" && class != Critical && c.premiumLimiter != nil {
+			waitStarted := time.Now()
 			if err := c.premiumLimiter.Wait(ctx); err != nil {
 				return err
 			}
+			if observer := timingObserver(ctx); observer != nil {
+				observer.ObserveRPCWait(time.Since(waitStarted))
+			}
 		}
+		providerWaitStarted := time.Now()
 		if err := waitDelay(ctx, providerDelay); err != nil {
 			return err
+		}
+		if observer := timingObserver(ctx); observer != nil {
+			observer.ObserveRPCWait(time.Since(providerWaitStarted))
 		}
 		metadata := requestMetadata(ctx, class)
 		c.recordRequest(provider, method, class, metadata.Stage)
 		started := time.Now()
 		err := c.callProvider(ctx, provider, body, out)
+		if observer := timingObserver(ctx); observer != nil {
+			observer.ObserveRPCTransport(time.Since(started), err == nil)
+		}
 		if err == nil {
 			c.recordSuccess(provider, method, out)
 			return nil

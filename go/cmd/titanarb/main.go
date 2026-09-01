@@ -206,7 +206,10 @@ func main() {
 			report, cycleErr := marketEngine.CycleAtWithSearchOptions(cycleCtx, trigger.Block, settings.RouteSearchDepth, routeBudget(settings), settings.VolatilityWeight, searchOptions)
 			if cycleErr != nil {
 				if errors.Is(cycleErr, context.Canceled) || cycleCtx.Err() == context.Canceled {
-					publish(operationSink, observability.Performance, "market_cycle_superseded", telegram.Info, "stale market work cancelled", map[string]any{"source_block": trigger.Block, "latest_block": marketScheduler.LatestBlock(), "max_work_lag_blocks": maxWorkLag})
+					latestBlock := marketScheduler.LatestBlock()
+					fields := map[string]any{"source_block": trigger.Block, "latest_block": latestBlock, "max_work_lag_blocks": maxWorkLag}
+					addDetectorStageFields(fields, report.DetectorStage, latestBlock)
+					publish(operationSink, observability.Performance, "market_cycle_superseded", telegram.Info, "stale market work cancelled", fields)
 					return
 				}
 				log.Event(logger.Warn, "health_check_failed", "market", "market cycle failed", map[string]any{"block": trigger.Block, "error_type": fmt.Sprintf("%T", cycleErr)})
@@ -1006,6 +1009,56 @@ func envIntBounded(name string, fallback, min, max int) int {
 
 func blockBeyondTolerance(source, latest, tolerance uint64) bool {
 	return latest > source && latest-source > tolerance
+}
+
+func addDetectorStageFields(fields map[string]any, stage market.DetectorStageTelemetry, latestBlock uint64) {
+	if fields == nil || stage.CurrentStage == "" {
+		return
+	}
+	lag := uint64(0)
+	if latestBlock > stage.SourceBlock {
+		lag = latestBlock - stage.SourceBlock
+	}
+	fields["lag_blocks"] = lag
+	fields["cycle_elapsed_ms"] = stage.CycleElapsed.Milliseconds()
+	fields["active_stage"] = stage.CurrentStage
+	fields["active_stage_elapsed_ms"] = stage.ActiveStageElapsed.Milliseconds()
+	fields["last_completed_stage"] = stage.LastCompletedStage
+	fields["last_completed_stage_duration_ms"] = stage.LastCompletedStageDuration.Milliseconds()
+	fields["last_state_block_before_cycle"] = stage.LastStateBlockBeforeCycle
+	fields["last_state_block_at_cancel"] = stage.LastStateBlockAtCancel
+	fields["latest_block_at_stage_start"] = stage.LatestBlockAtStageStart
+	fields["reconciliation_pending"] = stage.ReconciliationPending
+	fields["reconciliation_units_done"] = stage.ReconciliationUnitsDone
+	fields["reconciliation_units_total"] = stage.ReconciliationUnitsTotal
+	fields["getlogs_from_block"] = stage.GetLogsFromBlock
+	fields["getlogs_to_block"] = stage.GetLogsToBlock
+	fields["getlogs_blocks_to_scan"] = stage.GetLogsBlocksToScan
+	fields["getlogs_chunks_planned"] = stage.GetLogsChunksPlanned
+	fields["getlogs_chunks_attempted"] = stage.GetLogsChunksAttempted
+	fields["getlogs_chunks_succeeded"] = stage.GetLogsChunksSucceeded
+	fields["getlogs_chunks_failed"] = stage.GetLogsChunksFailed
+	fields["getlogs_blocks_scanned"] = stage.GetLogsBlocksScanned
+	fields["getlogs_duration_ms"] = stage.GetLogsDuration.Milliseconds()
+	fields["pool_refresh_requested"] = stage.PoolRefreshRequested
+	fields["pool_refresh_attempted"] = stage.PoolRefreshAttempted
+	fields["pool_refresh_succeeded"] = stage.PoolRefreshSucceeded
+	fields["pool_refresh_failed"] = stage.PoolRefreshFailed
+	fields["pool_refresh_duration_ms"] = stage.PoolRefreshDuration.Milliseconds()
+	fields["max_single_pool_refresh_ms"] = stage.MaxSinglePoolRefresh.Milliseconds()
+	fields["dirty_pools_found"] = stage.DirtyPoolsFound
+	fields["affected_routes_found"] = stage.AffectedRoutesFound
+	fields["routes_selected"] = stage.RoutesSelected
+	fields["routes_evaluation_started"] = stage.RoutesEvaluationStarted
+	fields["routes_evaluated"] = stage.RoutesEvaluated
+	fields["quote_attempts"] = stage.QuoteAttempts
+	fields["quote_successes"] = stage.QuoteSuccesses
+	fields["quote_failures"] = stage.QuoteFailures
+	fields["rpc_calls_started"] = stage.RPCCallsStarted
+	fields["rpc_calls_completed"] = stage.RPCCallsCompleted
+	fields["rpc_limiter_wait_ms"] = stage.RPCLimiterWait.Milliseconds()
+	fields["rpc_transport_ms"] = stage.RPCTransport.Milliseconds()
+	fields["rate_limiter_wait_ms"] = stage.RateLimiterWait.Milliseconds()
 }
 
 func cancelWhenSuperseded(parent context.Context, latest func() uint64, source, tolerance uint64) (context.Context, context.CancelFunc) {

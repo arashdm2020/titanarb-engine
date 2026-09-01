@@ -182,6 +182,7 @@ type CycleReport struct {
 	UnresolvedDirtyPools     uint64
 	RoutesSkippedUnresolved  uint64
 	MarketStateIncomplete    bool
+	DetectorStage            DetectorStageTelemetry
 }
 
 const incrementalRefreshBatchBlocks = 8
@@ -485,11 +486,20 @@ func (e *Engine) RequiresFullReconcile(maxHops, maxRoutes int, options SearchOpt
 
 // CycleAtWithSearchOptions lets runtime risk profiles widen or narrow the
 // read-only market search envelope without touching execution safety gates.
-func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int, volatilityWeight float64, options SearchOptions) (CycleReport, error) {
+func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int, volatilityWeight float64, options SearchOptions) (report CycleReport, err error) {
+	tracker := newDetectorStageTracker(stateBlock, e.lastStateBlock, nil)
+	defer func() {
+		tracker.SetLastStateBlock(e.lastStateBlock)
+		tracker.SetReconciliation(e.reconciliation != nil, reconciliationUnitsDone(e.reconciliation), reconciliationUnitsTotal(e.reconciliation))
+		report.DetectorStage = tracker.Snapshot()
+	}()
+	ctx = rpc.WithTimingObserver(ctx, tracker)
+	tracker.Stage(stageApplyPendingMarket)
 	marketChanged := e.applyPendingMarket()
+	tracker.Stage(stageReconcileCheck)
 	options = options.Normalized()
 	started := time.Now()
-	report := CycleReport{StateBlock: stateBlock}
+	report = CycleReport{StateBlock: stateBlock}
 	report.RouteCountBefore = len(e.routeCache)
 	report.RouteCacheReady = len(e.routeCache) > 0
 	report.RouteCacheSize = len(e.routeCache)
@@ -514,6 +524,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		e.startReconciliation(maxHops, maxRoutes)
 	}
 	if !hadRoutes {
+		tracker.Stage(stageStartupReconciliation)
 		e.advanceReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
 		report.Duration = time.Since(started)
 		report.Routes = append([]routes.Route(nil), e.routeCache...)
@@ -530,6 +541,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		}
 		return report, nil
 	}
+	tracker.Stage(stageIncrementalRefreshGate)
 	if shouldDeferIncrementalRefresh(e.lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
 		routesFound := refreshRoutes(e.routeCache, liquidPools(e.cache.Snapshot()))
 		report.RoutesReused = uint64(len(routesFound))
@@ -548,7 +560,6 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	}
 	var dirty map[string]struct{}
 	var refresh refreshStats
-	var err error
 	rpcAtStart := e.rpcCalls()
 	forceAllEvaluation := e.forceEvaluateNext
 	e.forceEvaluateNext = false
@@ -556,8 +567,12 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	if e.lastStateBlock > 0 && e.lastStateBlock < stateBlock {
 		fromBlock = e.lastStateBlock + 1
 	}
+	tracker.Stage(stageGetLogsDirtyDetection)
+	tracker.StartGetLogs(fromBlock, stateBlock, e.discoverer.GetLogsChunkSize())
 	refreshCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "pool_refresh", stateBlock)
-	dirty, refresh, err = e.incrementalRefresh(refreshCtx, fromBlock, stateBlock)
+	dirty, refresh, err = e.incrementalRefresh(refreshCtx, fromBlock, stateBlock, tracker)
+	tracker.FinishGetLogs(refresh)
+	tracker.FinishPoolRefresh(refresh)
 	report.GetLogsChunksAttempted = refresh.Logs.ChunksAttempted
 	report.GetLogsChunksSucceeded = refresh.Logs.ChunksSucceeded
 	report.GetLogsChunksFailed = refresh.Logs.ChunksFailed
@@ -570,6 +585,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	if err != nil {
 		return report, err
 	}
+	tracker.SetDirtyPools(uint64(len(dirty)))
 	if shouldAdvanceFullReconcileCounter(dirty) {
 		e.cyclesSinceFull++
 	}
@@ -581,6 +597,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		signals = e.volatility.Observe(active)
 	}
 	routesFound := refreshRoutes(e.routeCache, active)
+	tracker.Stage(stageDirtyRouteMapping)
 	sort.SliceStable(routesFound, func(i, j int) bool {
 		left := routeVolatility(routesFound[i], signals, volatilityWeight)
 		right := routeVolatility(routesFound[j], signals, volatilityWeight)
@@ -596,6 +613,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		report.RoutesSkippedUnresolved = uint64(before - len(affected))
 	}
 	e.reviveDirtyRouteMemory(affected, stateBlock)
+	tracker.SetAffectedRoutes(uint64(len(affected)))
 	report.RoutesRecomputed = uint64(len(affected))
 	if len(routesFound) > len(affected) {
 		report.RoutesReused = uint64(len(routesFound) - len(affected))
@@ -604,12 +622,13 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	e.activePools = uint64(len(active))
 	e.cycles = uint64(len(routesFound))
 	e.statsMu.Unlock()
+	tracker.Stage(stagePreQuote)
 	quoteStarted := time.Now()
 	if e.evaluator != nil {
 		e.evaluator.PrepareQuoteCache(stateBlock, dirty, options.PersistentQuoteCache)
 		e.evaluator.SetQuoteBudget(options.MaxQuotesPerCycle)
 	}
-	evaluation := e.evaluate(ctx, affected, options, signals, volatilityWeight, stateBlock)
+	evaluation := e.evaluate(ctx, affected, options, signals, volatilityWeight, stateBlock, tracker)
 	if err := ctx.Err(); err != nil {
 		return report, err
 	}
@@ -670,6 +689,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	// Dirty/live market work owns the cycle. Background reconciliation advances
 	// only on an otherwise idle head so it cannot add latency to fresh quotes.
 	if len(dirty) == 0 {
+		tracker.Stage(stageBackgroundReconciliation)
 		e.advanceBackgroundReconciliationBatch(ctx, stateBlock, options.ReconcileBatchPairs, &report)
 	}
 	report.RPCCallsByStage["reconcile"] = report.ReconcileRPC
@@ -680,10 +700,26 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.RouteCacheSize = len(e.routeCache)
 	report.RoutesByHop = routesByHop(routesFound)
 	report.DEXRoutes = routeDEXDiversity(routesFound)
+	tracker.Stage(stageCycleCommit)
 	if stateBlock > 0 && !refresh.MarketStateIncomplete {
 		e.lastStateBlock = stateBlock
 	}
+	tracker.Stage(stageCycleComplete)
 	return report, nil
+}
+
+func reconciliationUnitsDone(state *reconcileState) int {
+	if state == nil {
+		return 0
+	}
+	return state.next
+}
+
+func reconciliationUnitsTotal(state *reconcileState) int {
+	if state == nil {
+		return 0
+	}
+	return len(state.jobs)
 }
 
 func shouldAdvanceFullReconcileCounter(dirty map[string]struct{}) bool {
@@ -999,7 +1035,7 @@ func canonicalAddressPair(a, b string) string {
 	return a + ":" + b
 }
 
-func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock uint64) (map[string]struct{}, refreshStats, error) {
+func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock uint64, tracker *detectorStageTracker) (map[string]struct{}, refreshStats, error) {
 	stats := refreshStats{UnresolvedDirty: make(map[string]struct{})}
 	current := e.cache.Snapshot()
 	if len(current) == 0 {
@@ -1011,6 +1047,7 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 	}
 	dirty, logStats, logErr := e.discoverer.ChangedPoolAddressesAtWithStats(ctx, addresses, fromBlock, stateBlock)
 	stats.Logs = logStats
+	tracker.FinishGetLogs(stats)
 	refresh := current
 	if logErr == nil {
 		refresh = poolsByAddress(current, dirty)
@@ -1030,9 +1067,12 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 	if len(refresh) == 0 {
 		return dirty, stats, nil
 	}
+	tracker.Stage(stagePoolRefresh)
+	tracker.StartPoolRefresh(uint64(len(refresh)))
 	type result struct {
 		before, after pools.Pool
 		err           error
+		duration      time.Duration
 	}
 	jobs := make(chan pools.Pool)
 	results := make(chan result, len(refresh))
@@ -1042,8 +1082,9 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 		go func() {
 			defer wg.Done()
 			for pool := range jobs {
+				started := time.Now()
 				updated, err := e.discoverer.RefreshPoolAt(ctx, pool, stateBlock)
-				results <- result{before: pool, after: updated, err: err}
+				results <- result{before: pool, after: updated, err: err, duration: time.Since(started)}
 			}
 		}()
 	}
@@ -1061,6 +1102,7 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 	for result := range results {
 		stats.PoolsAttempted++
 		if result.err != nil {
+			tracker.PoolRefreshResult(false, result.duration)
 			if ctx.Err() != nil {
 				return nil, stats, ctx.Err()
 			}
@@ -1074,6 +1116,7 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 			}
 			continue
 		}
+		tracker.PoolRefreshResult(true, result.duration)
 		stats.PoolsSucceeded++
 		address := strings.ToLower(result.after.Address)
 		changed := poolChanged(result.before, result.after)
@@ -1190,7 +1233,7 @@ type evaluationReport struct {
 	ScoreDeciles            map[string]map[string]any
 }
 
-func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, options SearchOptions, signals map[string]volatility.Signal, volatilityWeight float64, stateBlock uint64) evaluationReport {
+func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, options SearchOptions, signals map[string]volatility.Signal, volatilityWeight float64, stateBlock uint64, tracker *detectorStageTracker) evaluationReport {
 	report := evaluationReport{}
 	byAsset := make(map[string][]routes.Route)
 	for _, route := range candidates {
@@ -1228,8 +1271,10 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		if assetsRemaining > 0 {
 			assetQuoteBudget = (remainingQuotes + assetsRemaining - 1) / assetsRemaining
 		}
+		tracker.Stage(stageRouteSelection)
 		evaluationCandidates, selection := e.selectEvaluationCandidates(assetCandidates, assetOptions, signals, volatilityWeight, stateBlock)
 		evaluationCandidates, usedQuotes := boundRoutesByQuoteCost(evaluationCandidates, assetQuoteBudget)
+		tracker.AddRoutesSelected(len(evaluationCandidates))
 		selection = summarizeBoundedSelection(evaluationCandidates, selection)
 		if usedQuotes > remainingQuotes {
 			usedQuotes = remainingQuotes
@@ -1246,7 +1291,7 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		report.SameDEXQuoted += uint64(selection.SameDEX)
 		report.AvgPreQuoteScore = combineAverages(report.AvgPreQuoteScore, report.RoutesEvaluated, selection.AvgScore, uint64(len(evaluationCandidates)))
 		report.RoutesEvaluated += uint64(len(evaluationCandidates))
-		evaluated := e.evaluateCurrent(ctx, evaluationCandidates, amount, stateBlock, selection.Scores)
+		evaluated := e.evaluateCurrent(ctx, evaluationCandidates, amount, stateBlock, selection.Scores, tracker)
 		allEvaluated = append(allEvaluated, evaluated...)
 		e.updateRouteFailures(evaluated)
 		e.updateRouteMemory(evaluated, stateBlock)
@@ -1267,6 +1312,7 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 		if left := options.MaxOptimizedRoutes - alreadyPending; optimizerLimit > left {
 			optimizerLimit = left
 		}
+		tracker.Stage(stageOptimizerSelection)
 		optimizerCandidates := selectOptimizerCandidates(append([]evaluatedRoute(nil), evaluated...), optimizerLimit)
 		if len(optimizerCandidates) > 0 {
 			pending = append(pending, pendingOptimization{asset: asset, amount: amount, candidates: optimizerCandidates})
@@ -1298,6 +1344,7 @@ func (e *Engine) evaluate(ctx context.Context, candidates []routes.Route, option
 			}
 		}
 		optimizerStarted := time.Now()
+		tracker.Stage(stageOptimizer)
 		optimized := e.optimizeRoutes(ctx, item.asset, item.candidates, item.amount, options.OptimizerSamplesPerRoute, options.NormalOptimizerSamples, assetBudget, options.AdaptiveOptimizer, options.EarlyStop)
 		report.OptimizerDuration += time.Since(optimizerStarted)
 		report.OptimizerRuns += optimized.OptimizerRuns
@@ -1388,7 +1435,7 @@ type evaluatedRoute struct {
 	quoteAgeBlocks  uint64
 }
 
-func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route, amount *big.Int, stateBlock uint64, preQuoteScores map[string]int64) []evaluatedRoute {
+func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route, amount *big.Int, stateBlock uint64, preQuoteScores map[string]int64, tracker *detectorStageTracker) []evaluatedRoute {
 	if len(candidates) == 0 {
 		return nil
 	}
@@ -1402,17 +1449,22 @@ func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route,
 			defer wg.Done()
 			for route := range jobs {
 				started := time.Now()
+				tracker.Stage(stageQuote)
+				tracker.RouteEvaluationStarted()
 				quoteCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "quote", stateBlock)
 				op, err := e.evaluator.Evaluate(quoteCtx, route, amount)
 				if err != nil || op == nil || op.ExpectedProfit == nil {
+					tracker.RouteEvaluationFinished(false)
 					results <- evaluatedRoute{route: route, preQuoteScore: preQuoteScores[routeKey(route)]}
 					continue
 				}
+				tracker.Stage(stageEconomicEvaluation)
 				reason := ""
 				if op.MinProfit != nil && op.ExpectedProfit.Cmp(op.MinProfit) <= 0 {
 					reason = "profitability threshold not met"
 				}
 				record := nearmiss.FromOpportunity(op, reason, time.Since(started), failures[routeKey(route)])
+				tracker.RouteEvaluationFinished(true)
 				results <- evaluatedRoute{route: route, score: new(big.Int).Set(op.ExpectedProfit), nearMiss: &record, routeScore: record.Score, preQuoteScore: preQuoteScores[routeKey(route)], quoteSuccessful: true, quoteAgeBlocks: quoteAgeBlocks(stateBlock, forcedRouteSourceBlock(route))}
 			}
 		}()
