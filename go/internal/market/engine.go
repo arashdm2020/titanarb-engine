@@ -63,6 +63,12 @@ type Engine struct {
 	recentNearMisses   []nearmiss.Record
 	reconciliation     *reconcileState
 	forceEvaluateNext  bool
+	syncOnce           sync.Once
+	syncMu             sync.Mutex
+	dirtyScanBlock     uint64
+	pendingDirty       map[string]struct{}
+	syncRunning        bool
+	syncLast           marketSyncSnapshot
 }
 
 type reconcileJob struct {
@@ -89,8 +95,30 @@ type refreshStats struct {
 	PoolsSucceeded        uint64
 	PoolsFailed           uint64
 	UnresolvedDirty       map[string]struct{}
+	ResolvedDirty         map[string]struct{}
 	MarketStateIncomplete bool
 	LastFailure           string
+}
+
+type marketSyncSnapshot struct {
+	LatestHead             uint64
+	ScanWatermark          uint64
+	StateWatermark         uint64
+	LagBlocks              uint64
+	ChunksAttempted        uint64
+	ChunksSucceeded        uint64
+	ChunksFailed           uint64
+	BlocksScanned          uint64
+	ProgressBlocks         uint64
+	DirtyPoolsFound        uint64
+	IterationDuration      time.Duration
+	LimiterWait            time.Duration
+	Transport              time.Duration
+	CheckpointAdvances     uint64
+	CheckpointBlock        uint64
+	PendingDirtyPools      uint64
+	MarketStateComplete    bool
+	MarketStateSyncLagging bool
 }
 
 type Snapshot struct {
@@ -183,6 +211,27 @@ type CycleReport struct {
 	RoutesSkippedUnresolved  uint64
 	MarketStateIncomplete    bool
 	DetectorStage            DetectorStageTelemetry
+	SyncLatestHead           uint64
+	SyncScanWatermark        uint64
+	SyncStateWatermark       uint64
+	SyncLagBlocks            uint64
+	SyncChunksAttempted      uint64
+	SyncChunksSucceeded      uint64
+	SyncChunksFailed         uint64
+	SyncBlocksScanned        uint64
+	SyncProgressBlocks       uint64
+	SyncDirtyPoolsFound      uint64
+	SyncIterationDuration    time.Duration
+	SyncLimiterWait          time.Duration
+	SyncTransport            time.Duration
+	SyncCheckpointAdvances   uint64
+	SyncCheckpointBlock      uint64
+	SyncPendingDirtyPools    uint64
+	DecisionStateBlock       uint64
+	DecisionLatestHead       uint64
+	DecisionStateLagBlocks   uint64
+	MarketStateComplete      bool
+	MarketStateSyncLagging   bool
 }
 
 const incrementalRefreshBatchBlocks = 8
@@ -191,40 +240,42 @@ const maxEvaluationRoutesPerAsset = 12
 const optimizerSamplesPerRoute = 8
 
 type SearchOptions struct {
-	EvaluationRoutesPerAsset int
-	OptimizerRoutesPerAsset  int
-	OptimizerSamplesPerRoute int
-	OptimizerSamplesPerCycle int
-	MaxQuotesPerCycle        int
-	MaxOptimizedRoutes       int
-	NormalOptimizerSamples   int
-	FullReconcileEvery       uint64
-	ReconcileBatchPairs      int
-	DisablePreQuoteRanking   bool
-	ExploreRatioBPS          int
-	PersistentQuoteCache     bool
-	AdaptiveOptimizer        bool
-	EarlyStop                bool
-	OptimizationFlagsSet     bool
+	EvaluationRoutesPerAsset  int
+	OptimizerRoutesPerAsset   int
+	OptimizerSamplesPerRoute  int
+	OptimizerSamplesPerCycle  int
+	MaxQuotesPerCycle         int
+	MaxOptimizedRoutes        int
+	NormalOptimizerSamples    int
+	FullReconcileEvery        uint64
+	ReconcileBatchPairs       int
+	SyncMaxChunksPerIteration int
+	DisablePreQuoteRanking    bool
+	ExploreRatioBPS           int
+	PersistentQuoteCache      bool
+	AdaptiveOptimizer         bool
+	EarlyStop                 bool
+	OptimizationFlagsSet      bool
 }
 
 func DefaultSearchOptions() SearchOptions {
 	return SearchOptions{
-		EvaluationRoutesPerAsset: maxEvaluationRoutesPerAsset,
-		OptimizerRoutesPerAsset:  maxOptimizerRoutesPerAsset,
-		OptimizerSamplesPerRoute: optimizerSamplesPerRoute,
-		OptimizerSamplesPerCycle: 32,
-		MaxQuotesPerCycle:        40,
-		MaxOptimizedRoutes:       8,
-		NormalOptimizerSamples:   3,
-		FullReconcileEvery:       2_400,
-		ReconcileBatchPairs:      4,
-		DisablePreQuoteRanking:   false,
-		ExploreRatioBPS:          2_000,
-		PersistentQuoteCache:     true,
-		AdaptiveOptimizer:        true,
-		EarlyStop:                true,
-		OptimizationFlagsSet:     true,
+		EvaluationRoutesPerAsset:  maxEvaluationRoutesPerAsset,
+		OptimizerRoutesPerAsset:   maxOptimizerRoutesPerAsset,
+		OptimizerSamplesPerRoute:  optimizerSamplesPerRoute,
+		OptimizerSamplesPerCycle:  32,
+		MaxQuotesPerCycle:         40,
+		MaxOptimizedRoutes:        8,
+		NormalOptimizerSamples:    3,
+		FullReconcileEvery:        2_400,
+		ReconcileBatchPairs:       4,
+		SyncMaxChunksPerIteration: 20,
+		DisablePreQuoteRanking:    false,
+		ExploreRatioBPS:           2_000,
+		PersistentQuoteCache:      true,
+		AdaptiveOptimizer:         true,
+		EarlyStop:                 true,
+		OptimizationFlagsSet:      true,
 	}
 }
 
@@ -272,6 +323,12 @@ func (o SearchOptions) Normalized() SearchOptions {
 	if o.ReconcileBatchPairs > 8 {
 		o.ReconcileBatchPairs = 8
 	}
+	if o.SyncMaxChunksPerIteration < 1 {
+		o.SyncMaxChunksPerIteration = defaults.SyncMaxChunksPerIteration
+	}
+	if o.SyncMaxChunksPerIteration > 200 {
+		o.SyncMaxChunksPerIteration = 200
+	}
 	if o.ExploreRatioBPS < 0 {
 		o.ExploreRatioBPS = 0
 	}
@@ -308,7 +365,221 @@ func NewWithAmounts(market config.MarketConfig, discoverer *pools.Discoverer, ca
 	if evaluator != nil {
 		events = evaluator.Events
 	}
-	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.MarketAssets(), routeFailures: make(map[string]uint64), routeMemory: nearmiss.NewRouteMemory(8192), executionAssets: append([]string(nil), market.ExecutionAssetNames...)}
+	return &Engine{market: market, discoverer: discoverer, cache: cache, evaluator: evaluator, Events: events, amounts: validAmounts, discoveryWorkers: workers, metrics: metrics, volatility: volatility.NewTracker(), optimizer: optimizer.Optimizer{Workers: workers}, liquidity: liquidity, universeAssets: market.MarketAssets(), routeFailures: make(map[string]uint64), routeMemory: nearmiss.NewRouteMemory(8192), executionAssets: append([]string(nil), market.ExecutionAssetNames...), pendingDirty: make(map[string]struct{})}
+}
+
+// StartMarketStateSynchronizer starts the single background dirty-log scanner.
+// It checkpointes contiguous successful getLogs chunks separately from the
+// latency-critical decision cycle. The decision cycle consumes the committed
+// pending dirty set instead of rescanning long historical ranges.
+func (e *Engine) StartMarketStateSynchronizer(ctx context.Context, latestBlock func() uint64, options func() SearchOptions) {
+	if latestBlock == nil {
+		return
+	}
+	e.syncOnce.Do(func() {
+		e.syncMu.Lock()
+		e.syncRunning = true
+		if e.pendingDirty == nil {
+			e.pendingDirty = make(map[string]struct{})
+		}
+		e.syncMu.Unlock()
+		go e.marketStateSyncLoop(ctx, latestBlock, options)
+	})
+}
+
+func (e *Engine) marketStateSyncLoop(ctx context.Context, latestBlock func() uint64, options func() SearchOptions) {
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			latest := latestBlock()
+			if latest == 0 || len(e.cache.Snapshot()) == 0 {
+				continue
+			}
+			opts := DefaultSearchOptions()
+			if options != nil {
+				opts = options().Normalized()
+			}
+			e.advanceMarketStateSync(ctx, latest, opts)
+		}
+	}
+}
+
+func (e *Engine) advanceMarketStateSync(ctx context.Context, latest uint64, options SearchOptions) marketSyncSnapshot {
+	started := time.Now()
+	chunkSize := e.discoverer.GetLogsChunkSize()
+	if chunkSize == 0 {
+		chunkSize = 5
+	}
+	maxChunks := uint64(options.Normalized().SyncMaxChunksPerIteration)
+	current := e.cache.Snapshot()
+	lastStateBlock := e.getLastStateBlock()
+	snapshot := marketSyncSnapshot{LatestHead: latest, StateWatermark: lastStateBlock, MarketStateComplete: true}
+	if len(current) == 0 {
+		e.storeMarketSyncSnapshot(snapshot)
+		return snapshot
+	}
+	addresses := make([]string, 0, len(current))
+	for _, pool := range current {
+		addresses = append(addresses, pool.Address)
+	}
+	snapshot.StateWatermark = lastStateBlock
+	e.syncMu.Lock()
+	if e.pendingDirty == nil {
+		e.pendingDirty = make(map[string]struct{})
+	}
+	if e.dirtyScanBlock == 0 {
+		if lastStateBlock > 0 {
+			e.dirtyScanBlock = lastStateBlock
+		} else {
+			e.dirtyScanBlock = latest
+		}
+	}
+	from := e.dirtyScanBlock + 1
+	pending := uint64(len(e.pendingDirty))
+	e.syncMu.Unlock()
+	if from == 0 || from > latest {
+		snapshot.ScanWatermark = e.currentDirtyScanBlock()
+		snapshot.StateWatermark = e.getLastStateBlock()
+		snapshot.PendingDirtyPools = pending
+		snapshot.MarketStateComplete = snapshot.ScanWatermark >= latest
+		if latest > snapshot.ScanWatermark {
+			snapshot.LagBlocks = latest - snapshot.ScanWatermark
+			snapshot.MarketStateSyncLagging = true
+		}
+		e.storeMarketSyncSnapshot(snapshot)
+		return snapshot
+	}
+	maxBlocks := maxChunks * chunkSize
+	to := latest
+	if maxBlocks > 0 && to-from+1 > maxBlocks {
+		to = from + maxBlocks - 1
+	}
+	syncCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.Background), "market_state_sync", latest)
+	iterCtx, cancel := context.WithTimeout(syncCtx, 30*time.Second)
+	defer cancel()
+	tracker := newDetectorStageTracker(latest, lastStateBlock, nil)
+	iterCtx = rpc.WithTimingObserver(iterCtx, tracker)
+	dirty, stats, err := e.discoverer.ChangedPoolAddressesAtWithStats(iterCtx, addresses, from, to)
+	telemetry := tracker.Snapshot()
+	successBlocks := stats.ChunksSucceeded * chunkSize
+	totalBlocks := to - from + 1
+	if successBlocks > totalBlocks {
+		successBlocks = totalBlocks
+	}
+	var checkpoint uint64
+	if successBlocks > 0 {
+		checkpoint = from + successBlocks - 1
+	}
+	e.syncMu.Lock()
+	if e.pendingDirty == nil {
+		e.pendingDirty = make(map[string]struct{})
+	}
+	for address := range dirty {
+		e.pendingDirty[strings.ToLower(address)] = struct{}{}
+	}
+	if checkpoint > e.dirtyScanBlock {
+		e.dirtyScanBlock = checkpoint
+		snapshot.CheckpointAdvances = 1
+	}
+	snapshot.LatestHead = latest
+	snapshot.ScanWatermark = e.dirtyScanBlock
+	snapshot.StateWatermark = lastStateBlock
+	snapshot.PendingDirtyPools = uint64(len(e.pendingDirty))
+	e.syncMu.Unlock()
+	snapshot.ChunksAttempted = stats.ChunksAttempted
+	snapshot.ChunksSucceeded = stats.ChunksSucceeded
+	snapshot.ChunksFailed = stats.ChunksFailed
+	snapshot.BlocksScanned = stats.BlocksScanned
+	snapshot.ProgressBlocks = successBlocks
+	snapshot.DirtyPoolsFound = uint64(len(dirty))
+	snapshot.IterationDuration = time.Since(started)
+	snapshot.LimiterWait = telemetry.RPCLimiterWait
+	snapshot.Transport = telemetry.RPCTransport
+	snapshot.CheckpointBlock = checkpoint
+	if latest > snapshot.ScanWatermark {
+		snapshot.LagBlocks = latest - snapshot.ScanWatermark
+		snapshot.MarketStateSyncLagging = true
+	}
+	snapshot.MarketStateComplete = !snapshot.MarketStateSyncLagging && err == nil
+	e.storeMarketSyncSnapshot(snapshot)
+	return snapshot
+}
+
+func (e *Engine) storeMarketSyncSnapshot(snapshot marketSyncSnapshot) {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	e.syncLast = snapshot
+}
+
+func (e *Engine) currentDirtyScanBlock() uint64 {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	return e.dirtyScanBlock
+}
+
+func (e *Engine) marketSyncEnabled() bool {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	return e.syncRunning
+}
+
+func (e *Engine) marketSyncSnapshot(latest uint64) marketSyncSnapshot {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	s := e.syncLast
+	s.LatestHead = latest
+	s.ScanWatermark = e.dirtyScanBlock
+	s.StateWatermark = e.lastStateBlock
+	s.PendingDirtyPools = uint64(len(e.pendingDirty))
+	s.MarketStateComplete = s.ScanWatermark >= latest
+	if latest > s.ScanWatermark {
+		s.LagBlocks = latest - s.ScanWatermark
+		s.MarketStateSyncLagging = true
+	} else {
+		s.LagBlocks = 0
+		s.MarketStateSyncLagging = false
+	}
+	return s
+}
+
+func (e *Engine) getLastStateBlock() uint64 {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	return e.lastStateBlock
+}
+
+func (e *Engine) setLastStateBlock(block uint64) {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	if block > e.lastStateBlock {
+		e.lastStateBlock = block
+	}
+}
+
+func (e *Engine) pendingDirtySnapshot() map[string]struct{} {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	out := make(map[string]struct{}, len(e.pendingDirty))
+	for address := range e.pendingDirty {
+		out[address] = struct{}{}
+	}
+	return out
+}
+
+func (e *Engine) ackPendingDirty(attempted, unresolved map[string]struct{}) {
+	e.syncMu.Lock()
+	defer e.syncMu.Unlock()
+	for address := range attempted {
+		key := strings.ToLower(address)
+		if _, keep := unresolved[key]; keep {
+			continue
+		}
+		delete(e.pendingDirty, key)
+	}
 }
 
 func (e *Engine) SetUniverseTelemetry(active, dynamic, decisions []string) {
@@ -487,9 +758,10 @@ func (e *Engine) RequiresFullReconcile(maxHops, maxRoutes int, options SearchOpt
 // CycleAtWithSearchOptions lets runtime risk profiles widen or narrow the
 // read-only market search envelope without touching execution safety gates.
 func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64, maxHops, maxRoutes int, volatilityWeight float64, options SearchOptions) (report CycleReport, err error) {
-	tracker := newDetectorStageTracker(stateBlock, e.lastStateBlock, nil)
+	lastStateAtStart := e.getLastStateBlock()
+	tracker := newDetectorStageTracker(stateBlock, lastStateAtStart, nil)
 	defer func() {
-		tracker.SetLastStateBlock(e.lastStateBlock)
+		tracker.SetLastStateBlock(e.getLastStateBlock())
 		tracker.SetReconciliation(e.reconciliation != nil, reconciliationUnitsDone(e.reconciliation), reconciliationUnitsTotal(e.reconciliation))
 		report.DetectorStage = tracker.Snapshot()
 	}()
@@ -503,6 +775,7 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.RouteCountBefore = len(e.routeCache)
 	report.RouteCacheReady = len(e.routeCache) > 0
 	report.RouteCacheSize = len(e.routeCache)
+	e.applySyncTelemetry(&report, e.marketSyncSnapshot(stateBlock), stateBlock)
 	e.statsMu.RLock()
 	report.UniverseAssets = append([]string(nil), e.universeAssets...)
 	report.DynamicAssets = append([]string(nil), e.dynamicAssets...)
@@ -537,12 +810,14 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 			report.NoQuoteReason = "reconciliation_in_progress"
 		}
 		if stateBlock > 0 {
-			e.lastStateBlock = stateBlock
+			e.setLastStateBlock(stateBlock)
 		}
 		return report, nil
 	}
 	tracker.Stage(stageIncrementalRefreshGate)
-	if shouldDeferIncrementalRefresh(e.lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
+	lastStateBlock := e.getLastStateBlock()
+	pendingSyncedDirty := e.marketSyncEnabled() && len(e.pendingDirtySnapshot()) > 0
+	if !pendingSyncedDirty && shouldDeferIncrementalRefresh(lastStateBlock, stateBlock, incrementalRefreshBatchBlocks) {
 		routesFound := refreshRoutes(e.routeCache, liquidPools(e.cache.Snapshot()))
 		report.RoutesReused = uint64(len(routesFound))
 		e.describeReconciliation(&report)
@@ -563,15 +838,27 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	rpcAtStart := e.rpcCalls()
 	forceAllEvaluation := e.forceEvaluateNext
 	e.forceEvaluateNext = false
-	fromBlock := stateBlock
-	if e.lastStateBlock > 0 && e.lastStateBlock < stateBlock {
-		fromBlock = e.lastStateBlock + 1
-	}
-	tracker.Stage(stageGetLogsDirtyDetection)
-	tracker.StartGetLogs(fromBlock, stateBlock, e.discoverer.GetLogsChunkSize())
 	refreshCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "pool_refresh", stateBlock)
-	dirty, refresh, err = e.incrementalRefresh(refreshCtx, fromBlock, stateBlock, tracker)
-	tracker.FinishGetLogs(refresh)
+	var syncedDirty map[string]struct{}
+	if e.marketSyncEnabled() {
+		syncedDirty = e.pendingDirtySnapshot()
+		dirty = copyStringSet(syncedDirty)
+		refresh = e.refreshKnownDirty(refreshCtx, dirty, stateBlock, tracker)
+		e.applySyncTelemetry(&report, e.marketSyncSnapshot(stateBlock), stateBlock)
+		if ctx.Err() != nil {
+			return report, ctx.Err()
+		}
+		e.ackPendingDirty(refresh.ResolvedDirty, refresh.UnresolvedDirty)
+	} else {
+		fromBlock := stateBlock
+		if lastStateBlock > 0 && lastStateBlock < stateBlock {
+			fromBlock = lastStateBlock + 1
+		}
+		tracker.Stage(stageGetLogsDirtyDetection)
+		tracker.StartGetLogs(fromBlock, stateBlock, e.discoverer.GetLogsChunkSize())
+		dirty, refresh, err = e.incrementalRefresh(refreshCtx, fromBlock, stateBlock, tracker)
+		tracker.FinishGetLogs(refresh)
+	}
 	tracker.FinishPoolRefresh(refresh)
 	report.GetLogsChunksAttempted = refresh.Logs.ChunksAttempted
 	report.GetLogsChunksSucceeded = refresh.Logs.ChunksSucceeded
@@ -669,7 +956,11 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.QuoteBudgetUsed = evaluation.QuoteBudgetUsed
 	report.QuoteBudgetDropped = evaluation.QuoteBudgetDropped
 	if len(affected) == 0 {
-		report.NoQuoteReason = "no_dirty_routes"
+		if report.MarketStateSyncLagging {
+			report.NoQuoteReason = "market_state_sync_lagging"
+		} else {
+			report.NoQuoteReason = "no_dirty_routes"
+		}
 	} else if evaluation.RoutesEvaluated == 0 {
 		report.NoQuoteReason = "prequote_or_quote_budget"
 	} else if len(evaluation.NearMisses) == 0 {
@@ -702,7 +993,13 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 	report.DEXRoutes = routeDEXDiversity(routesFound)
 	tracker.Stage(stageCycleCommit)
 	if stateBlock > 0 && !refresh.MarketStateIncomplete {
-		e.lastStateBlock = stateBlock
+		commitBlock := stateBlock
+		if e.marketSyncEnabled() {
+			if scan := e.currentDirtyScanBlock(); scan > 0 && scan < commitBlock {
+				commitBlock = scan
+			}
+		}
+		e.setLastStateBlock(commitBlock)
 	}
 	tracker.Stage(stageCycleComplete)
 	return report, nil
@@ -731,6 +1028,43 @@ func shouldDeferIncrementalRefresh(lastStateBlock, stateBlock uint64, batchBlock
 		return false
 	}
 	return stateBlock-lastStateBlock < batchBlocks
+}
+
+func (e *Engine) applySyncTelemetry(report *CycleReport, snapshot marketSyncSnapshot, decisionBlock uint64) {
+	if report == nil {
+		return
+	}
+	report.SyncLatestHead = snapshot.LatestHead
+	report.SyncScanWatermark = snapshot.ScanWatermark
+	report.SyncStateWatermark = snapshot.StateWatermark
+	report.SyncLagBlocks = snapshot.LagBlocks
+	report.SyncChunksAttempted = snapshot.ChunksAttempted
+	report.SyncChunksSucceeded = snapshot.ChunksSucceeded
+	report.SyncChunksFailed = snapshot.ChunksFailed
+	report.SyncBlocksScanned = snapshot.BlocksScanned
+	report.SyncProgressBlocks = snapshot.ProgressBlocks
+	report.SyncDirtyPoolsFound = snapshot.DirtyPoolsFound
+	report.SyncIterationDuration = snapshot.IterationDuration
+	report.SyncLimiterWait = snapshot.LimiterWait
+	report.SyncTransport = snapshot.Transport
+	report.SyncCheckpointAdvances = snapshot.CheckpointAdvances
+	report.SyncCheckpointBlock = snapshot.CheckpointBlock
+	report.SyncPendingDirtyPools = snapshot.PendingDirtyPools
+	report.DecisionStateBlock = snapshot.ScanWatermark
+	report.DecisionLatestHead = decisionBlock
+	report.MarketStateComplete = snapshot.MarketStateComplete
+	report.MarketStateSyncLagging = snapshot.MarketStateSyncLagging
+	if decisionBlock > snapshot.ScanWatermark {
+		report.DecisionStateLagBlocks = decisionBlock - snapshot.ScanWatermark
+	}
+}
+
+func copyStringSet(input map[string]struct{}) map[string]struct{} {
+	output := make(map[string]struct{}, len(input))
+	for key := range input {
+		output[key] = struct{}{}
+	}
+	return output
 }
 
 func (e *Engine) startReconciliation(maxHops, maxRoutes int) {
@@ -1132,6 +1466,90 @@ func (e *Engine) incrementalRefresh(ctx context.Context, fromBlock, stateBlock u
 		}
 	}
 	return dirty, stats, nil
+}
+
+func (e *Engine) refreshKnownDirty(ctx context.Context, dirty map[string]struct{}, stateBlock uint64, tracker *detectorStageTracker) refreshStats {
+	stats := refreshStats{UnresolvedDirty: make(map[string]struct{}), ResolvedDirty: make(map[string]struct{})}
+	current := e.cache.Snapshot()
+	if len(current) == 0 || len(dirty) == 0 {
+		return stats
+	}
+	refresh := poolsByAddress(current, dirty)
+	if len(refresh) == 0 {
+		return stats
+	}
+	tracker.Stage(stagePoolRefresh)
+	tracker.StartPoolRefresh(uint64(len(refresh)))
+	type result struct {
+		before, after pools.Pool
+		err           error
+		duration      time.Duration
+	}
+	jobs := make(chan pools.Pool)
+	results := make(chan result, len(refresh))
+	var wg sync.WaitGroup
+	for i := 0; i < e.discoveryWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for pool := range jobs {
+				started := time.Now()
+				updated, err := e.discoverer.RefreshPoolAt(ctx, pool, stateBlock)
+				results <- result{before: pool, after: updated, err: err, duration: time.Since(started)}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for _, pool := range refresh {
+			select {
+			case jobs <- pool:
+			case <-ctx.Done():
+				return
+			}
+		}
+	}()
+	go func() { wg.Wait(); close(results) }()
+	for result := range results {
+		stats.PoolsAttempted++
+		address := strings.ToLower(result.before.Address)
+		if result.err != nil {
+			tracker.PoolRefreshResult(false, result.duration)
+			if ctx.Err() != nil {
+				stats.MarketStateIncomplete = true
+				stats.LastFailure = fmt.Sprintf("%T", ctx.Err())
+				if address != "" {
+					stats.UnresolvedDirty[address] = struct{}{}
+				}
+				continue
+			}
+			stats.PoolsFailed++
+			stats.MarketStateIncomplete = true
+			stats.LastFailure = fmt.Sprintf("%T", result.err)
+			if address != "" {
+				stats.UnresolvedDirty[address] = struct{}{}
+			}
+			continue
+		}
+		tracker.PoolRefreshResult(true, result.duration)
+		stats.PoolsSucceeded++
+		afterAddress := strings.ToLower(result.after.Address)
+		if afterAddress == "" {
+			afterAddress = address
+		}
+		changed := poolChanged(result.before, result.after)
+		if !changed {
+			result.after.LastUpdatedBlock = result.before.LastUpdatedBlock
+			delete(dirty, afterAddress)
+		} else {
+			dirty[afterAddress] = struct{}{}
+		}
+		e.cache.Put(result.after)
+		if afterAddress != "" {
+			stats.ResolvedDirty[afterAddress] = struct{}{}
+		}
+	}
+	return stats
 }
 
 func changedPoolAddresses(before, after []pools.Pool) map[string]struct{} {
@@ -2192,7 +2610,7 @@ func scoreDecileQuality(input []evaluatedRoute) map[string]map[string]any {
 }
 
 func (e *Engine) optimizeRoutes(ctx context.Context, asset string, candidates []optimizerCandidate, current *big.Int, samples, normalSamples, sampleBudget int, adaptive, earlyStop bool) evaluationReport {
-	ctx = rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "optimizer", e.lastStateBlock)
+	ctx = rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "optimizer", e.getLastStateBlock())
 	if !adaptive {
 		return e.optimizeRoutesLegacy(ctx, asset, candidates, current, samples)
 	}

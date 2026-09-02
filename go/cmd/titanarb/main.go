@@ -209,6 +209,7 @@ func main() {
 					latestBlock := marketScheduler.LatestBlock()
 					fields := map[string]any{"source_block": trigger.Block, "latest_block": latestBlock, "max_work_lag_blocks": maxWorkLag}
 					addDetectorStageFields(fields, report.DetectorStage, latestBlock)
+					addMarketSyncFields(fields, report)
 					publish(operationSink, observability.Performance, "market_cycle_superseded", telegram.Info, "stale market work cancelled", fields)
 					return
 				}
@@ -405,6 +406,27 @@ func main() {
 				"unresolved_dirty_pools":             report.UnresolvedDirtyPools,
 				"routes_skipped_unresolved_refresh":  report.RoutesSkippedUnresolved,
 				"market_state_incomplete":            report.MarketStateIncomplete,
+				"sync_latest_head":                   report.SyncLatestHead,
+				"sync_scan_watermark":                report.SyncScanWatermark,
+				"sync_state_watermark":               report.SyncStateWatermark,
+				"sync_lag_blocks":                    report.SyncLagBlocks,
+				"sync_chunks_attempted":              report.SyncChunksAttempted,
+				"sync_chunks_succeeded":              report.SyncChunksSucceeded,
+				"sync_chunks_failed":                 report.SyncChunksFailed,
+				"sync_blocks_scanned":                report.SyncBlocksScanned,
+				"sync_progress_blocks":               report.SyncProgressBlocks,
+				"sync_dirty_pools_found":             report.SyncDirtyPoolsFound,
+				"sync_iteration_duration_ms":         report.SyncIterationDuration.Milliseconds(),
+				"sync_limiter_wait_ms":               report.SyncLimiterWait.Milliseconds(),
+				"sync_transport_ms":                  report.SyncTransport.Milliseconds(),
+				"sync_checkpoint_advances":           report.SyncCheckpointAdvances,
+				"sync_checkpoint_block":              report.SyncCheckpointBlock,
+				"sync_pending_dirty_pools":           report.SyncPendingDirtyPools,
+				"decision_state_block":               report.DecisionStateBlock,
+				"decision_latest_head":               report.DecisionLatestHead,
+				"decision_state_lag_blocks":          report.DecisionStateLagBlocks,
+				"market_state_complete":              report.MarketStateComplete,
+				"market_state_sync_lagging":          report.MarketStateSyncLagging,
 			}
 			if pairService != nil {
 				pairStats := pairService.Snapshot()
@@ -425,6 +447,13 @@ func main() {
 			executionPipeline.SetLatestBlockSource(marketScheduler.LatestBlock)
 		}
 		go marketScheduler.Run(ctx)
+		marketEngine.StartMarketStateSynchronizer(ctx, marketScheduler.LatestBlock, func() market.SearchOptions {
+			settings := runtimeconfig.Defaults(runtimeconfig.Balanced)
+			if runtimeRisk != nil {
+				settings = runtimeRisk.Snapshot()
+			}
+			return marketSearchOptions(settings)
+		})
 	}
 	if marketEngine != nil && executionPipeline != nil {
 		forcedConfig, forcedErr := loadForcedTradeConfig(operationsDir, runtimeConfigPath)
@@ -971,21 +1000,22 @@ func marketSearchOptions(settings runtimeconfig.Settings) market.SearchOptions {
 		depth = 32
 	}
 	return market.SearchOptions{
-		EvaluationRoutesPerAsset: clampInt(depth*4, 8, 96),
-		OptimizerRoutesPerAsset:  clampInt(depth/2, 2, 16),
-		OptimizerSamplesPerRoute: envIntBounded("HIGH_SCORE_MAX_SAMPLES", clampInt(depth/2, 3, 5), 2, 16),
-		OptimizerSamplesPerCycle: optimizerSampleBudget(),
-		MaxQuotesPerCycle:        envIntBounded("MAX_QUOTES_PER_CYCLE", 40, 4, 256),
-		MaxOptimizedRoutes:       envIntBounded("MAX_OPTIMIZED_ROUTES_PER_CYCLE", 8, 1, 32),
-		NormalOptimizerSamples:   envIntBounded("NORMAL_MAX_SAMPLES", 3, 2, 16),
-		FullReconcileEvery:       uint64(envIntBounded("FULL_RECONCILE_EVERY_CYCLES", 2_400, 240, 100_000)),
-		ReconcileBatchPairs:      reconcileBatchUnits(),
-		DisablePreQuoteRanking:   strings.EqualFold(strings.TrimSpace(os.Getenv("PREQUOTE_RANKING_ENABLED")), "false"),
-		ExploreRatioBPS:          preQuoteExploreBPS(),
-		PersistentQuoteCache:     envEnabled("QUOTE_CACHE_ENABLED", true),
-		AdaptiveOptimizer:        envEnabled("ADAPTIVE_OPTIMIZER_ENABLED", true),
-		EarlyStop:                envEnabled("RPC_EARLY_STOP_ENABLED", true),
-		OptimizationFlagsSet:     true,
+		EvaluationRoutesPerAsset:  clampInt(depth*4, 8, 96),
+		OptimizerRoutesPerAsset:   clampInt(depth/2, 2, 16),
+		OptimizerSamplesPerRoute:  envIntBounded("HIGH_SCORE_MAX_SAMPLES", clampInt(depth/2, 3, 5), 2, 16),
+		OptimizerSamplesPerCycle:  optimizerSampleBudget(),
+		MaxQuotesPerCycle:         envIntBounded("MAX_QUOTES_PER_CYCLE", 40, 4, 256),
+		MaxOptimizedRoutes:        envIntBounded("MAX_OPTIMIZED_ROUTES_PER_CYCLE", 8, 1, 32),
+		NormalOptimizerSamples:    envIntBounded("NORMAL_MAX_SAMPLES", 3, 2, 16),
+		FullReconcileEvery:        uint64(envIntBounded("FULL_RECONCILE_EVERY_CYCLES", 2_400, 240, 100_000)),
+		ReconcileBatchPairs:       reconcileBatchUnits(),
+		SyncMaxChunksPerIteration: envIntBounded("TITANARB_SYNC_MAX_CHUNKS_PER_ITERATION", 20, 1, 200),
+		DisablePreQuoteRanking:    strings.EqualFold(strings.TrimSpace(os.Getenv("PREQUOTE_RANKING_ENABLED")), "false"),
+		ExploreRatioBPS:           preQuoteExploreBPS(),
+		PersistentQuoteCache:      envEnabled("QUOTE_CACHE_ENABLED", true),
+		AdaptiveOptimizer:         envEnabled("ADAPTIVE_OPTIMIZER_ENABLED", true),
+		EarlyStop:                 envEnabled("RPC_EARLY_STOP_ENABLED", true),
+		OptimizationFlagsSet:      true,
 	}
 }
 
@@ -1059,6 +1089,33 @@ func addDetectorStageFields(fields map[string]any, stage market.DetectorStageTel
 	fields["rpc_limiter_wait_ms"] = stage.RPCLimiterWait.Milliseconds()
 	fields["rpc_transport_ms"] = stage.RPCTransport.Milliseconds()
 	fields["rate_limiter_wait_ms"] = stage.RateLimiterWait.Milliseconds()
+}
+
+func addMarketSyncFields(fields map[string]any, report market.CycleReport) {
+	if fields == nil {
+		return
+	}
+	fields["sync_latest_head"] = report.SyncLatestHead
+	fields["sync_scan_watermark"] = report.SyncScanWatermark
+	fields["sync_state_watermark"] = report.SyncStateWatermark
+	fields["sync_lag_blocks"] = report.SyncLagBlocks
+	fields["sync_chunks_attempted"] = report.SyncChunksAttempted
+	fields["sync_chunks_succeeded"] = report.SyncChunksSucceeded
+	fields["sync_chunks_failed"] = report.SyncChunksFailed
+	fields["sync_blocks_scanned"] = report.SyncBlocksScanned
+	fields["sync_progress_blocks"] = report.SyncProgressBlocks
+	fields["sync_dirty_pools_found"] = report.SyncDirtyPoolsFound
+	fields["sync_iteration_duration_ms"] = report.SyncIterationDuration.Milliseconds()
+	fields["sync_limiter_wait_ms"] = report.SyncLimiterWait.Milliseconds()
+	fields["sync_transport_ms"] = report.SyncTransport.Milliseconds()
+	fields["sync_checkpoint_advances"] = report.SyncCheckpointAdvances
+	fields["sync_checkpoint_block"] = report.SyncCheckpointBlock
+	fields["sync_pending_dirty_pools"] = report.SyncPendingDirtyPools
+	fields["decision_state_block"] = report.DecisionStateBlock
+	fields["decision_latest_head"] = report.DecisionLatestHead
+	fields["decision_state_lag_blocks"] = report.DecisionStateLagBlocks
+	fields["market_state_complete"] = report.MarketStateComplete
+	fields["market_state_sync_lagging"] = report.MarketStateSyncLagging
 }
 
 func cancelWhenSuperseded(parent context.Context, latest func() uint64, source, tolerance uint64) (context.Context, context.CancelFunc) {

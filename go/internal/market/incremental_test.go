@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -359,6 +360,133 @@ func TestRoutesWithoutUnresolvedPools(t *testing.T) {
 	if len(filtered) != 1 || filtered[0].Symbols[1] != "B" {
 		t.Fatalf("filtered routes=%+v", filtered)
 	}
+}
+
+func TestMarketStateSyncCheckpointsContiguousChunks(t *testing.T) {
+	p := pools.Pool{Address: "0x0000000000000000000000000000000000000001", DEX: pools.UniswapV3, Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20), LastUpdatedBlock: 100}
+	c := cache.NewPoolCache(nil)
+	c.Put(p)
+	caller := &syncFakeCaller{failOnCall: 2, dirtyAddress: strings.ToLower(p.Address)}
+	engine := &Engine{discoverer: pools.NewDiscoverer(caller, "", "", nil), cache: c, discoveryWorkers: 1, pendingDirty: make(map[string]struct{})}
+	engine.setLastStateBlock(100)
+	options := DefaultSearchOptions()
+	options.SyncMaxChunksPerIteration = 2
+	snapshot := engine.advanceMarketStateSync(context.Background(), 121, options)
+	if snapshot.CheckpointBlock != 105 || engine.currentDirtyScanBlock() != 105 {
+		t.Fatalf("checkpoint=%d scan=%d snapshot=%+v", snapshot.CheckpointBlock, engine.currentDirtyScanBlock(), snapshot)
+	}
+	if snapshot.ChunksAttempted != 2 || snapshot.ChunksSucceeded != 1 || snapshot.ChunksFailed != 1 {
+		t.Fatalf("unexpected chunk stats: %+v", snapshot)
+	}
+	if _, ok := engine.pendingDirtySnapshot()[strings.ToLower(p.Address)]; !ok {
+		t.Fatal("dirty address from successful chunk was not preserved")
+	}
+}
+
+func TestMarketStateSyncResumesAtCheckpointPlusOne(t *testing.T) {
+	p := pools.Pool{Address: "0x0000000000000000000000000000000000000001", DEX: pools.UniswapV3, Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20), LastUpdatedBlock: 100}
+	c := cache.NewPoolCache(nil)
+	c.Put(p)
+	caller := &syncFakeCaller{failOnCall: 2, dirtyAddress: strings.ToLower(p.Address)}
+	engine := &Engine{discoverer: pools.NewDiscoverer(caller, "", "", nil), cache: c, discoveryWorkers: 1, pendingDirty: make(map[string]struct{})}
+	engine.setLastStateBlock(100)
+	options := DefaultSearchOptions()
+	options.SyncMaxChunksPerIteration = 2
+	engine.advanceMarketStateSync(context.Background(), 121, options)
+	caller.failOnCall = 0
+	engine.advanceMarketStateSync(context.Background(), 121, options)
+	if len(caller.ranges) < 3 {
+		t.Fatalf("ranges=%+v", caller.ranges)
+	}
+	if caller.ranges[2] != [2]uint64{106, 110} {
+		t.Fatalf("did not resume at checkpoint+1: %+v", caller.ranges)
+	}
+}
+
+func TestAckPendingDirtyKeepsUnresolvedAndDedupes(t *testing.T) {
+	engine := &Engine{pendingDirty: map[string]struct{}{"0x1": {}, "0x2": {}}}
+	engine.ackPendingDirty(map[string]struct{}{"0x1": {}, "0x2": {}}, map[string]struct{}{"0x2": {}})
+	pending := engine.pendingDirtySnapshot()
+	if _, ok := pending["0x1"]; ok {
+		t.Fatalf("resolved dirty remained pending: %+v", pending)
+	}
+	if _, ok := pending["0x2"]; !ok {
+		t.Fatalf("unresolved dirty was removed: %+v", pending)
+	}
+}
+
+func TestDecisionCycleWithSyncDoesNotTriggerHistoricalGetLogs(t *testing.T) {
+	p := pools.Pool{Address: "0x0000000000000000000000000000000000000001", DEX: pools.UniswapV3, Liquidity: big.NewInt(10), SqrtPriceX96: big.NewInt(20), LastUpdatedBlock: 100}
+	c := cache.NewPoolCache(nil)
+	c.Put(p)
+	caller := &syncFakeCaller{dirtyAddress: strings.ToLower(p.Address)}
+	engine := &Engine{
+		discoverer:       pools.NewDiscoverer(caller, "", "", nil),
+		cache:            c,
+		discoveryWorkers: 1,
+		pendingDirty:     map[string]struct{}{},
+		routeCache:       []routes.Route{{Symbols: []string{"A", "B", "A"}, Hops: []pools.Pool{p}}},
+		lastMaxHops:      4,
+		lastMaxRoutes:    256,
+	}
+	engine.setLastStateBlock(100)
+	engine.syncMu.Lock()
+	engine.syncRunning = true
+	engine.dirtyScanBlock = 100
+	engine.syncMu.Unlock()
+	report, err := engine.CycleAtWithSearchOptions(context.Background(), 1000, 2, 1, 0, DefaultSearchOptions())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(caller.ranges) != 0 {
+		t.Fatalf("decision cycle performed getLogs despite sync worker: %+v", caller.ranges)
+	}
+	if report.NoQuoteReason != "market_state_sync_lagging" {
+		t.Fatalf("no_quote_reason=%s", report.NoQuoteReason)
+	}
+}
+
+type syncFakeCaller struct {
+	failOnCall   int
+	calls        int
+	dirtyAddress string
+	ranges       [][2]uint64
+}
+
+func (f *syncFakeCaller) BlockNumber(context.Context) (uint64, error) { return 1, nil }
+
+func (f *syncFakeCaller) EthCall(_ context.Context, _ map[string]string) (string, error) {
+	return testResponse(testWord(big.NewInt(10))), nil
+}
+
+func (f *syncFakeCaller) Call(_ context.Context, method string, params any, out any) error {
+	if method != "eth_getLogs" {
+		return errors.New("unexpected method")
+	}
+	f.calls++
+	if list, ok := params.([]any); ok && len(list) == 1 {
+		if filter, ok := list[0].(map[string]any); ok {
+			from, _ := strconv.ParseUint(strings.TrimPrefix(filter["fromBlock"].(string), "0x"), 16, 64)
+			to, _ := strconv.ParseUint(strings.TrimPrefix(filter["toBlock"].(string), "0x"), 16, 64)
+			f.ranges = append(f.ranges, [2]uint64{from, to})
+		}
+	}
+	if f.failOnCall > 0 && f.calls == f.failOnCall {
+		return errors.New("provider range limit")
+	}
+	target := out.(*[]struct {
+		Address     string   `json:"address"`
+		Data        string   `json:"data"`
+		Topics      []string `json:"topics"`
+		BlockNumber string   `json:"blockNumber"`
+	})
+	*target = append(*target, struct {
+		Address     string   `json:"address"`
+		Data        string   `json:"data"`
+		Topics      []string `json:"topics"`
+		BlockNumber string   `json:"blockNumber"`
+	}{Address: f.dirtyAddress})
+	return nil
 }
 
 func TestCapLoanMaxUsesAaveLiquidityAsUpperBound(t *testing.T) {
