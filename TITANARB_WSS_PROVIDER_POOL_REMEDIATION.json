@@ -1,0 +1,9 @@
+{
+  "commit": "5b0bdd4",
+  "wss_registered": ["alchemy_1_wss", "alchemy_2_wss", "alchemy_3_wss", "ankr_1_wss", "ankr_2_wss", "chainstack_wss", "arbitrum_official_wss", "quicknode_wss"],
+  "active_observed": "alchemy_1_wss",
+  "http_fallback_preserved": true,
+  "post_deploy": {"service": "active/running", "failover_loop_observed": false, "stable_connection_observed": true},
+  "safety_unchanged": true,
+  "tests": {"go_test": "pass", "race": "pass", "vet": "pass", "build": "pass"}
+}
