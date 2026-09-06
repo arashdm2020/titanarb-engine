@@ -59,6 +59,31 @@ func TestConnectDisconnectReconnect(t *testing.T) {
 	}
 }
 
+func TestOrderedWSSFailoverSequence(t *testing.T) {
+	client := NewManaged([]Endpoint{
+		{Name: "alchemy_1_wss", URL: "ws://a1"},
+		{Name: "alchemy_2_wss", URL: "ws://a2"},
+		{Name: "alchemy_3_wss", URL: "ws://a3"},
+		{Name: "quicknode_wss", URL: "ws://qn"},
+		{Name: "chainstack_wss", URL: "ws://cs"},
+		{Name: "arbitrum_official_wss", URL: "ws://official"},
+	}, logger.New(false, io.Discard), metrics.New())
+	for _, want := range []string{"alchemy_1_wss", "alchemy_2_wss", "alchemy_3_wss", "quicknode_wss", "chainstack_wss", "arbitrum_official_wss"} {
+		if got := client.ActiveProvider(); got != want { t.Fatalf("active=%s want=%s", got, want) }
+		client.markFailed("test")
+	}
+}
+
+func TestCooldownProviderSkippedAndActiveIsSticky(t *testing.T) {
+	client := NewManaged([]Endpoint{{Name: "alchemy_1_wss", URL: "ws://a1"}, {Name: "alchemy_2_wss", URL: "ws://a2"}, {Name: "quicknode_wss", URL: "ws://q"}}, logger.New(false, io.Discard), metrics.New())
+	client.states[1].cooldownUntil = time.Now().Add(time.Minute)
+	if client.ActiveProvider() != "alchemy_1_wss" { t.Fatal("active provider not sticky") }
+	client.markFailed("test")
+	if client.ActiveProvider() != "quicknode_wss" { t.Fatalf("cooldown provider selected: %s", client.ActiveProvider()) }
+	client.markSuccess()
+	if client.ActiveProvider() != "quicknode_wss" { t.Fatal("recovered higher priority provider preempted active") }
+}
+
 func TestWSSFailoverUsesSecondaryWithoutDuplicateSubscriptions(t *testing.T) {
 	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "down", http.StatusServiceUnavailable)

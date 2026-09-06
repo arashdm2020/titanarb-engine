@@ -1195,7 +1195,7 @@ func wssEndpoints(cfg config.Config) []ws.Endpoint {
 	if len(cfg.RPCProviders) == 0 {
 		return []ws.Endpoint{{Name: "primary", URL: cfg.WSRPCURL}}
 	}
-	out := make([]ws.Endpoint, 0, len(cfg.RPCProviders))
+	available := make(map[string]ws.Endpoint)
 	for _, provider := range cfg.RPCProviders {
 		endpoint := strings.TrimSpace(provider.WSS)
 		if endpoint == "" {
@@ -1216,8 +1216,18 @@ func wssEndpoints(cfg config.Config) []ws.Endpoint {
 				endpoint = strings.Replace(provider.HTTP, "https://", "wss://", 1)
 			}
 		}
-		if endpoint != "" { out = append(out, ws.Endpoint{Name: provider.Name + "_wss", URL: endpoint}) }
+		if endpoint != "" {
+			name := strings.ToLower(provider.Name)
+			// Ankr WSS endpoints are currently failing probes; keep their HTTP
+			// registrations intact but exclude them from normal WSS rotation.
+			if strings.HasPrefix(name, "ankr_") { continue }
+			available[name] = ws.Endpoint{Name: provider.Name + "_wss", URL: endpoint}
+		}
 	}
+	// WSS priority is deliberately independent from HTTP provider ordering.
+	order := []string{"alchemy_1", "alchemy_2", "alchemy_3", "quicknode", "chainstack", "arbitrum_official"}
+	out := make([]ws.Endpoint, 0, len(order))
+	for _, name := range order { if endpoint, ok := available[name]; ok { out = append(out, endpoint) } }
 	if len(out) == 0 {
 		out = append(out, ws.Endpoint{Name: "primary", URL: cfg.WSRPCURL})
 	}
