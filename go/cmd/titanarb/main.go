@@ -146,7 +146,11 @@ func main() {
 		go shadow.Run(ctx)
 		log.Event(logger.Info, "phase2_shadow_started", "decision", "Phase 2 analysis observer started", map[string]any{"mode": "shadow", "execution_authority": false, "max_reads_per_minute": shadow.ReadLimit, "probes_enabled": shadow.ProbeEnabled})
 	}
+	var latestMarketReport atomic.Pointer[market.CycleReport]
 	if telegramConfig.Enabled() && !telegramConfig.ReadOnly && runtimeRisk != nil {
+		// latestMarketReport is populated by the scheduler callback below. It is
+		// intentionally read-only here so Telegram can distinguish sync state
+		// from cumulative metrics without affecting market execution.
 		go control.Run(ctx, notifier, control.Handler{
 			Auth: control.Authorizer{ChatID: telegramConfig.ChatID, AdminID: os.Getenv("TELEGRAM_ADMIN_ID")},
 			Risk: runtimeRisk,
@@ -162,7 +166,14 @@ func main() {
 				if w.Connected() {
 					wssStatus = "Healthy"
 				}
-				return dashboard.FormatMarket(dashboard.MarketSnapshot{Status: "ONLINE", RiskProfile: string(runtimeRisk.Snapshot().Profile), WSS: wssStatus, ActivePools: marketSnapshot.ActivePools, Cycles: marketSnapshot.Cycles, Metrics: m.Snapshot()})
+				view := dashboard.MarketSnapshot{Status: "ONLINE", RiskProfile: string(runtimeRisk.Snapshot().Profile), WSS: wssStatus, ActivePools: marketSnapshot.ActivePools, Cycles: marketSnapshot.Cycles, Metrics: m.Snapshot()}
+				if report := latestMarketReport.Load(); report != nil {
+					view.RouteCacheReady = report.RouteCacheReady
+					view.ReconciliationPending = report.ReconcilePending
+					view.ReconcileUnitsDone, view.ReconcileUnitsTotal = report.ReconcileUnitsDone, report.ReconcileUnitsTotal
+					view.SyncLagBlocks, view.NoQuoteReason = report.SyncLagBlocks, report.NoQuoteReason
+				}
+				return dashboard.FormatMarket(view)
 			},
 			Top: func() string { return "🏆 No globally ranked candidate is available yet." },
 		})
@@ -213,6 +224,7 @@ func main() {
 			}
 			defer stopStale()
 			report, cycleErr := marketEngine.CycleAtWithSearchOptions(cycleCtx, trigger.Block, settings.RouteSearchDepth, routeBudget(settings), settings.VolatilityWeight, searchOptions)
+			latestMarketReport.Store(&report)
 			if cycleErr != nil {
 				if errors.Is(cycleErr, context.Canceled) || cycleCtx.Err() == context.Canceled {
 					latestBlock := marketScheduler.LatestBlock()
@@ -559,7 +571,14 @@ func main() {
 			if runtimeRisk != nil {
 				profile = string(runtimeRisk.Snapshot().Profile)
 			}
-			message := dashboard.FormatMarket(dashboard.MarketSnapshot{Status: "ONLINE", RiskProfile: profile, WSS: wssStatus, ActivePools: marketSnapshot.ActivePools, Cycles: marketSnapshot.Cycles, Metrics: snapshot})
+			view := dashboard.MarketSnapshot{Status: "ONLINE", RiskProfile: profile, WSS: wssStatus, ActivePools: marketSnapshot.ActivePools, Cycles: marketSnapshot.Cycles, Metrics: snapshot}
+			if report := latestMarketReport.Load(); report != nil {
+				view.RouteCacheReady = report.RouteCacheReady
+				view.ReconciliationPending = report.ReconcilePending
+				view.ReconcileUnitsDone, view.ReconcileUnitsTotal = report.ReconcileUnitsDone, report.ReconcileUnitsTotal
+				view.SyncLagBlocks, view.NoQuoteReason = report.SyncLagBlocks, report.NoQuoteReason
+			}
+			message := dashboard.FormatMarket(view)
 			alert(operationSink, observability.Performance, "operational_summary", telegram.Info, message, map[string]any{"blocks": snapshot.BlocksReceived, "routes": snapshot.RoutesEvaluated, "quotes": snapshot.Quotes, "opportunities": snapshot.Opportunities, "rpc_errors": snapshot.RPCErrors, "wss_disconnects": snapshot.WSSDisconnects, "transactions": snapshot.TransactionsBroadcast})
 			if pairService != nil {
 				mode, tracked, shadow, topScore := pairService.Memory.Summary()
@@ -1226,14 +1245,20 @@ func wssEndpoints(cfg config.Config) []ws.Endpoint {
 			name := strings.ToLower(provider.Name)
 			// Ankr WSS endpoints are currently failing probes; keep their HTTP
 			// registrations intact but exclude them from normal WSS rotation.
-			if strings.HasPrefix(name, "ankr_") { continue }
+			if strings.HasPrefix(name, "ankr_") {
+				continue
+			}
 			available[name] = ws.Endpoint{Name: provider.Name + "_wss", URL: endpoint}
 		}
 	}
 	// WSS priority is deliberately independent from HTTP provider ordering.
 	order := []string{"alchemy_1", "alchemy_2", "alchemy_3", "quicknode", "chainstack", "arbitrum_official"}
 	out := make([]ws.Endpoint, 0, len(order))
-	for _, name := range order { if endpoint, ok := available[name]; ok { out = append(out, endpoint) } }
+	for _, name := range order {
+		if endpoint, ok := available[name]; ok {
+			out = append(out, endpoint)
+		}
+	}
 	if len(out) == 0 {
 		out = append(out, ws.Endpoint{Name: "primary", URL: cfg.WSRPCURL})
 	}

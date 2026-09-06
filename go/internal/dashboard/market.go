@@ -15,6 +15,12 @@ import (
 type MarketSnapshot struct {
 	Status, RiskProfile, WSS string
 	ActivePools, Cycles      uint64
+	RouteCacheReady          bool
+	ReconciliationPending    bool
+	ReconcileUnitsDone       int
+	ReconcileUnitsTotal      int
+	SyncLagBlocks            uint64
+	NoQuoteReason            string
 	BestCycle, BestNet       string
 	ClosestNearMiss          string
 	Metrics                  metrics.Snapshot
@@ -27,6 +33,7 @@ func FormatMarket(s MarketSnapshot) string {
 	bestCycle := nonEmpty(s.BestCycle, "No candidate passed the preliminary threshold")
 	bestNet := nonEmpty(s.BestNet, "n/a")
 	nearMiss := nonEmpty(s.ClosestNearMiss, "n/a")
+	noQuoteReason := nonEmpty(s.NoQuoteReason, "n/a")
 	lines := []string{
 		"📊 TITANARB — MARKET",
 		fmt.Sprintf("🟢 Status: %s", status),
@@ -39,6 +46,10 @@ func FormatMarket(s MarketSnapshot) string {
 		fmt.Sprintf("🔎 Routes evaluated (runtime total): %d", s.Metrics.RoutesEvaluated),
 		fmt.Sprintf("💱 Quotes (runtime total): %d", s.Metrics.Quotes),
 		fmt.Sprintf("🧾 Last cycle: %d routes · %d RPC calls", s.Metrics.CycleLatency.RoutesEvaluated, s.Metrics.CycleLatency.RPCCalls),
+		fmt.Sprintf("🗃️ Route cache ready: %t", s.RouteCacheReady),
+		fmt.Sprintf("♻️ Reconciliation: %d/%d", s.ReconcileUnitsDone, s.ReconcileUnitsTotal),
+		fmt.Sprintf("📦 Sync lag: %d blocks", s.SyncLagBlocks),
+		fmt.Sprintf("🚫 No-quote reason: %s", noQuoteReason),
 		"",
 		"⚡ Engine latency",
 		fmt.Sprintf("⏱ Cycle: %d ms (p95 %d ms)", s.Metrics.CycleLatency.DurationMS, s.Metrics.P95CycleMS),
