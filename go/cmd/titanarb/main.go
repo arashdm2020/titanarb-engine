@@ -146,7 +146,7 @@ func main() {
 		go shadow.Run(ctx)
 		log.Event(logger.Info, "phase2_shadow_started", "decision", "Phase 2 analysis observer started", map[string]any{"mode": "shadow", "execution_authority": false, "max_reads_per_minute": shadow.ReadLimit, "probes_enabled": shadow.ProbeEnabled})
 	}
-	if telegramConfig.Enabled() && runtimeRisk != nil {
+	if telegramConfig.Enabled() && !telegramConfig.ReadOnly && runtimeRisk != nil {
 		go control.Run(ctx, notifier, control.Handler{
 			Auth: control.Authorizer{ChatID: telegramConfig.ChatID, AdminID: os.Getenv("TELEGRAM_ADMIN_ID")},
 			Risk: runtimeRisk,

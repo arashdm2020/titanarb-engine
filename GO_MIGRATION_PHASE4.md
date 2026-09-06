@@ -43,8 +43,9 @@ Set only non-secret operational variables locally when needed:
 ```text
 TITANARB_PHASE4_READ_ONLY=true
 TITANARB_OBSERVABILITY_DIR=runtime/go
-TELEGRAM_BOT_TOKEN=<local secret>
-TELEGRAM_CHAT_ID=<private channel>
+TITANARB_TELEGRAM_ENABLED=true
+TITANARB_TELEGRAM_BOT_TOKEN=<local secret; never commit>
+TITANARB_TELEGRAM_CHANNEL_ID=-1004450557518
 ```
 
 The operations sink persists `opportunities.jsonl`, `trades.jsonl`, `errors.jsonl`, `performance.jsonl`, and `server.jsonl` with mode `0600` under a mode-`0700` directory. It redacts private keys, API keys, RPC/WSS URLs, and Telegram tokens. Telegram is buffered and fail-open: unavailable delivery is counted/dropped without blocking WSS, RPC, quoting, safety, or execution.

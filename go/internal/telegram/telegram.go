@@ -7,7 +7,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
+	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"sort"
@@ -42,18 +46,29 @@ type Update struct {
 type Config struct {
 	Token, ChatID string
 	QueueSize     int
+	Disabled      bool
+	ReadOnly      bool
 }
 
 func FromEnv() Config {
+	value := func(primary, legacy string) string {
+		if v, ok := os.LookupEnv(primary); ok {
+			return strings.TrimSpace(v)
+		}
+		return strings.TrimSpace(os.Getenv(legacy))
+	}
+	enabled, specified := os.LookupEnv("TITANARB_TELEGRAM_ENABLED")
 	return Config{
-		Token:     strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN")),
-		ChatID:    strings.TrimSpace(os.Getenv("TELEGRAM_CHAT_ID")),
+		Token:     value("TITANARB_TELEGRAM_BOT_TOKEN", "TELEGRAM_BOT_TOKEN"),
+		ChatID:    value("TITANARB_TELEGRAM_CHANNEL_ID", "TELEGRAM_CHAT_ID"),
 		QueueSize: 128,
+		Disabled:  specified && !strings.EqualFold(strings.TrimSpace(enabled), "true"),
+		ReadOnly:  true, // Environment-configured Telegram is notification-only.
 	}
 }
 
 func (c Config) Enabled() bool {
-	return c.Token != "" && c.ChatID != ""
+	return !c.Disabled && c.Token != "" && c.ChatID != ""
 }
 
 type Client struct {
@@ -154,16 +169,18 @@ func (c *Client) sendTo(defaultChatID string, message Message) {
 
 	body, _ := json.Marshal(map[string]string{
 		"chat_id": chatID,
-		"text":    format(message),
+		"text":    strings.ReplaceAll(format(message), c.cfg.Token, "[redacted]"),
 	})
 
-	request, err := http.NewRequest(
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	request, err := http.NewRequestWithContext(ctx,
 		http.MethodPost,
 		strings.TrimRight(c.endpoint, "/")+"/bot"+c.cfg.Token+"/sendMessage",
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		c.failed.Add(1)
+		c.deliveryFailure("invalid_request", 0)
 		return
 	}
 
@@ -171,22 +188,45 @@ func (c *Client) sendTo(defaultChatID string, message Message) {
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		c.failed.Add(1)
+		c.deliveryFailure(transportClass(err), 0)
 		return
 	}
 
 	defer response.Body.Close()
 
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		c.failed.Add(1)
+		c.deliveryFailure("http_error", response.StatusCode)
+		return
+	}
+	var result struct {
+		OK bool `json:"ok"`
+	}
+	if json.NewDecoder(io.LimitReader(response.Body, 1<<20)).Decode(&result) != nil || !result.OK {
+		c.deliveryFailure("invalid_api_response", response.StatusCode)
 		return
 	}
 
 	c.sent.Add(1)
 }
 
+// Never include raw transport errors: net/http errors embed credential URLs.
+func transportClass(err error) string {
+	var e net.Error
+	if errors.As(err, &e) && e.Timeout() {
+		return "timeout"
+	}
+	return "network_error"
+}
+
+func (c *Client) deliveryFailure(reason string, status int) {
+	n := c.failed.Add(1)
+	if n == 1 || n%64 == 0 {
+		slog.Warn("Telegram notification failed; trading unaffected", "reason", reason, "http_status", status, "failures", n)
+	}
+}
+
 func (c *Client) Updates(ctx context.Context, offset int64, timeoutSeconds int) ([]Update, error) {
-	if c == nil || !c.cfg.Enabled() {
+	if c == nil || !c.cfg.Enabled() || c.cfg.ReadOnly {
 		return nil, nil
 	}
 
@@ -210,14 +250,14 @@ func (c *Client) Updates(ctx context.Context, offset int64, timeoutSeconds int) 
 		bytes.NewReader(body),
 	)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("telegram getUpdates invalid request")
 	}
 
 	request.Header.Set("Content-Type", "application/json")
 
 	response, err := c.http.Do(request)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("telegram getUpdates %s", transportClass(err))
 	}
 	defer response.Body.Close()
 
@@ -251,7 +291,7 @@ func (c *Client) Updates(ctx context.Context, offset int64, timeoutSeconds int) 
 	decoder.UseNumber()
 
 	if err := decoder.Decode(&raw); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("telegram getUpdates invalid response")
 	}
 
 	if !raw.OK {
