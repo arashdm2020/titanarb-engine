@@ -234,10 +234,24 @@ func (s *Service) analyze(ctx context.Context, in Input) {
 		r := selected[int((s.round-1)%uint64(len(selected)))]
 		ladder := AmountLadder(in.Amounts[r.Route.Symbols[0]], firstDepthCap(r.Route, market, ps, now))
 		if len(ladder) > 0 {
-			s.shadowSeen[r.Key]++
+			s.rememberShadow(r.Key)
 			s.probe(ctx, in, market, r, ladder[int((s.round-1)%uint64(len(ladder)))])
 		}
 	}
+}
+
+func (s *Service) rememberShadow(key string) {
+	if _, ok := s.shadowSeen[key]; !ok && len(s.shadowSeen) >= 4096 {
+		// Sampling history has a hard bound even if the market graph churns.
+		old := ""
+		for k := range s.shadowSeen {
+			if old == "" || k < old {
+				old = k
+			}
+		}
+		delete(s.shadowSeen, old)
+	}
+	s.shadowSeen[key]++
 }
 
 func firstDepthCap(r routes.Route, m config.MarketConfig, ps []pairintel.Pair, now time.Time) *big.Int {

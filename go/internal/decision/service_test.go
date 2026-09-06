@@ -3,6 +3,7 @@ package decision
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"math/big"
 	"os"
 	"path/filepath"
@@ -184,5 +185,15 @@ func TestUnresolvedPoolExcludedFromShadow(t *testing.T) {
 	out, _ := shadowRoutes(Input{Market: m, Routes: []routes.Route{r}, Unresolved: map[string]bool{r.Hops[0].Address: true}}, nil, nil, nil)
 	if len(out) != 0 {
 		t.Fatal("unresolved pool used")
+	}
+}
+
+func TestSamplingMemoryBounded(t *testing.T) {
+	s := NewService(nil, nil, t.TempDir(), nil)
+	for i := 0; i < 5000; i++ {
+		s.rememberShadow(fmt.Sprint(i))
+	}
+	if len(s.shadowSeen) != 4096 {
+		t.Fatal(len(s.shadowSeen))
 	}
 }

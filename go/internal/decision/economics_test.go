@@ -12,7 +12,20 @@ var testETH = Asset{"0x0000000000000000000000000000000000000002", 18}
 func bi(s string) *big.Int { x, _ := new(big.Int).SetString(s, 10); return x }
 func portfolioFixture() PortfolioInput {
 	now := time.Unix(10000, 0)
-	return PortfolioInput{Funding: FundingState{Borrowed: []Balance{{testUSD, bi("1000000000")}}}, Liabilities: []Liability{{testUSD, bi("1000000000"), bi("500000")}}, After: []Balance{{testUSD, bi("1000500000")}, {testETH, bi("1000000000000000")}}, Valuation: ValuationState{Numeraire: "USD", Now: now, MaxAge: time.Minute, Prices: map[string]Price{testETH.Address: {USD: big.NewRat(2000, 1), AsOf: now, MaxRaw: bi("1000000000000000000"), Independent: true, Executable: true, ReviewedToken: true}}}}
+	return PortfolioInput{Funding: FundingState{Borrowed: []Balance{{testUSD, bi("1000000000")}}}, Liabilities: []Liability{{testUSD, bi("1000000000"), bi("500000")}}, After: []Balance{{testUSD, bi("1000500000")}, {testETH, bi("1000000000000000")}}, Valuation: ValuationState{Numeraire: "USD", Now: now, MaxAge: time.Minute, ExposureLimits: map[string]*big.Int{testETH.Address: bi("1000000000000000000")}, Prices: map[string]Price{testETH.Address: {USD: big.NewRat(2000, 1), AsOf: now, MaxRaw: bi("1000000000000000000"), Independent: true, Executable: true, ReviewedToken: true}}}}
+}
+
+func TestResidualExposureIsExplicit(t *testing.T) {
+	in := portfolioFixture()
+	in.Valuation.ExposureLimits = nil
+	if EvaluatePortfolio(in).Positive {
+		t.Fatal("missing exposure limit")
+	}
+	in = portfolioFixture()
+	in.Valuation.ExposureLimits[testETH.Address] = bi("1")
+	if EvaluatePortfolio(in).Positive {
+		t.Fatal("exceeded exposure limit")
+	}
 }
 func TestResidualProfitIsIndependentOfFunding(t *testing.T) {
 	in := portfolioFixture()

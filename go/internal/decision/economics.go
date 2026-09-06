@@ -39,10 +39,11 @@ type Price struct {
 	HaircutBPS                             uint64
 }
 type ValuationState struct {
-	Numeraire string
-	Prices    map[string]Price
-	Now       time.Time
-	MaxAge    time.Duration
+	Numeraire      string
+	Prices         map[string]Price
+	ExposureLimits map[string]*big.Int // Explicit residual caps in raw asset units.
+	Now            time.Time
+	MaxAge         time.Duration
 }
 type PortfolioInput struct {
 	Funding     FundingState
@@ -153,6 +154,15 @@ func EvaluatePortfolio(in PortfolioInput) PortfolioResult {
 	for k, v := range after {
 		if v.Sign() > 0 {
 			r.Residual[k] = v.String()
+		}
+	}
+	for k, v := range after {
+		if v.Sign() == 0 {
+			continue
+		}
+		cap := in.Valuation.ExposureLimits[k]
+		if cap == nil || cap.Sign() < 0 || v.Cmp(cap) > 0 {
+			return fail("missing/exceeded residual exposure limit: " + k)
 		}
 	}
 	if in.Valuation.Numeraire != "USD" || in.Valuation.MaxAge <= 0 || in.Valuation.Now.IsZero() {
