@@ -1197,10 +1197,26 @@ func wssEndpoints(cfg config.Config) []ws.Endpoint {
 	}
 	out := make([]ws.Endpoint, 0, len(cfg.RPCProviders))
 	for _, provider := range cfg.RPCProviders {
-		if strings.TrimSpace(provider.WSS) == "" {
-			continue
+		endpoint := strings.TrimSpace(provider.WSS)
+		if endpoint == "" {
+			// Some HTTP providers expose the same authenticated path over WSS.
+			// Derive only for explicitly supported pools; never invent an
+			// emergency endpoint or reuse HTTP health state.
+			name := strings.ToLower(provider.Name)
+			if strings.HasPrefix(name, "alchemy_") {
+				idx := strings.TrimPrefix(name, "alchemy_")
+				endpoint = strings.TrimSpace(os.Getenv("RPC_ALCHEMY_WSS_" + idx))
+			} else if strings.HasPrefix(name, "ankr_") {
+				idx := strings.TrimPrefix(name, "ankr_")
+				endpoint = strings.TrimSpace(os.Getenv("RPC_ANKR_WSS_" + idx))
+			} else if name == "quicknode" {
+				endpoint = strings.TrimSpace(os.Getenv("RPC_QUICKNODE_WSS"))
+			}
+			if endpoint == "" && (strings.HasPrefix(name, "alchemy_") || strings.HasPrefix(name, "ankr_") || name == "quicknode") {
+				endpoint = strings.Replace(provider.HTTP, "https://", "wss://", 1)
+			}
 		}
-		out = append(out, ws.Endpoint{Name: provider.Name, URL: provider.WSS})
+		if endpoint != "" { out = append(out, ws.Endpoint{Name: provider.Name + "_wss", URL: endpoint}) }
 	}
 	if len(out) == 0 {
 		out = append(out, ws.Endpoint{Name: "primary", URL: cfg.WSRPCURL})

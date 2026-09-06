@@ -30,7 +30,9 @@ func TestConnectDisconnectReconnect(t *testing.T) {
 		}
 		n := connections.Add(1)
 		_ = conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "result": "sub"})
-		_ = conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "method": "eth_subscription", "params": map[string]any{"result": map[string]string{"number": "0x1", "hash": "0xabc", "timestamp": "0x1"}}})
+		number, hash := "0x1", "0xabc"
+		if n > 1 { number, hash = "0x2", "0xdef" }
+		_ = conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "method": "eth_subscription", "params": map[string]any{"result": map[string]string{"number": number, "hash": hash, "timestamp": number}}})
 		if n == 1 {
 			return
 		}

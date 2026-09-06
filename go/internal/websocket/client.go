@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"strconv"
 
 	"github.com/gorilla/websocket"
 	"github.com/titanarb/titanarb-go/internal/logger"
@@ -28,7 +29,11 @@ type Client struct {
 	observer   func(string, map[string]any)
 	observerMu sync.RWMutex
 	mu         sync.Mutex
+	states     []endpointState
+	lastBlock  uint64
 }
+
+type endpointState struct { failures int; cooldownUntil time.Time; attempts, successes, heads uint64 }
 
 type Endpoint struct {
 	Name string
@@ -49,6 +54,7 @@ func NewManaged(endpoints []Endpoint, log *logger.Logger, m *metrics.Metrics) *C
 			endpoint.Name = "provider"
 		}
 		client.endpoints = append(client.endpoints, endpoint)
+		client.states = append(client.states, endpointState{})
 	}
 	if len(client.endpoints) > 0 {
 		client.url = client.endpoints[0].URL
@@ -102,7 +108,7 @@ func (c *Client) Start(ctx context.Context) <-chan NewBlockEvent {
 			}
 			conn, _, err := websocket.DefaultDialer.DialContext(ctx, endpoint.URL, nil)
 			if err != nil {
-				c.failover("connect")
+				c.markFailed("connect")
 				if !sleep(ctx, delay) {
 					return
 				}
@@ -112,7 +118,7 @@ func (c *Client) Start(ctx context.Context) <-chan NewBlockEvent {
 			}
 			if err := subscribe(conn); err != nil {
 				_ = conn.Close()
-				c.failover("subscribe")
+				c.markFailed("subscribe")
 				if !sleep(ctx, delay) {
 					return
 				}
@@ -129,6 +135,7 @@ func (c *Client) Start(ctx context.Context) <-chan NewBlockEvent {
 				c.emit("wss_connected", map[string]any{"provider": c.ActiveProvider()})
 			}
 			c.connected.Store(true)
+			c.markSuccess()
 			reconnecting = false
 			delay = time.Second
 			err = c.read(ctx, conn, events)
@@ -140,7 +147,7 @@ func (c *Client) Start(ctx context.Context) <-chan NewBlockEvent {
 			c.metrics.IncWSSDisconnects()
 			c.log.Event(logger.Warn, "wss_disconnected", "websocket", "connection lost; polling fallback remains available", map[string]any{"provider": c.ActiveProvider()})
 			c.emit("wss_disconnected", map[string]any{"http_fallback": "active", "provider": c.ActiveProvider()})
-			c.failover("disconnect")
+			c.markFailed("disconnect")
 			reconnecting = true
 		}
 	}()
@@ -153,23 +160,34 @@ func (c *Client) currentEndpoint() Endpoint {
 	if len(c.endpoints) == 0 {
 		return Endpoint{}
 	}
+	now := time.Now()
+	for i := range c.endpoints {
+		idx := (c.active+i)%len(c.endpoints)
+		if now.After(c.states[idx].cooldownUntil) { c.active=idx; c.url=c.endpoints[idx].URL; return c.endpoints[idx] }
+	}
 	return c.endpoints[c.active]
 }
 
-func (c *Client) failover(reason string) {
+func (c *Client) markFailed(reason string) {
 	c.mu.Lock()
+	if len(c.endpoints)>0 { s:=&c.states[c.active]; s.failures++; d:=time.Second << min(s.failures-1,4); if d>30*time.Second {d=30*time.Second}; s.cooldownUntil=time.Now().Add(d) }
 	if len(c.endpoints) < 2 {
 		c.mu.Unlock()
 		return
 	}
 	from := c.endpoints[c.active]
-	c.active = (c.active + 1) % len(c.endpoints)
+	fromIndex:=c.active; now:=time.Now(); nextIndex:=fromIndex
+	for i:=1;i<=len(c.endpoints);i++ { idx:=(fromIndex+i)%len(c.endpoints); if now.After(c.states[idx].cooldownUntil) { nextIndex=idx; break } }
+	if nextIndex==fromIndex { c.mu.Unlock(); return }
+	c.active = nextIndex
 	to := c.endpoints[c.active]
 	c.url = to.URL
 	c.mu.Unlock()
 	c.log.Event(logger.Warn, "wss_failover", "websocket", "switching websocket provider", map[string]any{"from": from.Name, "to": to.Name, "reason": reason})
 	c.emit("wss_failover", map[string]any{"from": from.Name, "to": to.Name, "reason": reason})
 }
+func (c *Client) markSuccess() { c.mu.Lock(); if len(c.states)>0 { s:=&c.states[c.active]; s.successes++; s.failures=0; s.cooldownUntil=time.Time{} }; c.mu.Unlock() }
+func min(a,b int) int { if a<b{return a}; return b }
 func subscribe(conn *websocket.Conn) error {
 	return conn.WriteJSON(map[string]any{"jsonrpc": "2.0", "id": 1, "method": "eth_subscribe", "params": []any{"newHeads"}})
 }
@@ -194,6 +212,8 @@ func (c *Client) read(ctx context.Context, conn *websocket.Conn, out chan<- NewB
 				return
 			}
 			if msg.Method == "eth_subscription" {
+				n, err := strconv.ParseUint(msg.Params.Result.Number, 0, 64); if err != nil { continue }
+				c.mu.Lock(); if n<=c.lastBlock { c.mu.Unlock(); continue }; c.lastBlock=n; if len(c.states)>0 { c.states[c.active].heads++ }; c.mu.Unlock()
 				select {
 				case out <- NewBlockEvent{msg.Params.Result.Number, msg.Params.Result.Hash, msg.Params.Result.Timestamp}:
 					c.metrics.IncBlocks()
