@@ -13,6 +13,7 @@ import (
 
 	"github.com/titanarb/titanarb-go/internal/cache"
 	"github.com/titanarb/titanarb-go/internal/config"
+	"github.com/titanarb/titanarb-go/internal/decision"
 	"github.com/titanarb/titanarb-go/internal/graph"
 	"github.com/titanarb/titanarb-go/internal/metrics"
 	"github.com/titanarb/titanarb-go/internal/nearmiss"
@@ -69,7 +70,12 @@ type Engine struct {
 	pendingDirty       map[string]struct{}
 	syncRunning        bool
 	syncLast           marketSyncSnapshot
+	shadow             *decision.Service
 }
+
+// SetShadowObserver is startup-only. The observer has no execution authority;
+// its bounded queues never wait for shadow analysis or RPC on the live cycle.
+func (e *Engine) SetShadowObserver(s *decision.Service) { e.shadow = s }
 
 type reconcileJob struct {
 	from, to string
@@ -1002,6 +1008,16 @@ func (e *Engine) CycleAtWithSearchOptions(ctx context.Context, stateBlock uint64
 		e.setLastStateBlock(commitBlock)
 	}
 	tracker.Stage(stageCycleComplete)
+	if e.shadow != nil {
+		changed, unresolved := map[string]bool{}, map[string]bool{}
+		for key := range dirty {
+			changed[key] = true
+		}
+		for key := range refresh.UnresolvedDirty {
+			unresolved[key] = true
+		}
+		e.shadow.Offer(decision.Input{Block: stateBlock, Market: e.market, Routes: routesFound, Amounts: e.amounts, Dirty: changed, Unresolved: unresolved})
+	}
 	return report, nil
 }
 
@@ -1872,6 +1888,9 @@ func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route,
 				quoteCtx := rpc.WithRequestMetadata(rpc.WithRequestClass(ctx, rpc.HotPath), "quote", stateBlock)
 				op, err := e.evaluator.Evaluate(quoteCtx, route, amount)
 				if err != nil || op == nil || op.ExpectedProfit == nil {
+					if e.shadow != nil {
+						e.shadow.Observe(route, e.market, nearmiss.Record{Route: route.String(), AmountIn: amount, QuoteSuccessful: false, RejectionReason: "incomplete economic evaluation", Timestamp: time.Now().UTC()}, stateBlock)
+					}
 					tracker.RouteEvaluationFinished(false)
 					results <- evaluatedRoute{route: route, preQuoteScore: preQuoteScores[routeKey(route)]}
 					continue
@@ -1882,6 +1901,9 @@ func (e *Engine) evaluateCurrent(ctx context.Context, candidates []routes.Route,
 					reason = "profitability threshold not met"
 				}
 				record := nearmiss.FromOpportunity(op, reason, time.Since(started), failures[routeKey(route)])
+				if e.shadow != nil {
+					e.shadow.Observe(route, e.market, record, stateBlock)
+				}
 				tracker.RouteEvaluationFinished(true)
 				results <- evaluatedRoute{route: route, score: new(big.Int).Set(op.ExpectedProfit), nearMiss: &record, routeScore: record.Score, preQuoteScore: preQuoteScores[routeKey(route)], quoteSuccessful: true, quoteAgeBlocks: quoteAgeBlocks(stateBlock, forcedRouteSourceBlock(route))}
 			}

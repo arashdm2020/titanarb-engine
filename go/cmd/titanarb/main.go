@@ -22,6 +22,7 @@ import (
 	"github.com/titanarb/titanarb-go/internal/config"
 	"github.com/titanarb/titanarb-go/internal/control"
 	"github.com/titanarb/titanarb-go/internal/dashboard"
+	"github.com/titanarb/titanarb-go/internal/decision"
 	"github.com/titanarb/titanarb-go/internal/dex"
 	"github.com/titanarb/titanarb-go/internal/execution"
 	"github.com/titanarb/titanarb-go/internal/fees"
@@ -136,6 +137,14 @@ func main() {
 	}
 	if pairService != nil {
 		go pairService.Run(ctx)
+	}
+	if marketEngine != nil && pairService != nil && envEnabled("PHASE2_SHADOW_ENABLED", true) {
+		shadow := decision.NewService(rpcClient, pairService.Memory, operationsDir, marketBusy.Load)
+		shadow.ReadLimit = envIntBounded("PHASE2_SHADOW_MAX_READS_PER_MINUTE", 12, 1, 12)
+		shadow.ProbeEnabled = envEnabled("PHASE2_SHADOW_PROBES_ENABLED", true)
+		marketEngine.SetShadowObserver(shadow)
+		go shadow.Run(ctx)
+		log.Event(logger.Info, "phase2_shadow_started", "decision", "Phase 2 analysis observer started", map[string]any{"mode": "shadow", "execution_authority": false, "max_reads_per_minute": shadow.ReadLimit, "probes_enabled": shadow.ProbeEnabled})
 	}
 	if telegramConfig.Enabled() && runtimeRisk != nil {
 		go control.Run(ctx, notifier, control.Handler{
