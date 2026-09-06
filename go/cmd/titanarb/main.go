@@ -1183,6 +1183,12 @@ func rpcProviderConfigs(cfg config.Config) []rpc.ProviderConfig {
 		if strings.TrimSpace(provider.HTTP) == "" {
 			continue
 		}
+		// Chainstack HTTP is opt-out independently from its WSS endpoint.
+		// This allows a persistently forbidden HTTP endpoint to remain available
+		// for WSS fallback without adding HTTP failover noise.
+		if strings.EqualFold(provider.Name, "chainstack") && !envEnabled("RPC_CHAINSTACK_HTTP_ENABLED", true) {
+			continue
+		}
 		out = append(out, rpc.ProviderConfig{Name: provider.Name, HTTP: provider.HTTP, MaxRPS: provider.MaxRPS, TargetRPS: provider.TargetRPS, Burst: provider.Burst, MaxBlockLag: provider.MaxBlockLag, Tier: provider.Tier})
 	}
 	if len(out) == 0 {
